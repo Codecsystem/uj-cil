@@ -806,7 +806,7 @@ fn prepare_stdout(
             let mut read_pipe = HANDLE::default();
             let mut write_pipe = HANDLE::default();
             unsafe {
-                CreatePipe(&mut read_pipe, &mut write_pipe, None, 0)?;
+                CreatePipe(&mut read_pipe, &mut write_pipe, None, 65536)?;
                 let _ =
                     SetHandleInformation(write_pipe, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
             }
@@ -875,12 +875,19 @@ fn read_pipe_to_end(
 ) -> Vec<u8> {
     use windows::Win32::Storage::FileSystem::ReadFile;
 
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
+    let mut buf = Vec::with_capacity(limit.min(65536));
+    let mut chunk = vec![0u8; 65536];
     let mut bytes_read: u32 = 0;
 
     unsafe {
-        while ReadFile(pipe_handle, Some(&mut chunk), Some(&mut bytes_read), None).is_ok() {
+        while ReadFile(
+            pipe_handle,
+            Some(chunk.as_mut_slice()),
+            Some(&mut bytes_read),
+            None,
+        )
+        .is_ok()
+        {
             if bytes_read == 0 {
                 break;
             }

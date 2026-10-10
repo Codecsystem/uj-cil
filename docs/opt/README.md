@@ -11,6 +11,7 @@
 | **Round 4** | 出题流水线测试数据生成器多线程并发 (Concurrent uj gen) | 确定性预分配用例编号避免命名竞态，并发执行 generator，Blake3 缓存快速短路 | **已完成** | [Round 4 报告](ROUND_4_CONCURRENT_GEN.md) |
 | **Round 5** | 内置比较器 SWAR 64 位分词器加速 (wcmp / lcmp / ncmp) | 8 字节连续空格与可见 ASCII 字符 SWAR 无分支跳过，100k 单词比对仅 2.1ms (47M 单词/秒) | **已完成** | [Round 5 报告](ROUND_5_SWAR_TOKENIZER.md) |
 | **Round 6** | 沙盒 Slot 隔离目录池化复用 (Worker Box Pooling) | 槽位独占目录跨用例复用，微秒级残留擦除，彻底消除重复建删目录的 NTFS 元数据锁争抢 | **已完成** | [Round 6 报告](ROUND_6_SLOT_BOX_POOLING.md) |
+| **Round 7** | 标准输出管道 64KB 环形缓冲与预分配流式读取 | 内核管道缓冲区提升至 64KB，消除管道满阻塞与上下文切换颠簸，64KB 块读取减少 87% 系统调用 | **已完成** | [Round 7 报告](ROUND_7_STDOUT_PIPE_BUFFERING.md) |
 
 
 

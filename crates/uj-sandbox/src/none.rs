@@ -148,9 +148,9 @@ impl NoneSandbox {
             let mut stdout_pipe = child.stdout.take();
             let ole_flag_clone = Arc::clone(&ole_flag);
             Some(thread::spawn(move || {
-                let mut buf = Vec::new();
+                let mut buf = Vec::with_capacity(stdout_limit.min(65536));
                 if let Some(mut stream) = stdout_pipe.take() {
-                    let mut chunk = [0u8; 8192];
+                    let mut chunk = vec![0u8; 65536];
                     while let Ok(n) = stream.read(&mut chunk) {
                         if n == 0 {
                             break;
