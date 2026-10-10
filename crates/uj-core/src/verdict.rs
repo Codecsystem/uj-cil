@@ -87,6 +87,15 @@ impl Verdict {
             Self::Skipped => 0,
         }
     }
+
+    /// Merge two verdicts, keeping the one with higher priority.
+    pub fn merge(self, other: Self) -> Self {
+        if self.priority() >= other.priority() {
+            self
+        } else {
+            other
+        }
+    }
 }
 
 impl fmt::Display for Verdict {

@@ -1,0 +1,27 @@
+schema = 1
+name = "aplusb"
+type = "traditional"
+
+[limits]
+time = "1s"
+memory = "512MiB"
+
+[io]
+mode = "stdio"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+
+[[subtasks]]
+id = 1
+score = 40.0
+scoring = "min"
+tests = ["1", "2"]
+
+[[subtasks]]
+id = 2
+score = 60.0
+scoring = "min"
+tests = ["3"]
+depends = [1]

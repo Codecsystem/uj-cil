@@ -11,3 +11,4 @@ memchr.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true

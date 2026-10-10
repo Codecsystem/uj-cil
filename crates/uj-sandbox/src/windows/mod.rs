@@ -7,9 +7,9 @@ pub mod security;
 use uj_core::run::{RunResult, RunSpec, Tier};
 
 use crate::windows::job::JobObject;
-use std::sync::Arc;
 use crate::windows::security::AppContainerProfile;
 use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
+use std::sync::Arc;
 
 pub struct WindowsSandbox {
     tier: Tier,

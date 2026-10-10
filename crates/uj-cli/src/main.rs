@@ -1,6 +1,7 @@
 mod cli;
 mod doctor;
 mod error;
+mod judge_cmd;
 
 use clap::Parser;
 use std::io::IsTerminal;
@@ -198,6 +199,25 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::Judge {
+            ref sources,
+            ref problem,
+        } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            judge_cmd::run_judge(sources, problem, &args, format, &cancel)
+        }
+        Commands::Last => judge_cmd::run_last(std::path::Path::new("."), format),
+        Commands::Show { run_id, test } => judge_cmd::run_show(
+            std::path::Path::new("."),
+            run_id.as_deref(),
+            test.as_deref(),
+            format,
+        ),
+        Commands::Clean => judge_cmd::run_clean(std::path::Path::new(".")),
         _ => {
             if format == OutputFormat::Json {
                 let err_obj = serde_json::json!({
