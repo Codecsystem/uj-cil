@@ -78,10 +78,23 @@ impl Sandbox for WindowsSandbox {
         let slot_dir = runs_base.join(format!("slot-{}", self.slot_id));
         std::fs::create_dir_all(&slot_dir)?;
 
+        let mut slot_authorized = false;
         if let Some(ref ac) = self.app_container {
             let mut set = self.authorized_slot_dirs.lock();
-            if set.insert(slot_dir.clone()) {
-                let _ = ac.grant_access_to_path(&slot_dir);
+            if set.contains(&slot_dir) {
+                slot_authorized = true;
+            } else {
+                match ac.grant_access_to_path(&slot_dir) {
+                    Ok(()) => {
+                        set.insert(slot_dir.clone());
+                        slot_authorized = true;
+                    }
+                    Err(e) => {
+                        return Err(SandboxError::Internal(format!(
+                            "Failed to grant access to slot dir: {e}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -95,15 +108,43 @@ impl Sandbox for WindowsSandbox {
         let box_dir = slot_dir.join(format!("run-{ts}-{cnt}")).join("box");
         std::fs::create_dir_all(&box_dir)?;
 
+        // If parent slot_dir was successfully authorized, box_dir inherits (OI)(CI) permissions.
+        // Register box_dir so that run() skips redundant icacls invocation.
+        if slot_authorized {
+            let mut set = self.authorized_slot_dirs.lock();
+            set.insert(box_dir.clone());
+        }
+
         Ok(box_dir)
     }
 
-    fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
-        // Ensure this slot's AppContainer profile has access to the work_dir
+    fn authorize_executable(&self, path: &std::path::Path) -> Result<(), SandboxError> {
         if let Some(ref ac) = self.app_container {
             let mut set = self.authorized_slot_dirs.lock();
-            if set.insert(spec.work_dir.clone()) {
-                let _ = ac.grant_access_to_path(&spec.work_dir);
+            if !set.contains(path) {
+                let sid = ac
+                    .sid_string()
+                    .map_err(|e| SandboxError::Internal(format!("Failed to get SID: {e}")))?;
+                security::AppContainerProfile::grant_path_read_execute(path, &sid).map_err(
+                    |e| SandboxError::Internal(format!("Failed to grant RX to executable: {e}")),
+                )?;
+                set.insert(path.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
+        // Ensure this slot's AppContainer profile has access to the work_dir if not trusted
+        if !spec.trusted
+            && let Some(ref ac) = self.app_container
+        {
+            let mut set = self.authorized_slot_dirs.lock();
+            if !set.contains(&spec.work_dir) {
+                ac.grant_access_to_path(&spec.work_dir).map_err(|e| {
+                    SandboxError::Internal(format!("Failed to grant access to work_dir: {e}"))
+                })?;
+                set.insert(spec.work_dir.clone());
             }
         }
 
@@ -144,6 +185,17 @@ impl Sandbox for WindowsSandbox {
         wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
+        if let Some(ref ac) = self.app_container {
+            let mut set = self.authorized_slot_dirs.lock();
+            for spec in specs {
+                if !spec.trusted && !set.contains(&spec.work_dir) {
+                    ac.grant_access_to_path(&spec.work_dir).map_err(|e| {
+                        SandboxError::Internal(format!("Failed to grant access to work_dir: {e}"))
+                    })?;
+                    set.insert(spec.work_dir.clone());
+                }
+            }
+        }
         let ac = self.app_container.as_deref();
         process::execute_group_in_jobs(specs, wiring, ac, cancel, self.tier)
     }

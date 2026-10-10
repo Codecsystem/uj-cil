@@ -11,7 +11,7 @@ use uj_checker::builtin::BuiltinCheckerType;
 use uj_core::config::{ProblemConfig, SolutionTag};
 use uj_core::run::{Limits, RunSpec, Stdio};
 use uj_core::verdict::Verdict;
-use uj_engine::compiler::Compiler;
+use uj_engine::compiler::CompileSession;
 use uj_engine::judge::JudgeOptions;
 use uj_engine::scheduler::Scheduler;
 use uj_sandbox::{CancelToken, create_sandbox};
@@ -227,6 +227,17 @@ pub fn run_build(
     no_cache: bool,
     format: OutputFormat,
 ) -> ExitCode {
+    let session = CompileSession::new();
+    run_build_with_session(problem_dir, targets, no_cache, format, &session)
+}
+
+pub fn run_build_with_session(
+    problem_dir: &Path,
+    targets: &[String],
+    no_cache: bool,
+    format: OutputFormat,
+    compile_session: &CompileSession,
+) -> ExitCode {
     let config_path = problem_dir.join("problem.toml");
     let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -300,7 +311,7 @@ pub fn run_build(
         {
             continue;
         }
-        match Compiler::compile(&target, no_cache) {
+        match compile_session.compile(&target, no_cache) {
             Ok(c) => {
                 if format == OutputFormat::Human {
                     println!("Compiled {} ({} ms)", target.display(), c.duration_ms);
@@ -342,6 +353,17 @@ pub fn run_gen(
     force: bool,
     format: OutputFormat,
     cancel: &CancelToken,
+) -> ExitCode {
+    let session = CompileSession::new();
+    run_gen_with_session(problem_dir, force, format, cancel, &session)
+}
+
+pub fn run_gen_with_session(
+    problem_dir: &Path,
+    force: bool,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    session: &CompileSession,
 ) -> ExitCode {
     let config_path = problem_dir.join("problem.toml");
     let content = match fs::read_to_string(&config_path) {
@@ -394,13 +416,19 @@ pub fn run_gen(
             return ExitCode::from(EXIT_INTERRUPTED);
         }
         let gen_path = problem_dir.join(&gen_spec.generator);
-        let compiled_gen = match Compiler::compile(&gen_path, false) {
+        let compiled_gen = match session.compile(&gen_path, false) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Failed to compile generator '{}': {e}", gen_path.display());
                 return ExitCode::from(EXIT_COMPILE_ERROR);
             }
         };
+
+        let mut base_hasher = blake3::Hasher::new();
+        if let Ok(b) = fs::read(&compiled_gen.binary_path) {
+            base_hasher.update(&b);
+        }
+        base_hasher.update(gen_spec.args.as_bytes());
 
         for i in 0..gen_spec.count {
             if cancel.is_cancelled() {
@@ -409,12 +437,8 @@ pub fn run_gen(
             max_idx += 1;
             let target_in = tests_dir.join(format!("{max_idx}.in"));
 
-            // Blake3 cache check
-            let mut cache_hasher = blake3::Hasher::new();
-            if let Ok(b) = fs::read(&compiled_gen.binary_path) {
-                cache_hasher.update(&b);
-            }
-            cache_hasher.update(gen_spec.args.as_bytes());
+            // Blake3 cache check using cloned base hasher
+            let mut cache_hasher = base_hasher.clone();
             cache_hasher.update(&i.to_le_bytes());
             let hash = cache_hasher.finalize().to_hex().to_string();
 
@@ -494,6 +518,16 @@ pub fn run_gen(
 // ============================================================================
 
 pub fn run_validate(problem_dir: &Path, format: OutputFormat, cancel: &CancelToken) -> ExitCode {
+    let session = CompileSession::new();
+    run_validate_with_session(problem_dir, format, cancel, &session)
+}
+
+pub fn run_validate_with_session(
+    problem_dir: &Path,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    session: &CompileSession,
+) -> ExitCode {
     let config_path = problem_dir.join("problem.toml");
     let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -515,7 +549,7 @@ pub fn run_validate(problem_dir: &Path, format: OutputFormat, cancel: &CancelTok
     };
 
     let val_path = problem_dir.join(val_path_rel);
-    let compiled_val = match Compiler::compile(&val_path, false) {
+    let compiled_val = match session.compile(&val_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile validator: {e}");
@@ -613,6 +647,17 @@ pub fn run_ans(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
+    let session = CompileSession::new();
+    run_ans_with_session(problem_dir, force, format, cancel, &session)
+}
+
+pub fn run_ans_with_session(
+    problem_dir: &Path,
+    force: bool,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    session: &CompileSession,
+) -> ExitCode {
     let config_path = problem_dir.join("problem.toml");
     let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -646,7 +691,7 @@ pub fn run_ans(
     };
 
     let sol_path = problem_dir.join(&main_sol.path);
-    let compiled = match Compiler::compile(&sol_path, false) {
+    let compiled = match session.compile(&sol_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile main solution: {e}");
@@ -670,10 +715,34 @@ pub fn run_ans(
         }
     };
 
-    let main_bytes = fs::read(&compiled.binary_path).unwrap_or_default();
-    let mut main_hasher = blake3::Hasher::new();
-    main_hasher.update(&main_bytes);
-    let main_hash = main_hasher.finalize().to_hex().to_string();
+    let hash_file_streaming = |path: &Path| -> std::io::Result<String> {
+        use std::io::Read;
+        let mut file = fs::File::open(path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    hasher.update(&buf[..n]);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(hasher.finalize().to_hex().to_string())
+    };
+
+    let main_hash = match hash_file_streaming(&compiled.binary_path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Failed to read binary for hash: {e}");
+            return ExitCode::from(EXIT_JUDGE_FAILED);
+        }
+    };
+    let limits = cfg
+        .to_limits()
+        .unwrap_or_else(|_| Limits::new(1000, 256 * 1024 * 1024));
 
     let mut generated_count = 0;
     for test in &tests {
@@ -681,8 +750,16 @@ pub fn run_ans(
             return ExitCode::from(EXIT_INTERRUPTED);
         }
 
-        let in_bytes = fs::read(&test.input_path).unwrap_or_default();
-        let in_hash = blake3::hash(&in_bytes).to_hex().to_string();
+        let in_hash = match hash_file_streaming(&test.input_path) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!(
+                    "Failed to read input file for hash {}: {e}",
+                    test.input_path.display()
+                );
+                return ExitCode::from(EXIT_JUDGE_FAILED);
+            }
+        };
 
         let ans_path = test.input_path.with_extension("ans");
         let cache_meta = problem_dir
@@ -696,9 +773,6 @@ pub fn run_ans(
             continue;
         }
 
-        let limits = cfg
-            .to_limits()
-            .unwrap_or_else(|_| Limits::new(1000, 256 * 1024 * 1024));
         let spec = RunSpec {
             argv: vec![compiled.binary_path.as_os_str().to_os_string()],
             env: vec![],
@@ -708,7 +782,7 @@ pub fn run_ans(
             stdout: Stdio::Pipe,
             stderr: Stdio::Pipe,
             extra_fds: vec![],
-            limits,
+            limits: limits.clone(),
             cpu_affinity: None,
             seccomp_profile: Default::default(),
             trusted: false,
@@ -758,6 +832,17 @@ pub fn run_verify(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
+    let session = CompileSession::new();
+    run_verify_with_session(problem_dir, cli, format, cancel, &session)
+}
+
+pub fn run_verify_with_session(
+    problem_dir: &Path,
+    cli: &Cli,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    session: &CompileSession,
+) -> ExitCode {
     let config_path = problem_dir.join("problem.toml");
     let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -792,7 +877,7 @@ pub fn run_verify(
         fail_fast: cli.fail_fast,
         precise: cli.precise,
     };
-    let scheduler = Scheduler::new(options);
+    let scheduler = Scheduler::with_session(options, session.clone());
 
     let mut verification_failures = Vec::new();
 
@@ -802,7 +887,7 @@ pub fn run_verify(
         }
 
         let sol_path = problem_dir.join(&sol.path);
-        let compiled = match Compiler::compile(&sol_path, cli.no_cache) {
+        let compiled = match session.compile(&sol_path, cli.no_cache) {
             Ok(c) => c,
             Err(e) => {
                 verification_failures
@@ -1005,6 +1090,18 @@ pub fn run_tl(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
+    let session = CompileSession::new();
+    run_tl_with_session(problem_dir, apply, cli, format, cancel, &session)
+}
+
+pub fn run_tl_with_session(
+    problem_dir: &Path,
+    apply: bool,
+    cli: &Cli,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    session: &CompileSession,
+) -> ExitCode {
     let config_path = problem_dir.join("problem.toml");
     let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -1050,7 +1147,7 @@ pub fn run_tl(
         fail_fast: false,
         precise: false,
     };
-    let scheduler = Scheduler::new(options);
+    let scheduler = Scheduler::with_session(options, session.clone());
 
     let mut t_main = 0u64;
     let mut t_slowest_ac = 0u64;
@@ -1060,7 +1157,7 @@ pub fn run_tl(
             return ExitCode::from(EXIT_INTERRUPTED);
         }
         let sol_path = problem_dir.join(&sol.path);
-        let compiled = match Compiler::compile(&sol_path, false) {
+        let compiled = match session.compile(&sol_path, false) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Failed to compile solution: {e}");
@@ -1164,21 +1261,22 @@ pub fn run_stress(
     let sol_path = problem_dir.join(sol_src);
     let brute_path = problem_dir.join(brute_src);
 
-    let compiled_gen = match Compiler::compile(&gen_path, false) {
+    let compile_session = CompileSession::new();
+    let compiled_gen = match compile_session.compile(&gen_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile generator: {e}");
             return ExitCode::from(EXIT_COMPILE_ERROR);
         }
     };
-    let compiled_sol = match Compiler::compile(&sol_path, false) {
+    let compiled_sol = match compile_session.compile(&sol_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile target solution: {e}");
             return ExitCode::from(EXIT_COMPILE_ERROR);
         }
     };
-    let compiled_brute = match Compiler::compile(&brute_path, false) {
+    let compiled_brute = match compile_session.compile(&brute_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile brute oracle: {e}");
@@ -1386,12 +1484,32 @@ pub fn run_pipeline(
         };
     }
 
-    step!("build", run_build(problem_dir, &[], cli.no_cache, format));
-    step!("gen", run_gen(problem_dir, false, format, cancel));
-    step!("validate", run_validate(problem_dir, format, cancel));
-    step!("ans", run_ans(problem_dir, false, format, cancel));
-    step!("verify", run_verify(problem_dir, cli, format, cancel));
-    step!("tl", run_tl(problem_dir, false, cli, format, cancel));
+    let session = CompileSession::new();
+
+    step!(
+        "build",
+        run_build_with_session(problem_dir, &[], cli.no_cache, format, &session)
+    );
+    step!(
+        "gen",
+        run_gen_with_session(problem_dir, false, format, cancel, &session)
+    );
+    step!(
+        "validate",
+        run_validate_with_session(problem_dir, format, cancel, &session)
+    );
+    step!(
+        "ans",
+        run_ans_with_session(problem_dir, false, format, cancel, &session)
+    );
+    step!(
+        "verify",
+        run_verify_with_session(problem_dir, cli, format, cancel, &session)
+    );
+    step!(
+        "tl",
+        run_tl_with_session(problem_dir, false, cli, format, cancel, &session)
+    );
 
     if format == OutputFormat::Human {
         println!("Pipeline completed successfully!");

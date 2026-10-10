@@ -26,5 +26,5 @@ int main(){
     int G=0; if(FILE* f=fopen((std::string(userprof)+"\\.gitconfig").c_str(),"r")){G=1;fclose(f);}
     int T=try_write(std::string(userprof)+"\\AppData\\Local\\Temp\\uj_pwned_win.txt");
     int K=try_write("box_write_test.txt");
-    printf("A=%d,C=%d,E=%d,G=%d,T=%d,K=%d,pd=%s\n",A,C,E,G,T,K,pd.c_str());
+    printf("A=%d,C=%d,E=%d,G=%d,T=%d,K=%d,pd_found=%d\n",A,C,E,G,T,K,k!=std::string::npos?1:0);
 }

@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use crossbeam_channel::unbounded;
 use uj_core::config::{ProblemConfig, ProblemType};
 use uj_core::verdict::Verdict;
-use uj_engine::compiler::{CompileError, Compiler};
+use uj_engine::compiler::CompileError;
 use uj_engine::judge::JudgeOptions;
 use uj_engine::scheduler::Scheduler;
 use uj_report::human::{format_human_report, format_test_details};
@@ -157,7 +157,8 @@ pub fn run_judge(
         precise: cli.precise,
     };
 
-    let scheduler = Scheduler::new(judge_options);
+    let compile_session = uj_engine::compiler::CompileSession::new();
+    let scheduler = Scheduler::with_session(judge_options, compile_session.clone());
     let mut overall_exit = ExitCode::from(EXIT_SUCCESS);
     let mut json_reports: Vec<serde_json::Value> = Vec::new();
 
@@ -207,7 +208,8 @@ pub fn run_judge(
             .unwrap_or(512 * 1024 * 1024);
         let slot_count = uj_engine::topology::Topology::detect(mem_limit, cli.jobs)
             .slots
-            .len();
+            .len()
+            .min(test_names.len());
 
         // Set up event streaming: TUI, NDJSON, or indicatif progress bar
         let (event_sender, event_thread) = if cli.tui {
@@ -317,9 +319,14 @@ pub fn run_judge(
                 } else {
                     (vec![], vec![problem_dir.to_path_buf()])
                 };
-                Compiler::compile_with_options(source, &extra_sources, &include_dirs, cli.no_cache)
+                compile_session.compile_with_options(
+                    source,
+                    &extra_sources,
+                    &include_dirs,
+                    cli.no_cache,
+                )
             }
-            _ => Compiler::compile(source, cli.no_cache),
+            _ => compile_session.compile(source, cli.no_cache),
         };
 
         let compiled = match compile_res {

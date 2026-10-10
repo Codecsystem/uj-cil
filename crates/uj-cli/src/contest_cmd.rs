@@ -12,7 +12,6 @@ use std::process::ExitCode;
 use uj_core::config::ProblemConfig;
 use uj_core::tests::TestCase;
 use uj_core::verdict::Verdict;
-use uj_engine::compiler::Compiler;
 use uj_engine::scheduler::{JudgeOptions, Scheduler};
 use uj_report::result::SubmissionJudgeReport;
 use uj_sandbox::CancelToken;
@@ -234,7 +233,8 @@ pub fn run_contest(
         precise: cli.precise,
     };
 
-    let scheduler = Scheduler::new(judge_options);
+    let compile_session = uj_engine::compiler::CompileSession::new();
+    let scheduler = Scheduler::with_session(judge_options, compile_session.clone());
     let mut all_reports: Vec<SubmissionJudgeReport> = Vec::new();
     let mut standings_map: HashMap<String, ContestantStanding> = HashMap::new();
 
@@ -274,7 +274,7 @@ pub fn run_contest(
                 }
 
                 // Compile
-                let compile_res = Compiler::compile(source_path, cli.no_cache);
+                let compile_res = compile_session.compile(source_path, cli.no_cache);
                 let compiled = match compile_res {
                     Ok(c) => c,
                     Err(e) => {

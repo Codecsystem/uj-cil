@@ -71,18 +71,50 @@ pub struct DiffSummary {
     pub actual: String,
 }
 
-/// Helper to load a file into a contiguous byte buffer using mmap for large files.
-pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    let file = File::open(path)?;
+/// A contiguous byte buffer that is either owned on heap or memory-mapped.
+pub enum FileBytes {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl AsRef<[u8]> for FileBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v.as_slice(),
+            Self::Mapped(m) => &m[..],
+        }
+    }
+}
+
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+/// Helper to load a stable file (e.g. answer file) into a contiguous byte buffer.
+/// For files >= 64 KiB, maps the file into memory using Mmap and directly borrows it without `to_vec()`.
+/// For smaller files or empty files, reads the bytes from the already-opened handle without re-opening.
+pub fn read_file_bytes(path: &Path) -> Result<FileBytes, std::io::Error> {
+    let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     let len = metadata.len();
 
-    // Use memory mapping for files >= 64 KiB
+    if len == 0 {
+        return Ok(FileBytes::Owned(Vec::new()));
+    }
+
     if len >= 64 * 1024 {
-        // SAFETY: The file is opened read-only and mapped into memory.
+        // SAFETY: The file is an answer/reference file opened read-only and is expected to remain
+        // unmodified during the check comparison. The Mmap lives within FileBytes.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(mmap.to_vec())
+        Ok(FileBytes::Mapped(mmap))
     } else {
-        std::fs::read(path)
+        use std::io::Read;
+        let mut buf = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut buf)?;
+        Ok(FileBytes::Owned(buf))
     }
 }

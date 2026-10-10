@@ -136,7 +136,7 @@ impl AppContainerProfile {
     }
 
     pub fn grant_path_access(path: &std::path::Path, sid_str: &str) -> Result<(), std::io::Error> {
-        let _ = std::process::Command::new("icacls")
+        let status = std::process::Command::new("icacls")
             .arg(path)
             .arg("/grant")
             .arg(format!("*{sid_str}:(OI)(CI)F"))
@@ -145,7 +145,32 @@ impl AppContainerProfile {
             .arg("/Q")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "icacls failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn grant_path_read_execute(
+        path: &std::path::Path,
+        sid_str: &str,
+    ) -> Result<(), std::io::Error> {
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/grant")
+            .arg(format!("*{sid_str}:RX"))
+            .arg("/Q")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "icacls RX failed with status {status}"
+            )));
+        }
         Ok(())
     }
 }

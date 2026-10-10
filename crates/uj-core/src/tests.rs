@@ -140,11 +140,12 @@ pub fn discover_tests(
     } else {
         // Assign test cases to subtasks based on patterns
         for sub in &config.subtasks {
+            let pattern_set = PatternSet::compile(&sub.tests);
             let sub_total_fixed = (sub.score * 1_000_000.0).round() as u64;
             let mut matched_indices = Vec::new();
 
             for (idx, case) in cases.iter().enumerate() {
-                if test_matches_patterns(&case.name, &sub.tests) {
+                if pattern_set.is_match(&case.name) {
                     matched_indices.push(idx);
                 }
             }
@@ -169,6 +170,118 @@ pub fn discover_tests(
     Ok(cases)
 }
 
+/// A parsed, reusable pattern for subtask test matching.
+#[derive(Debug, Clone)]
+pub enum CompiledPattern {
+    Regex(Option<Regex>),
+    NumericRange {
+        start: u64,
+        end: u64,
+        exact_fallback: String,
+    },
+    Glob {
+        matcher: Option<globset::GlobMatcher>,
+        exact_fallback: String,
+    },
+    Exact(String),
+}
+
+impl CompiledPattern {
+    pub fn parse(raw: &str) -> Self {
+        let pat = raw.trim();
+
+        // 1. Regex pattern
+        if let Some(regex_str) = pat.strip_prefix("re:") {
+            let re = Regex::new(regex_str).ok();
+            return Self::Regex(re);
+        }
+
+        // 2. Numeric range pattern like "1-10"
+        if let Some((start_s, end_s)) = pat.split_once('-')
+            && let (Ok(start), Ok(end)) =
+                (start_s.trim().parse::<u64>(), end_s.trim().parse::<u64>())
+        {
+            return Self::NumericRange {
+                start,
+                end,
+                exact_fallback: pat.to_string(),
+            };
+        }
+
+        // 3. Glob pattern
+        if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+            let matcher = Glob::new(pat).ok().map(|g| g.compile_matcher());
+            return Self::Glob {
+                matcher,
+                exact_fallback: pat.to_string(),
+            };
+        }
+
+        // 4. Exact string match
+        Self::Exact(pat.to_string())
+    }
+
+    pub fn is_match(&self, stem: &str) -> bool {
+        match self {
+            Self::Regex(Some(re)) => re.is_match(stem),
+            Self::Regex(None) => false,
+            Self::NumericRange {
+                start,
+                end,
+                exact_fallback,
+            } => {
+                if let Ok(val) = stem.parse::<u64>()
+                    && (*start..=*end).contains(&val)
+                {
+                    return true;
+                }
+                exact_fallback == stem
+            }
+            Self::Glob {
+                matcher,
+                exact_fallback,
+            } => {
+                if let Some(m) = matcher
+                    && m.is_match(stem)
+                {
+                    return true;
+                }
+                exact_fallback == stem
+            }
+            Self::Exact(exact) => exact == stem,
+        }
+    }
+}
+
+/// A precompiled set of patterns for a subtask.
+#[derive(Debug, Clone, Default)]
+pub struct PatternSet {
+    patterns: Vec<CompiledPattern>,
+}
+
+impl PatternSet {
+    pub fn compile(patterns: &[String]) -> Self {
+        let compiled = patterns.iter().map(|p| CompiledPattern::parse(p)).collect();
+        Self { patterns: compiled }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub fn is_match(&self, stem: &str) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        for pat in &self.patterns {
+            if pat.is_match(stem) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Check if a test stem matches any of the given pattern specifications.
 /// Supported patterns:
 /// - Range: "1-10"
@@ -176,48 +289,7 @@ pub fn discover_tests(
 /// - Glob: "sample*"
 /// - Exact string: "sample1"
 pub fn test_matches_patterns(stem: &str, patterns: &[String]) -> bool {
-    if patterns.is_empty() {
-        return false;
-    }
-
-    for pat in patterns {
-        let pat = pat.trim();
-
-        // 1. Regex pattern
-        if let Some(regex_str) = pat.strip_prefix("re:") {
-            if let Ok(re) = Regex::new(regex_str)
-                && re.is_match(stem)
-            {
-                return true;
-            }
-            continue;
-        }
-
-        // 2. Numeric range pattern like "1-10"
-        if let Some((start_s, end_s)) = pat.split_once('-')
-            && let (Ok(start), Ok(end)) =
-                (start_s.trim().parse::<u64>(), end_s.trim().parse::<u64>())
-            && let Ok(val) = stem.parse::<u64>()
-            && (start..=end).contains(&val)
-        {
-            return true;
-        }
-
-        // 3. Glob pattern
-        if (pat.contains('*') || pat.contains('?') || pat.contains('['))
-            && let Ok(glob) = Glob::new(pat).map(|g| g.compile_matcher())
-            && glob.is_match(stem)
-        {
-            return true;
-        }
-
-        // 4. Exact string match
-        if pat == stem {
-            return true;
-        }
-    }
-
-    false
+    PatternSet::compile(patterns).is_match(stem)
 }
 
 #[cfg(test)]
@@ -245,5 +317,17 @@ mod unit_tests {
         assert!(test_matches_patterns("sample1", &patterns));
         assert!(test_matches_patterns("edge_42", &patterns));
         assert!(!test_matches_patterns("edge_abc", &patterns));
+
+        // Exact match fallback for range string itself
+        assert!(test_matches_patterns("1-10", &["1-10".to_string()]));
+
+        // Illegal regex should not match and should not panic
+        let bad_regex = vec!["re:[a-z".to_string()];
+        assert!(!test_matches_patterns("abc", &bad_regex));
+
+        // Exact fallback for special characters if glob compilation fails
+        let bad_glob = vec!["[".to_string()];
+        assert!(test_matches_patterns("[", &bad_glob));
+        assert!(!test_matches_patterns("x", &bad_glob));
     }
 }

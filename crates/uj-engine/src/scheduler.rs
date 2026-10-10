@@ -15,7 +15,7 @@ use uj_core::verdict::Verdict;
 use uj_report::result::{JudgeEvent, SingleTestResult, SubmissionJudgeReport};
 use uj_sandbox::{CancelToken, create_sandbox};
 
-use crate::compiler::{CompileResult, Compiler};
+use crate::compiler::CompileResult;
 pub use crate::judge::JudgeOptions;
 use crate::judge::{
     ResolvedChecker, aggregate_submission_report, judge_communication_test, judge_interactive_test,
@@ -35,11 +35,19 @@ pub enum SchedulerError {
 
 pub struct Scheduler {
     pub options: JudgeOptions,
+    pub session: crate::compiler::CompileSession,
 }
 
 impl Scheduler {
     pub fn new(options: JudgeOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            session: crate::compiler::CompileSession::new(),
+        }
+    }
+
+    pub fn with_session(options: JudgeOptions, session: crate::compiler::CompileSession) -> Self {
+        Self { options, session }
     }
 
     /// Run full judging pipeline for a submission against a problem.
@@ -56,8 +64,11 @@ impl Scheduler {
         cancel: &CancelToken,
     ) -> Result<SubmissionJudgeReport, SchedulerError> {
         // Pre-validate sandbox initialization and required tier
-        let _ = create_sandbox(&self.options.sandbox_mode, self.options.require_tier)
-            .map_err(|e| SchedulerError::Sandbox(format!("Failed to initialize sandbox: {e}")))?;
+        let prechecked_sandbox =
+            create_sandbox(&self.options.sandbox_mode, self.options.require_tier).map_err(|e| {
+                SchedulerError::Sandbox(format!("Failed to initialize sandbox: {e}"))
+            })?;
+        let mut prechecked_sandbox = Some(prechecked_sandbox);
 
         let limits = problem_config
             .to_limits()
@@ -65,6 +76,8 @@ impl Scheduler {
         let topology = Topology::detect(limits.memory_bytes, user_jobs);
 
         let pe_as_wa = problem_config.checker.pe_as_wa;
+
+        let compile_session = &self.session;
 
         let resolved_checker = match problem_config.checker.checker_type {
             CheckerType::Builtin => {
@@ -96,7 +109,7 @@ impl Scheduler {
                 {
                     chk_path
                 } else {
-                    let compiled_chk = Compiler::compile(&chk_path, false).map_err(|e| {
+                    let compiled_chk = compile_session.compile(&chk_path, false).map_err(|e| {
                         SchedulerError::Config(format!("Failed to compile testlib checker: {e}"))
                     })?;
                     compiled_chk.binary_path
@@ -127,7 +140,7 @@ impl Scheduler {
                 {
                     chk_path
                 } else {
-                    let compiled_chk = Compiler::compile(&chk_path, false).map_err(|e| {
+                    let compiled_chk = compile_session.compile(&chk_path, false).map_err(|e| {
                         SchedulerError::Config(format!("Failed to compile Lemon SPJ: {e}"))
                     })?;
                     compiled_chk.binary_path
@@ -162,7 +175,7 @@ impl Scheduler {
             {
                 int_path
             } else {
-                let compiled_int = Compiler::compile(&int_path, false).map_err(|e| {
+                let compiled_int = compile_session.compile(&int_path, false).map_err(|e| {
                     SchedulerError::Config(format!("Failed to compile interactor: {e}"))
                 })?;
                 compiled_int.binary_path
@@ -193,7 +206,7 @@ impl Scheduler {
             {
                 mgr_path
             } else {
-                let compiled_mgr = Compiler::compile(&mgr_path, false).map_err(|e| {
+                let compiled_mgr = compile_session.compile(&mgr_path, false).map_err(|e| {
                     SchedulerError::Config(format!("Failed to compile manager: {e}"))
                 })?;
                 compiled_mgr.binary_path
@@ -203,12 +216,42 @@ impl Scheduler {
             None
         };
 
+        // Prepare submission binary content once for native submissions
+        let prepared_exe = if compiled.interpreter_cmd.is_none()
+            && problem_config.problem_type != ProblemType::OutputOnly
+        {
+            let base_dir = tests
+                .first()
+                .map(|t| {
+                    t.input_path
+                        .parent()
+                        .and_then(|p| {
+                            if p.file_name().is_some_and(|n| n == "tests") {
+                                p.parent()
+                            } else {
+                                Some(p)
+                            }
+                        })
+                        .unwrap_or(problem_dir)
+                })
+                .unwrap_or(problem_dir);
+            match uj_sandbox::prepare_binary_content(&compiled.binary_path, base_dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return Err(SchedulerError::Sandbox(format!(
+                        "Failed to prepare submission binary: {e}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         // Sort tests by input file size descending (LPT heuristic)
+        use std::cmp::Reverse;
         let mut sorted_tests = tests.clone();
-        sorted_tests.sort_by(|a, b| {
-            let size_a = fs::metadata(&a.input_path).map(|m| m.len()).unwrap_or(0);
-            let size_b = fs::metadata(&b.input_path).map(|m| m.len()).unwrap_or(0);
-            size_b.cmp(&size_a)
+        sorted_tests.sort_by_cached_key(|test| {
+            Reverse(fs::metadata(&test.input_path).map(|m| m.len()).unwrap_or(0))
         });
 
         let total_tests = sorted_tests.len();
@@ -228,12 +271,17 @@ impl Scheduler {
         let (task_tx, task_rx) = unbounded::<TestCase>();
         let (result_tx, result_rx) = bounded::<SingleTestResult>(total_tests.max(1));
 
-        let slot_count = topology.slots.len();
+        let slot_count = topology.slots.len().min(total_tests);
         let mut worker_handles = Vec::with_capacity(slot_count);
 
         // Spawn workers
         for worker_id in 0..slot_count {
             let slot = topology.slots[worker_id].clone();
+            let initial_sandbox = if worker_id == 0 {
+                prechecked_sandbox.take()
+            } else {
+                None
+            };
             let task_rx_clone = task_rx.clone();
             let result_tx_clone = result_tx.clone();
             let cancel_clone = cancel.clone();
@@ -242,6 +290,7 @@ impl Scheduler {
             let limits_clone = limits.clone();
             let exe_path = compiled.binary_path.clone();
             let interpreter_cmd = compiled.interpreter_cmd.clone();
+            let prepared_exe_clone = prepared_exe.clone();
             let sandbox_mode = self.options.sandbox_mode.clone();
             let require_tier = self.options.require_tier;
             let fail_fast = self.options.fail_fast;
@@ -252,17 +301,73 @@ impl Scheduler {
             let io_config = problem_config.io.clone();
 
             let handle = thread::spawn(move || {
-                let sandbox = match create_sandbox(&sandbox_mode, require_tier) {
-                    Ok(sb) => sb,
-                    Err(e) => {
-                        eprintln!("Worker failed to initialize sandbox: {e}");
-                        return;
+                let sandbox_res = match initial_sandbox {
+                    Some(sb) => Ok(sb),
+                    None => create_sandbox(&sandbox_mode, require_tier),
+                };
+
+                let (sandbox, init_error) = match sandbox_res {
+                    Ok(sb) => (Some(sb), None),
+                    Err(e) => (None, Some(e)),
+                };
+
+                let auth_error = if let Some(ref sb) = sandbox {
+                    if let Some(ref p) = prepared_exe_clone {
+                        sb.authorize_executable(p).err()
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 };
 
                 while let Ok(test) = task_rx_clone.recv() {
                     if cancel_clone.is_cancelled() {
                         break;
+                    }
+
+                    if let Some(ref err) = init_error {
+                        let failed_result = SingleTestResult {
+                            id: test.name.clone(),
+                            subtask: test.subtask_id,
+                            verdict: Verdict::JudgeFailed,
+                            score: 0.0,
+                            time_ms: 0,
+                            wall_ms: 0,
+                            memory_kb: 0,
+                            exit: Default::default(),
+                            message: Some(format!("Worker failed to initialize sandbox: {err}")),
+                            checker: None,
+                            diff: None,
+                            timing: Default::default(),
+                            sandbox_tier: None,
+                        };
+                        let _ = result_tx_clone.send(failed_result);
+                        continue;
+                    }
+
+                    let sandbox = sandbox.as_ref().unwrap();
+
+                    if let Some(ref err) = auth_error {
+                        let failed_result = SingleTestResult {
+                            id: test.name.clone(),
+                            subtask: test.subtask_id,
+                            verdict: Verdict::JudgeFailed,
+                            score: 0.0,
+                            time_ms: 0,
+                            wall_ms: 0,
+                            memory_kb: 0,
+                            exit: Default::default(),
+                            message: Some(format!(
+                                "Failed to authorize executable for sandbox slot: {err}"
+                            )),
+                            checker: None,
+                            diff: None,
+                            timing: Default::default(),
+                            sandbox_tier: Some(sandbox.tier()),
+                        };
+                        let _ = result_tx_clone.send(failed_result);
+                        continue;
                     }
 
                     // Fail fast check: skip if same subtask already failed
@@ -305,6 +410,7 @@ impl Scheduler {
                                 sandbox.as_ref(),
                                 &exe_path,
                                 interpreter_cmd.as_deref(),
+                                prepared_exe_clone.as_deref(),
                                 int_exe,
                                 &test,
                                 &limits_clone,
@@ -328,6 +434,7 @@ impl Scheduler {
                                     mgr_exe,
                                     &exe_path,
                                     interpreter_cmd.as_deref(),
+                                    prepared_exe_clone.as_deref(),
                                     &test,
                                     &limits_clone,
                                     &cancel_clone,
@@ -337,6 +444,7 @@ impl Scheduler {
                                     sandbox.as_ref(),
                                     &exe_path,
                                     interpreter_cmd.as_deref(),
+                                    prepared_exe_clone.as_deref(),
                                     &test,
                                     &limits_clone,
                                     &checker_clone,
@@ -351,6 +459,7 @@ impl Scheduler {
                             sandbox.as_ref(),
                             &exe_path,
                             interpreter_cmd.as_deref(),
+                            prepared_exe_clone.as_deref(),
                             &test,
                             &limits_clone,
                             &checker_clone,
@@ -428,10 +537,45 @@ impl Scheduler {
                 }
             }
 
-            if !candidate_indices.is_empty()
-                && let Ok(exclusive_sandbox) =
-                    create_sandbox(&self.options.sandbox_mode, self.options.require_tier)
-            {
+            if !candidate_indices.is_empty() {
+                let exclusive_sandbox = match create_sandbox(
+                    &self.options.sandbox_mode,
+                    self.options.require_tier,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        for &idx in &candidate_indices {
+                            test_results[idx].verdict = Verdict::JudgeFailed;
+                            test_results[idx].message = Some(format!(
+                                "Precise rejudge failed: could not create exclusive sandbox: {e}"
+                            ));
+                        }
+                        return Ok(aggregate_submission_report(
+                            &problem_config.name,
+                            submission_name,
+                            problem_config,
+                            test_results,
+                        ));
+                    }
+                };
+
+                if let Some(ref p) = prepared_exe
+                    && let Err(e) = exclusive_sandbox.authorize_executable(p)
+                {
+                    for &idx in &candidate_indices {
+                        test_results[idx].verdict = Verdict::JudgeFailed;
+                        test_results[idx].message = Some(format!(
+                            "Precise rejudge failed: could not authorize executable: {e}"
+                        ));
+                    }
+                    return Ok(aggregate_submission_report(
+                        &problem_config.name,
+                        submission_name,
+                        problem_config,
+                        test_results,
+                    ));
+                }
+
                 for &idx in &candidate_indices {
                     if cancel.is_cancelled() {
                         break;
@@ -459,6 +603,7 @@ impl Scheduler {
                                     exclusive_sandbox.as_ref(),
                                     &compiled.binary_path,
                                     compiled.interpreter_cmd.as_deref(),
+                                    prepared_exe.as_deref(),
                                     int_exe,
                                     orig_test,
                                     &limits,
@@ -472,6 +617,7 @@ impl Scheduler {
                                 exclusive_sandbox.as_ref(),
                                 &compiled.binary_path,
                                 compiled.interpreter_cmd.as_deref(),
+                                prepared_exe.as_deref(),
                                 orig_test,
                                 &limits,
                                 &resolved_checker,

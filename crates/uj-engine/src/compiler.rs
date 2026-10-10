@@ -67,29 +67,48 @@ impl Language {
     }
 }
 
-pub struct Compiler;
+/// A compilation session that caches compiler lookup, `--version` query outputs,
+/// merged languages configurations, and problem limits within a command or request.
+#[derive(Clone, Default)]
+pub struct CompileSession {
+    inner: std::sync::Arc<CompileSessionInner>,
+}
 
-impl Compiler {
-    /// Compile source file, utilizing .uj/cache/bin/<blake3> caching.
-    pub fn compile(source_path: &Path, no_cache: bool) -> Result<CompileResult, CompileError> {
-        Self::compile_with_options(source_path, &[], &[], no_cache)
+#[derive(Default)]
+struct CompileSessionInner {
+    compiler_bins: parking_lot::Mutex<std::collections::HashMap<String, Result<PathBuf, String>>>,
+    compiler_versions: parking_lot::Mutex<std::collections::HashMap<PathBuf, String>>,
+    languages_configs: parking_lot::Mutex<
+        std::collections::HashMap<Option<PathBuf>, uj_core::config::LanguagesConfig>,
+    >,
+    problem_limits: parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, u64, u64)>>,
+}
+
+impl CompileSession {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Compile source file with extra source files (e.g. grader.cpp) and include directories.
-    pub fn compile_with_options(
+    pub fn compile(
+        &self,
         source_path: &Path,
-        extra_sources: &[PathBuf],
-        include_dirs: &[PathBuf],
         no_cache: bool,
     ) -> Result<CompileResult, CompileError> {
-        let start = Instant::now();
-        let source_bytes = fs::read(source_path)?;
+        self.compile_with_options(source_path, &[], &[], no_cache)
+    }
 
-        let problem_dir = source_path
-            .ancestors()
-            .find(|p| p.join("problem.toml").exists() || p.join(".uj").exists());
+    fn resolve_languages_config(
+        &self,
+        problem_dir: Option<&Path>,
+    ) -> uj_core::config::LanguagesConfig {
+        let key = problem_dir.map(|p| p.to_path_buf());
+        {
+            let cache = self.inner.languages_configs.lock();
+            if let Some(cfg) = cache.get(&key) {
+                return cfg.clone();
+            }
+        }
 
-        // 1. Load and merge languages.toml
         let mut lang_configs =
             uj_core::config::LanguagesConfig::from_toml_str(DEFAULT_LANGUAGES_TOML, None)
                 .unwrap_or_default();
@@ -121,6 +140,98 @@ impl Compiler {
             }
         }
 
+        let mut cache = self.inner.languages_configs.lock();
+        cache.insert(key, lang_configs.clone());
+        lang_configs
+    }
+
+    fn resolve_compiler_bin(&self, cmd_name: &str) -> Result<PathBuf, CompileError> {
+        let mut cache = self.inner.compiler_bins.lock();
+        if let Some(res) = cache.get(cmd_name) {
+            return res.clone().map_err(CompileError::CompilerNotFound);
+        }
+        let res = which::which(cmd_name).map_err(|_| cmd_name.to_string());
+        cache.insert(cmd_name.to_string(), res.clone());
+        res.map_err(CompileError::CompilerNotFound)
+    }
+
+    fn resolve_compiler_version(&self, bin: &Path) -> String {
+        let mut cache = self.inner.compiler_versions.lock();
+        if let Some(ver) = cache.get(bin) {
+            return ver.clone();
+        }
+        let version_output = Command::new(bin)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let version_line = version_output
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+        cache.insert(bin.to_path_buf(), version_line.clone());
+        version_line
+    }
+
+    fn resolve_problem_limits(&self, problem_dir: Option<&Path>) -> (u64, u64, u64) {
+        let Some(pdir) = problem_dir else {
+            return (256, 256, 268435456);
+        };
+        let mut cache = self.inner.problem_limits.lock();
+        if let Some(&limits) = cache.get(pdir) {
+            return limits;
+        }
+
+        let mut mem_mb: u64 = 256;
+        let mut stack_mb: u64 = 256;
+        let mut stack_bytes: u64 = 268435456;
+
+        let ptoml = pdir.join("problem.toml");
+        if ptoml.is_file()
+            && let Ok(content) = fs::read_to_string(&ptoml)
+            && let Ok(pcfg) = uj_core::config::ProblemConfig::from_toml_str(&content, Some(&ptoml))
+        {
+            if let Ok(b) = uj_core::config::parse_bytes(&pcfg.limits.memory) {
+                mem_mb = b / (1024 * 1024);
+            }
+            if let Some(ref stk) = pcfg.limits.stack {
+                if stk.eq_ignore_ascii_case("same") || stk.eq_ignore_ascii_case("unlimited") {
+                    stack_mb = mem_mb;
+                    stack_bytes = stack_mb * 1024 * 1024;
+                } else if let Ok(b) = uj_core::config::parse_bytes(stk) {
+                    stack_bytes = b;
+                    stack_mb = b / (1024 * 1024);
+                }
+            } else {
+                stack_mb = mem_mb;
+                stack_bytes = stack_mb * 1024 * 1024;
+            }
+        }
+
+        let res = (mem_mb, stack_mb, stack_bytes);
+        cache.insert(pdir.to_path_buf(), res);
+        res
+    }
+
+    /// Compile source file with extra source files and include directories using this session's cache.
+    pub fn compile_with_options(
+        &self,
+        source_path: &Path,
+        extra_sources: &[PathBuf],
+        include_dirs: &[PathBuf],
+        no_cache: bool,
+    ) -> Result<CompileResult, CompileError> {
+        let start = Instant::now();
+        let source_bytes = fs::read(source_path)?;
+
+        let problem_dir = source_path
+            .ancestors()
+            .find(|p| p.join("problem.toml").exists() || p.join(".uj").exists());
+
+        // 1. Load and merge languages.toml using session cache
+        let lang_configs = self.resolve_languages_config(problem_dir);
+
         let ext = source_path
             .extension()
             .and_then(|e| e.to_str())
@@ -131,8 +242,9 @@ impl Compiler {
 
         // 2. Handle interpreted languages (e.g. Python)
         if ext.eq_ignore_ascii_case("py") {
-            let python_bin = which::which("python3")
-                .or_else(|_| which::which("python"))
+            let python_bin = self
+                .resolve_compiler_bin("python3")
+                .or_else(|_| self.resolve_compiler_bin("python"))
                 .map_err(|_| CompileError::CompilerNotFound("python3/python".to_string()))?;
 
             let py_compile = Command::new(&python_bin)
@@ -167,46 +279,13 @@ impl Compiler {
         })?;
 
         let compiler_cmd_name = &compile_template[0];
-        let compiler_bin = which::which(compiler_cmd_name)
-            .map_err(|_| CompileError::CompilerNotFound(compiler_cmd_name.to_string()))?;
+        let compiler_bin = self.resolve_compiler_bin(compiler_cmd_name)?;
 
-        // Query compiler version for cache key uniqueness
-        let version_output = Command::new(&compiler_bin)
-            .arg("--version")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        let version_line = version_output.lines().next().unwrap_or("unknown");
+        // Query compiler version using session cache
+        let version_line = self.resolve_compiler_version(&compiler_bin);
 
-        // Dynamically resolve memory_mb, stack_mb, and stack_bytes from problem.toml if available
-        let mut mem_mb: u64 = 256;
-        let mut stack_mb: u64 = 256;
-        let mut stack_bytes: u64 = 268435456;
-
-        if let Some(pdir) = problem_dir {
-            let ptoml = pdir.join("problem.toml");
-            if ptoml.is_file()
-                && let Ok(content) = fs::read_to_string(&ptoml)
-                && let Ok(pcfg) =
-                    uj_core::config::ProblemConfig::from_toml_str(&content, Some(&ptoml))
-            {
-                if let Ok(b) = uj_core::config::parse_bytes(&pcfg.limits.memory) {
-                    mem_mb = b / (1024 * 1024);
-                }
-                if let Some(ref stk) = pcfg.limits.stack {
-                    if stk.eq_ignore_ascii_case("same") || stk.eq_ignore_ascii_case("unlimited") {
-                        stack_mb = mem_mb;
-                        stack_bytes = stack_mb * 1024 * 1024;
-                    } else if let Ok(b) = uj_core::config::parse_bytes(stk) {
-                        stack_bytes = b;
-                        stack_mb = b / (1024 * 1024);
-                    }
-                } else {
-                    stack_mb = mem_mb;
-                    stack_bytes = stack_mb * 1024 * 1024;
-                }
-            }
-        }
+        // Dynamically resolve memory_mb, stack_mb, and stack_bytes from problem.toml using session cache
+        let (mem_mb, stack_mb, stack_bytes) = self.resolve_problem_limits(problem_dir);
 
         // 4. Compute Blake3 cache key (including source, flags, version, and headers)
         let mut hasher = blake3::Hasher::new();
@@ -375,6 +454,30 @@ impl Compiler {
             duration_ms,
             cached: false,
         })
+    }
+}
+
+pub struct Compiler;
+
+impl Compiler {
+    /// Compile source file, utilizing .uj/cache/bin/<blake3> caching.
+    pub fn compile(source_path: &Path, no_cache: bool) -> Result<CompileResult, CompileError> {
+        CompileSession::new().compile(source_path, no_cache)
+    }
+
+    /// Compile source file with extra source files (e.g. grader.cpp) and include directories.
+    pub fn compile_with_options(
+        source_path: &Path,
+        extra_sources: &[PathBuf],
+        include_dirs: &[PathBuf],
+        no_cache: bool,
+    ) -> Result<CompileResult, CompileError> {
+        CompileSession::new().compile_with_options(
+            source_path,
+            extra_sources,
+            include_dirs,
+            no_cache,
+        )
     }
 }
 

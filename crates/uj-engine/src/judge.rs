@@ -44,6 +44,7 @@ pub fn judge_single_test(
     sandbox: &dyn Sandbox,
     exe_path: &Path,
     interpreter_cmd: Option<&[String]>,
+    prepared_exe: Option<&Path>,
     test: &TestCase,
     limits: &Limits,
     checker: &ResolvedChecker,
@@ -64,13 +65,27 @@ pub fn judge_single_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = sandbox
-        .create_box_dir(base_dir)
-        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
-    let run_dir = box_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| box_dir.clone());
+    let box_dir = match sandbox.create_box_dir(base_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms: 0,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                message: Some(format!("Failed to create sandbox box directory: {e}")),
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: Some(sandbox.tier()),
+            };
+        }
+    };
+    let run_dir = box_dir.parent().map(|p| p.to_path_buf());
 
     let is_file_io = io.is_some_and(|i| {
         i.mode == uj_core::config::IoMode::File || i.input_name.is_some() || i.output_name.is_some()
@@ -103,6 +118,8 @@ pub fn judge_single_test(
             }
         }
         modified_cmd
+    } else if let Some(p) = prepared_exe {
+        vec![p.to_path_buf().into_os_string()]
     } else {
         let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(exe_path, base_dir)
             .unwrap_or_else(|_| exe_path.to_path_buf());
@@ -164,7 +181,9 @@ pub fn judge_single_test(
     let res = match run_res {
         Ok(r) => r,
         Err(e) => {
-            let _ = fs::remove_dir_all(&run_dir);
+            if let Some(ref rd) = run_dir {
+                let _ = fs::remove_dir_all(rd);
+            }
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -299,10 +318,10 @@ pub fn judge_single_test(
                         let ans_bytes = test
                             .answer_path
                             .as_ref()
-                            .and_then(|p| uj_checker::read_file_bytes(p).ok())
-                            .unwrap_or_default();
+                            .and_then(|p| uj_checker::read_file_bytes(p).ok());
+                        let ans_slice = ans_bytes.as_deref().unwrap_or(b"");
 
-                        let check_res = b.check(&stdout_bytes, &ans_bytes);
+                        let check_res = b.check(&stdout_bytes, ans_slice);
                         let diff = check_res.diff.map(|d| DiffSummary {
                             line: d.line,
                             column: d.column,
@@ -320,7 +339,7 @@ pub fn judge_single_test(
                         )
                     }
                     ResolvedChecker::Testlib(chk_exe) => {
-                        let out_file = run_dir.join(format!(
+                        let out_file = box_dir.join(format!(
                             "uj_out_{}_{}_{}.txt",
                             std::process::id(),
                             test.name,
@@ -355,7 +374,7 @@ pub fn judge_single_test(
                         path: chk_exe,
                         full_score,
                     } => {
-                        let out_file = run_dir.join(format!(
+                        let out_file = box_dir.join(format!(
                             "uj_out_{}_{}_{}.txt",
                             std::process::id(),
                             test.name,
@@ -398,7 +417,9 @@ pub fn judge_single_test(
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
 
     // Clean up isolated run directory and all files inside it
-    let _ = fs::remove_dir_all(&run_dir);
+    if let Some(ref rd) = run_dir {
+        let _ = fs::remove_dir_all(rd);
+    }
 
     SingleTestResult {
         id: test.name.clone(),
@@ -583,6 +604,7 @@ pub fn judge_interactive_test(
     sandbox: &dyn Sandbox,
     exe_path: &Path,
     interpreter_cmd: Option<&[String]>,
+    prepared_exe: Option<&Path>,
     interactor_exe: &Path,
     test: &TestCase,
     limits: &Limits,
@@ -602,13 +624,27 @@ pub fn judge_interactive_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = sandbox
-        .create_box_dir(base_dir)
-        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
-    let run_dir = box_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| box_dir.clone());
+    let box_dir = match sandbox.create_box_dir(base_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms: 0,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                message: Some(format!("Failed to create sandbox box directory: {e}")),
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: Some(sandbox.tier()),
+            };
+        }
+    };
+    let run_dir = box_dir.parent().map(|p| p.to_path_buf());
 
     let argv_sol = if let Some(cmd) = interpreter_cmd {
         let mut modified_cmd = Vec::new();
@@ -627,6 +663,8 @@ pub fn judge_interactive_test(
             }
         }
         modified_cmd
+    } else if let Some(p) = prepared_exe {
+        vec![p.to_path_buf().into_os_string()]
     } else {
         let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(exe_path, base_dir)
             .unwrap_or_else(|_| exe_path.to_path_buf());
@@ -639,8 +677,8 @@ pub fn judge_interactive_test(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    let tout_file = run_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
-    let result_file = run_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
+    let tout_file = box_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
+    let result_file = box_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
 
     let spec_sol = RunSpec {
         argv: argv_sol,
@@ -676,7 +714,7 @@ pub fn judge_interactive_test(
     let spec_int = RunSpec {
         argv: argv_int,
         env: vec![],
-        work_dir: run_dir.clone(),
+        work_dir: box_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::Pipe,
         stdout: Stdio::Pipe,
@@ -708,7 +746,9 @@ pub fn judge_interactive_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) => {
-            let _ = fs::remove_dir_all(&run_dir);
+            if let Some(ref rd) = run_dir {
+                let _ = fs::remove_dir_all(rd);
+            }
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -726,7 +766,9 @@ pub fn judge_interactive_test(
             };
         }
         Err(e) => {
-            let _ = fs::remove_dir_all(&run_dir);
+            if let Some(ref rd) = run_dir {
+                let _ = fs::remove_dir_all(rd);
+            }
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -868,8 +910,9 @@ pub fn judge_interactive_test(
                 match chk {
                     ResolvedChecker::Builtin(b) => {
                         let tout_bytes = fs::read(&tout_file).unwrap_or_default();
-                        let ans_bytes = uj_checker::read_file_bytes(ans_file).unwrap_or_default();
-                        let check_res = b.check(&tout_bytes, &ans_bytes);
+                        let ans_bytes = uj_checker::read_file_bytes(ans_file).ok();
+                        let ans_slice = ans_bytes.as_deref().unwrap_or(b"");
+                        let check_res = b.check(&tout_bytes, ans_slice);
                         (check_res.verdict, check_res.score_ratio, check_res.message)
                     }
                     ResolvedChecker::Testlib(chk_exe) => {
@@ -910,7 +953,9 @@ pub fn judge_interactive_test(
         }
     };
 
-    let _ = fs::remove_dir_all(&run_dir);
+    if let Some(ref rd) = run_dir {
+        let _ = fs::remove_dir_all(rd);
+    }
 
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
 
@@ -1010,8 +1055,9 @@ pub fn judge_output_only_test(
     let (mut verdict, score_ratio, checker_msg, diff) = match checker {
         ResolvedChecker::Builtin(b) => {
             let out_bytes = fs::read(&existing_out).unwrap_or_default();
-            let ans_bytes = uj_checker::read_file_bytes(ans_file).unwrap_or_default();
-            let check_res = b.check(&out_bytes, &ans_bytes);
+            let ans_bytes = uj_checker::read_file_bytes(ans_file).ok();
+            let ans_slice = ans_bytes.as_deref().unwrap_or(b"");
+            let check_res = b.check(&out_bytes, ans_slice);
             let diff = check_res.diff.map(|d| DiffSummary {
                 line: d.line,
                 column: d.column,
@@ -1094,11 +1140,13 @@ pub fn judge_output_only_test(
 }
 
 /// Evaluate a communication problem with manager and participant instances.
+#[allow(clippy::too_many_arguments)]
 pub fn judge_communication_test(
     sandbox: &dyn Sandbox,
     manager_exe: &Path,
     participant_exe: &Path,
     interpreter_cmd: Option<&[String]>,
+    prepared_exe: Option<&Path>,
     test: &TestCase,
     limits: &Limits,
     cancel: &CancelToken,
@@ -1115,13 +1163,27 @@ pub fn judge_communication_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = sandbox
-        .create_box_dir(base_dir)
-        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
-    let run_dir = box_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| box_dir.clone());
+    let box_dir = match sandbox.create_box_dir(base_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms: 0,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                message: Some(format!("Failed to create sandbox box directory: {e}")),
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: Some(sandbox.tier()),
+            };
+        }
+    };
+    let run_dir = box_dir.parent().map(|p| p.to_path_buf());
 
     let argv_sol = if let Some(cmd) = interpreter_cmd {
         let mut modified_cmd = Vec::new();
@@ -1140,6 +1202,8 @@ pub fn judge_communication_test(
             }
         }
         modified_cmd
+    } else if let Some(p) = prepared_exe {
+        vec![p.to_path_buf().into_os_string()]
     } else {
         let authorized_exe =
             uj_sandbox::get_or_prepare_authorized_binary(participant_exe, base_dir)
@@ -1156,7 +1220,7 @@ pub fn judge_communication_test(
             test.input_path.as_os_str().to_os_string(),
         ],
         env: vec![],
-        work_dir: run_dir.clone(),
+        work_dir: box_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::Inherit,
         stdout: Stdio::Pipe,
@@ -1203,7 +1267,9 @@ pub fn judge_communication_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) | Err(_) => {
-            let _ = fs::remove_dir_all(&run_dir);
+            if let Some(ref rd) = run_dir {
+                let _ = fs::remove_dir_all(rd);
+            }
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -1260,7 +1326,9 @@ pub fn judge_communication_test(
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
 
     // Clean up isolated run directory
-    let _ = fs::remove_dir_all(&run_dir);
+    if let Some(ref rd) = run_dir {
+        let _ = fs::remove_dir_all(rd);
+    }
 
     SingleTestResult {
         id: test.name.clone(),

@@ -13,7 +13,7 @@ use serde_json::Value;
 use uj_core::config::{ProblemConfig, SolutionTag};
 use uj_core::run::{Limits, RunSpec, Stdio};
 use uj_core::verdict::Verdict;
-use uj_engine::compiler::Compiler;
+use uj_engine::compiler::CompileSession;
 use uj_engine::judge::JudgeOptions;
 use uj_engine::scheduler::Scheduler;
 use uj_report::result::SubmissionJudgeReport;
@@ -399,12 +399,13 @@ fn dispatch_tool_call(
                 }
             }
 
+            let session = CompileSession::new();
             let mut results = Vec::new();
             for target in targets {
                 if target.extension().is_some_and(|e| e == "exe") {
                     continue;
                 }
-                let c = Compiler::compile(&target, false)?;
+                let c = session.compile(&target, false)?;
                 results.push(serde_json::json!({
                     "target": target.to_string_lossy(),
                     "duration_ms": c.duration_ms,
@@ -446,11 +447,12 @@ fn dispatch_tool_call(
                 fail_fast: false,
                 precise: true,
             };
-            let scheduler = Scheduler::new(judge_options);
+            let session = CompileSession::new();
+            let scheduler = Scheduler::with_session(judge_options, session.clone());
             let mut reports = Vec::new();
 
             for src in &sources {
-                let compiled = Compiler::compile(src, false)?;
+                let compiled = session.compile(src, false)?;
                 let sub_name = src
                     .file_name()
                     .unwrap_or_default()
@@ -489,14 +491,15 @@ fn dispatch_tool_call(
                 fail_fast: false,
                 precise: true,
             };
-            let scheduler = Scheduler::new(judge_options);
+            let session = CompileSession::new();
+            let scheduler = Scheduler::with_session(judge_options, session.clone());
 
             let mut verifications = Vec::new();
             let mut all_match = true;
 
             for sol in &cfg.solutions {
                 let sol_path = problem_dir.join(&sol.path);
-                let compiled = Compiler::compile(&sol_path, false)?;
+                let compiled = session.compile(&sol_path, false)?;
                 let sub_name = sol.path.to_string_lossy().to_string();
                 let report = scheduler.judge_submission(
                     problem_dir,
@@ -535,19 +538,20 @@ fn dispatch_tool_call(
             let config_path = problem_dir.join("problem.toml");
             let content = fs::read_to_string(&config_path)?;
             let cfg = ProblemConfig::from_toml_str(&content, Some(&config_path))?;
+            let session = CompileSession::new();
 
             // 1. Build
             let mut compiled_count = 0;
             if let Some(ref val) = cfg.validator {
-                Compiler::compile(&problem_dir.join(val), false)?;
+                session.compile(&problem_dir.join(val), false)?;
                 compiled_count += 1;
             }
             if let Some(ref chk) = cfg.checker.path {
-                Compiler::compile(&problem_dir.join(chk), false)?;
+                session.compile(&problem_dir.join(chk), false)?;
                 compiled_count += 1;
             }
             for sol in &cfg.solutions {
-                Compiler::compile(&problem_dir.join(&sol.path), false)?;
+                session.compile(&problem_dir.join(&sol.path), false)?;
                 compiled_count += 1;
             }
 
@@ -578,9 +582,10 @@ fn dispatch_tool_call(
                 .ok_or("brute required")?;
             let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
 
-            let compiled_gen = Compiler::compile(&problem_dir.join(gen_str), false)?;
-            let compiled_sol = Compiler::compile(&problem_dir.join(sol_str), false)?;
-            let compiled_brute = Compiler::compile(&problem_dir.join(brute_str), false)?;
+            let session = CompileSession::new();
+            let compiled_gen = session.compile(&problem_dir.join(gen_str), false)?;
+            let compiled_sol = session.compile(&problem_dir.join(sol_str), false)?;
+            let compiled_brute = session.compile(&problem_dir.join(brute_str), false)?;
 
             let sandbox = create_sandbox("auto", false)?;
             let mut tested = 0;

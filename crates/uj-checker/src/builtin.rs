@@ -255,40 +255,81 @@ pub fn check_wcmp(output: &[u8], answer: &[u8]) -> CheckResult {
 
 /// Line-by-line comparison ignoring trailing whitespace and blank lines (fcmp).
 pub fn check_fcmp(output: &[u8], answer: &[u8]) -> CheckResult {
-    let out_lines = split_lines_strip(output);
-    let ans_lines = split_lines_strip(answer);
+    let mut out_iter = output.split(|&b| b == b'\n').map(strip_line_trailing);
+    let mut ans_iter = answer.split(|&b| b == b'\n').map(strip_line_trailing);
+    let mut line_num = 1;
 
-    let max_lines = out_lines.len().max(ans_lines.len());
-    for i in 0..max_lines {
-        let out_line = out_lines.get(i).copied().unwrap_or(b"");
-        let ans_line = ans_lines.get(i).copied().unwrap_or(b"");
+    loop {
+        let out_opt = out_iter.next();
+        let ans_opt = ans_iter.next();
 
-        if out_line != ans_line {
-            return CheckResult::wrong_answer(
-                format!("Line mismatch at line {}", i + 1),
-                Some(DiffSummary {
-                    line: i + 1,
-                    column: 1,
-                    token_index: 0,
-                    expected: String::from_utf8_lossy(ans_line).to_string(),
-                    actual: String::from_utf8_lossy(out_line).to_string(),
-                }),
-            );
+        match (out_opt, ans_opt) {
+            (Some(out_line), Some(ans_line)) => {
+                if out_line != ans_line {
+                    return CheckResult::wrong_answer(
+                        format!("Line mismatch at line {line_num}"),
+                        Some(DiffSummary {
+                            line: line_num,
+                            column: 1,
+                            token_index: 0,
+                            expected: String::from_utf8_lossy(ans_line).to_string(),
+                            actual: String::from_utf8_lossy(out_line).to_string(),
+                        }),
+                    );
+                }
+                line_num += 1;
+            }
+            (Some(out_line), None) => {
+                if !out_line.is_empty() {
+                    return CheckResult::wrong_answer(
+                        format!("Line mismatch at line {line_num}"),
+                        Some(DiffSummary {
+                            line: line_num,
+                            column: 1,
+                            token_index: 0,
+                            expected: String::new(),
+                            actual: String::from_utf8_lossy(out_line).to_string(),
+                        }),
+                    );
+                }
+                line_num += 1;
+            }
+            (None, Some(ans_line)) => {
+                if !ans_line.is_empty() {
+                    return CheckResult::wrong_answer(
+                        format!("Line mismatch at line {line_num}"),
+                        Some(DiffSummary {
+                            line: line_num,
+                            column: 1,
+                            token_index: 0,
+                            expected: String::from_utf8_lossy(ans_line).to_string(),
+                            actual: String::new(),
+                        }),
+                    );
+                }
+                line_num += 1;
+            }
+            (None, None) => return CheckResult::accepted(),
         }
     }
-
-    CheckResult::accepted()
 }
 
 /// Line-by-line token comparison (lcmp).
 pub fn check_lcmp(output: &[u8], answer: &[u8]) -> CheckResult {
-    let out_raw_lines = split_raw_lines(output);
-    let ans_raw_lines = split_raw_lines(answer);
+    let mut out_iter = output.split(|&b| b == b'\n').map(strip_raw_line);
+    let mut ans_iter = answer.split(|&b| b == b'\n').map(strip_raw_line);
+    let mut line_num = 1;
 
-    let max_lines = out_raw_lines.len().max(ans_raw_lines.len());
-    for i in 0..max_lines {
-        let out_line = out_raw_lines.get(i).copied().unwrap_or(b"");
-        let ans_line = ans_raw_lines.get(i).copied().unwrap_or(b"");
+    loop {
+        let out_opt = out_iter.next();
+        let ans_opt = ans_iter.next();
+
+        if out_opt.is_none() && ans_opt.is_none() {
+            break;
+        }
+
+        let out_line = out_opt.unwrap_or(b"");
+        let ans_line = ans_opt.unwrap_or(b"");
 
         let mut out_tokens = TokenIterator::new(out_line);
         let mut ans_tokens = TokenIterator::new(ans_line);
@@ -298,9 +339,9 @@ pub fn check_lcmp(output: &[u8], answer: &[u8]) -> CheckResult {
                 (Some(o), Some(a)) => {
                     if o.slice != a.slice {
                         return CheckResult::wrong_answer(
-                            format!("Line {}, token {} mismatch", i + 1, a.index),
+                            format!("Line {}, token {} mismatch", line_num, a.index),
                             Some(DiffSummary {
-                                line: i + 1,
+                                line: line_num,
                                 column: o.col,
                                 token_index: a.index,
                                 expected: a.snippet(100),
@@ -312,9 +353,9 @@ pub fn check_lcmp(output: &[u8], answer: &[u8]) -> CheckResult {
                 (None, None) => break,
                 (None, Some(a)) => {
                     return CheckResult::wrong_answer(
-                        format!("Line {} missing expected token {}", i + 1, a.index),
+                        format!("Line {} missing expected token {}", line_num, a.index),
                         Some(DiffSummary {
-                            line: i + 1,
+                            line: line_num,
                             column: a.col,
                             token_index: a.index,
                             expected: a.snippet(100),
@@ -324,9 +365,9 @@ pub fn check_lcmp(output: &[u8], answer: &[u8]) -> CheckResult {
                 }
                 (Some(o), None) => {
                     return CheckResult::wrong_answer(
-                        format!("Line {} has unexpected token {}", i + 1, o.index),
+                        format!("Line {} has unexpected token {}", line_num, o.index),
                         Some(DiffSummary {
-                            line: i + 1,
+                            line: line_num,
                             column: o.col,
                             token_index: o.index,
                             expected: "<EOL>".to_string(),
@@ -336,6 +377,8 @@ pub fn check_lcmp(output: &[u8], answer: &[u8]) -> CheckResult {
                 }
             }
         }
+
+        line_num += 1;
     }
 
     CheckResult::accepted()
@@ -461,7 +504,7 @@ pub fn check_hcmp(output: &[u8], answer: &[u8]) -> CheckResult {
                                 line: out_tok.line,
                                 column: out_tok.col,
                                 token_index: out_tok.index,
-                                expected: ans_norm,
+                                expected: ans_norm.to_string(),
                                 actual: out_tok.snippet(100),
                             }),
                         );
@@ -469,17 +512,19 @@ pub fn check_hcmp(output: &[u8], answer: &[u8]) -> CheckResult {
                 };
 
                 if out_norm != ans_norm {
+                    let ans_str = ans_norm.to_string();
+                    let out_str = out_norm.to_string();
                     return CheckResult::wrong_answer(
                         format!(
                             "BigInt mismatch at #{} (expected {}, found {})",
-                            ans_tok.index, ans_norm, out_norm
+                            ans_tok.index, ans_str, out_str
                         ),
                         Some(DiffSummary {
                             line: out_tok.line,
                             column: out_tok.col,
                             token_index: ans_tok.index,
-                            expected: ans_norm,
-                            actual: out_norm,
+                            expected: ans_str,
+                            actual: out_str,
                         }),
                     );
                 }
@@ -668,54 +713,43 @@ pub fn check_yesno(output: &[u8], answer: &[u8]) -> CheckResult {
 // Internal Helpers
 // ----------------------------------------------------------------------------
 
-fn split_lines_strip(input: &[u8]) -> Vec<&[u8]> {
-    let mut lines = Vec::new();
-    for mut line in input.split(|&b| b == b'\n') {
-        // Strip trailing \r and whitespace
-        while let Some(&last) = line.last() {
-            if last == b'\r' || last == b' ' || last == b'\t' {
-                line = &line[..line.len() - 1];
-            } else {
-                break;
-            }
-        }
-        lines.push(line);
-    }
-
-    // Strip trailing empty lines
-    while let Some(&last) = lines.last() {
-        if last.is_empty() {
-            lines.pop();
-        } else {
-            break;
-        }
-    }
-
-    lines
-}
-
-fn split_raw_lines(input: &[u8]) -> Vec<&[u8]> {
-    let mut lines = Vec::new();
-    for mut line in input.split(|&b| b == b'\n') {
-        if let Some(&b'\r') = line.last() {
+#[inline]
+fn strip_line_trailing(mut line: &[u8]) -> &[u8] {
+    while let Some(&last) = line.last() {
+        if last == b'\r' || last == b' ' || last == b'\t' {
             line = &line[..line.len() - 1];
-        }
-        lines.push(line);
-    }
-
-    // Strip trailing empty lines
-    while let Some(&last) = lines.last() {
-        if last.is_empty() {
-            lines.pop();
         } else {
             break;
         }
     }
-
-    lines
+    line
 }
 
-fn normalize_bigint(bytes: &[u8]) -> Result<String, ()> {
+#[inline]
+fn strip_raw_line(mut line: &[u8]) -> &[u8] {
+    if let Some(&b'\r') = line.last() {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizedBigInt<'a> {
+    pub negative: bool,
+    pub digits: &'a [u8],
+}
+
+impl<'a> std::fmt::Display for NormalizedBigInt<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.negative {
+            write!(f, "-")?;
+        }
+        let s = std::str::from_utf8(self.digits).unwrap_or("<invalid>");
+        write!(f, "{s}")
+    }
+}
+
+fn normalize_bigint(bytes: &[u8]) -> Result<NormalizedBigInt<'_>, ()> {
     if bytes.is_empty() {
         return Err(());
     }
@@ -748,15 +782,16 @@ fn normalize_bigint(bytes: &[u8]) -> Result<String, ()> {
 
     if start == bytes.len() {
         // Number is 0 (or -0, +000)
-        return Ok("0".to_string());
+        return Ok(NormalizedBigInt {
+            negative: false,
+            digits: b"0",
+        });
     }
 
-    let digits = std::str::from_utf8(&bytes[start..]).map_err(|_| ())?;
-    if negative {
-        Ok(format!("-{digits}"))
-    } else {
-        Ok(digits.to_string())
-    }
+    Ok(NormalizedBigInt {
+        negative,
+        digits: &bytes[start..],
+    })
 }
 
 // ----------------------------------------------------------------------------

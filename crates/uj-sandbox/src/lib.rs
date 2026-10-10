@@ -85,6 +85,9 @@ pub trait Sandbox: Send + Sync {
     ) -> Result<std::path::PathBuf, SandboxError> {
         create_isolated_box_dir(base_dir).map_err(SandboxError::Io)
     }
+    fn authorize_executable(&self, _path: &std::path::Path) -> Result<(), SandboxError> {
+        Ok(())
+    }
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError>;
 }
 
@@ -217,9 +220,9 @@ static AUTHORIZED_BINARIES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
-/// Prepares a shared authorized copy of a binary in `<base_dir>/.uj/tmp/bin/<hash>.exe`
-/// (authorized and prewarmed once, reused across all test cases).
-pub fn get_or_prepare_authorized_binary(
+/// Prepares a shared copy of an executable in `<base_dir>/.uj/tmp/bin/<hash>.exe`.
+/// The file is read, hashed, and written once per submission.
+pub fn prepare_binary_content(
     exe_path: &std::path::Path,
     base_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf, std::io::Error> {
@@ -232,11 +235,6 @@ pub fn get_or_prepare_authorized_binary(
     let authorized_exe = bin_dir.join(format!("{}.exe", &hash[..16]));
     #[cfg(not(windows))]
     let authorized_exe = bin_dir.join(&hash[..16]);
-
-    let needs_prep = {
-        let mut set = AUTHORIZED_BINARIES.lock();
-        set.insert(authorized_exe.clone())
-    };
 
     if !authorized_exe.exists() {
         let temp_exe = bin_dir.join(format!("{}.tmp.{}", &hash[..16], std::process::id()));
@@ -254,16 +252,28 @@ pub fn get_or_prepare_authorized_binary(
         let _ = std::fs::set_permissions(&authorized_exe, std::fs::Permissions::from_mode(0o755));
     }
 
+    Ok(authorized_exe)
+}
+
+/// Prepares a shared authorized copy of a binary in `<base_dir>/.uj/tmp/bin/<hash>.exe`
+/// (authorized and prewarmed once, reused across all test cases).
+pub fn get_or_prepare_authorized_binary(
+    exe_path: &std::path::Path,
+    base_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    let authorized_exe = prepare_binary_content(exe_path, base_dir)?;
+
+    let needs_prep = {
+        let mut set = AUTHORIZED_BINARIES.lock();
+        set.insert(authorized_exe.clone())
+    };
+
     if needs_prep {
         #[cfg(windows)]
         {
             if let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
                 let _ = profile.grant_access_to_path(&authorized_exe);
             }
-            let _ = windows::security::AppContainerProfile::grant_path_access(
-                &authorized_exe,
-                "S-1-15-2-1",
-            );
             if let Ok(box_dir) = create_isolated_box_dir(base_dir) {
                 prewarm_binary(&authorized_exe, &box_dir);
                 if let Some(run_dir) = box_dir.parent() {
