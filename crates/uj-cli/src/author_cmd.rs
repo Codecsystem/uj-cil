@@ -402,15 +402,30 @@ pub fn run_gen_with_session(
         }
     }
 
-    let sandbox = match create_sandbox("auto", false) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Sandbox error: {e}");
-            return ExitCode::from(EXIT_JUDGE_FAILED);
-        }
-    };
+    struct GenJob {
+        idx: u32,
+        gen_name: String,
+        gen_args: String,
+        argv: Vec<std::ffi::OsString>,
+        target_in: PathBuf,
+        cache_meta: PathBuf,
+        hash: String,
+    }
 
-    let mut generated_count = 0;
+    enum GenResult {
+        Generated,
+        Failed {
+            idx: u32,
+            gen_name: String,
+            gen_args: String,
+            msg: String,
+        },
+        Error {
+            err: String,
+        },
+    }
+
+    let mut jobs = Vec::new();
     for gen_spec in &cfg.tests.generators {
         if cancel.is_cancelled() {
             return ExitCode::from(EXIT_INTERRUPTED);
@@ -459,45 +474,164 @@ pub fn run_gen_with_session(
                 argv.push(std::ffi::OsString::from(format!("{}", i + 1)));
             }
 
-            let limits = Limits::new(5000, 512 * 1024 * 1024);
-            let spec = RunSpec {
+            jobs.push(GenJob {
+                idx: max_idx,
+                gen_name: gen_spec.generator.clone(),
+                gen_args: gen_spec.args.clone(),
                 argv,
-                env: vec![],
-                work_dir: tests_dir.clone(),
-                ro_binds: vec![],
-                stdin: Stdio::Null,
-                stdout: Stdio::Pipe,
-                stderr: Stdio::Pipe,
-                extra_fds: vec![],
-                limits,
-                cpu_affinity: None,
-                seccomp_profile: Default::default(),
-                trusted: true,
-            };
+                target_in,
+                cache_meta,
+                hash,
+            });
+        }
+    }
 
-            let res = match sandbox.run(&spec, cancel) {
-                Ok(r) => r,
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+        .min(jobs.len().max(1));
+
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<GenJob>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<GenResult>();
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    for job in jobs {
+        let _ = job_tx.send(job);
+    }
+    drop(job_tx);
+
+    let t_dir = tests_dir.clone();
+    let mut handles = Vec::new();
+    for _ in 0..num_workers {
+        let job_rx = job_rx.clone();
+        let res_tx = res_tx.clone();
+        let stop = stop_flag.clone();
+        let cancel = cancel.clone();
+        let work_dir = t_dir.clone();
+
+        let handle = std::thread::spawn(move || {
+            let sandbox = match create_sandbox("auto", false) {
+                Ok(s) => s,
                 Err(e) => {
-                    eprintln!("Generator execution error: {e}");
-                    return ExitCode::from(EXIT_JUDGE_FAILED);
+                    let _ = res_tx.send(GenResult::Error {
+                        err: format!("Sandbox error: {e}"),
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    return;
                 }
             };
 
-            if !res.status.is_success() {
-                let err_tail = String::from_utf8_lossy(&res.stderr_tail);
-                eprintln!(
-                    "Generator '{}' failed with args '{}': {err_tail}",
-                    gen_spec.generator, gen_spec.args
-                );
-                return ExitCode::from(EXIT_JUDGE_FAILED);
-            }
+            while let Ok(job) = job_rx.recv() {
+                if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                    break;
+                }
 
-            let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
-            let _ = fs::write(&target_in, stdout_bytes);
-            let _ = fs::create_dir_all(cache_meta.parent().unwrap());
-            let _ = fs::write(cache_meta, &hash);
-            generated_count += 1;
+                let limits = Limits::new(5000, 512 * 1024 * 1024);
+                let spec = RunSpec {
+                    argv: job.argv,
+                    env: vec![],
+                    work_dir: work_dir.clone(),
+                    ro_binds: vec![],
+                    stdin: Stdio::Null,
+                    stdout: Stdio::Pipe,
+                    stderr: Stdio::Pipe,
+                    extra_fds: vec![],
+                    limits,
+                    cpu_affinity: None,
+                    seccomp_profile: Default::default(),
+                    trusted: true,
+                };
+
+                let res = match sandbox.run(&spec, &cancel) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = res_tx.send(GenResult::Error {
+                            err: format!("Generator execution error: {e}"),
+                        });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                if !res.status.is_success() {
+                    let err_tail = String::from_utf8_lossy(&res.stderr_tail).to_string();
+                    let _ = res_tx.send(GenResult::Failed {
+                        idx: job.idx,
+                        gen_name: job.gen_name,
+                        gen_args: job.gen_args,
+                        msg: err_tail,
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
+                if let Err(e) = fs::write(&job.target_in, stdout_bytes) {
+                    let _ = res_tx.send(GenResult::Error {
+                        err: format!("Failed to write {}: {e}", job.target_in.display()),
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if let Some(parent) = job.cache_meta.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(job.cache_meta, &job.hash);
+                let _ = res_tx.send(GenResult::Generated);
+            }
+        });
+        handles.push(handle);
+    }
+    drop(res_tx);
+
+    let mut generated_count = 0;
+    let mut first_failure: Option<(u32, String, String, String)> = None;
+    let mut runtime_error: Option<String> = None;
+
+    while let Ok(res) = res_rx.recv() {
+        match res {
+            GenResult::Generated => {
+                generated_count += 1;
+            }
+            GenResult::Failed {
+                idx,
+                gen_name,
+                gen_args,
+                msg,
+            } => {
+                if let Some((f_idx, _, _, _)) = first_failure {
+                    if idx < f_idx {
+                        first_failure = Some((idx, gen_name, gen_args, msg));
+                    }
+                } else {
+                    first_failure = Some((idx, gen_name, gen_args, msg));
+                }
+            }
+            GenResult::Error { err } => {
+                if runtime_error.is_none() {
+                    runtime_error = Some(err);
+                }
+            }
         }
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+
+    if cancel.is_cancelled() {
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
+
+    if let Some(err) = runtime_error {
+        eprintln!("{err}");
+        return ExitCode::from(EXIT_JUDGE_FAILED);
+    }
+
+    if let Some((_, gen_name, gen_args, msg)) = first_failure {
+        eprintln!("Generator '{gen_name}' failed with args '{gen_args}': {msg}");
+        return ExitCode::from(EXIT_JUDGE_FAILED);
     }
 
     if format == OutputFormat::Json {
