@@ -16,9 +16,10 @@ use uj_report::result::{JudgeEvent, SingleTestResult, SubmissionJudgeReport};
 use uj_sandbox::{CancelToken, create_sandbox};
 
 use crate::compiler::{CompileResult, Compiler};
+pub use crate::judge::JudgeOptions;
 use crate::judge::{
-    JudgeOptions, ResolvedChecker, aggregate_submission_report, judge_communication_test,
-    judge_interactive_test, judge_output_only_test, judge_single_test,
+    ResolvedChecker, aggregate_submission_report, judge_communication_test, judge_interactive_test,
+    judge_output_only_test, judge_single_test,
 };
 use crate::topology::{Slot, Topology};
 

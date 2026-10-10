@@ -1,8 +1,10 @@
 mod author_cmd;
 mod cli;
+mod contest_cmd;
 mod doctor;
 mod error;
 mod judge_cmd;
+mod lemon_import;
 mod report_cmd;
 
 use clap::Parser;
@@ -303,23 +305,21 @@ fn main() -> ExitCode {
             csv.as_deref(),
             format,
         ),
-        _ => {
-            if format == OutputFormat::Json {
-                let err_obj = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "kind": "Unimplemented",
-                        "message": "Command not yet implemented in scaffolding phase (P0)",
-                        "hint": "Check docs/PLAN.md for current phase progress"
-                    }
-                });
-                println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
+        Commands::Contest { dir } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            contest_cmd::run_contest(dir, &args, format, &cancel)
+        }
+        Commands::Import { kind, file } => {
+            if kind == "lemon" {
+                lemon_import::run_import_lemon(file, format)
             } else {
-                eprintln!(
-                    "This command will be implemented in subsequent phases. See docs/PLAN.md."
-                );
+                eprintln!("Unsupported format '{kind}'. Supported formats: lemon");
+                ExitCode::from(EXIT_USAGE_OR_CONFIG)
             }
-            ExitCode::from(EXIT_USAGE_OR_CONFIG)
         }
     }
 }

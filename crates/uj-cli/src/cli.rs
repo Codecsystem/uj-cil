@@ -280,8 +280,8 @@ pub enum Commands {
 
     #[command(about = "Import problem configuration from external format (e.g., Lemon)")]
     Import {
-        #[arg(value_parser = ["lemon"], help = "Format identifier")]
-        format: String,
+        #[arg(value_name = "FORMAT", value_parser = ["lemon"], help = "Format identifier")]
+        kind: String,
         #[arg(required = true, help = "Path to CDF / project file")]
         file: PathBuf,
     },
