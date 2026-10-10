@@ -165,5 +165,5 @@ MCP 服务端对外暴露的工具包含：
 - `stress`: 启动自动化对拍找反例。
 
 > 📖 **进阶使用指南**：更详细的 Agent 实战工作流、解题/出题原子操作、JSON 字段解析范式与 Token 优化建议，请参阅：
-> 👉 [**docs/AGENT_GUIDE.md — uj AI Agent 详细使用与集成指南**](file:///e:/Data/Work/uj-cil/docs/AGENT_GUIDE.md)
+> 👉 [**docs/AGENT_GUIDE.md — uj AI Agent 详细使用与集成指南**](docs/AGENT_GUIDE.md)
 

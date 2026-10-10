@@ -14,8 +14,8 @@ members = [
 version = "0.1.0"
 edition = "2024"
 authors = ["uj developers"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/uj-cil/uj"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Codecsystem/uj-cil"
 
 [workspace.dependencies]
 # Internal crates

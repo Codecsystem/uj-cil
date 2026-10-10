@@ -1,6 +1,23 @@
+# Build artifacts
 /target
-.uj/
 *.pdb
 *.exe
+
+# uj runtime & cache directories
+.uj/
+**/.uj/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Logs
+*.log

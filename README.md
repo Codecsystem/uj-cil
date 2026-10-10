@@ -81,8 +81,8 @@ flowchart TD
 
 ```bash
 # 需已安装 Rust 1.85+ (Edition 2024)
-git clone https://github.com/uj-cil/uj.git
-cd uj
+git clone https://github.com/Codecsystem/uj-cil.git
+cd uj-cil
 cargo build --release
 
 # 二进制位于 target/release/uj
@@ -157,7 +157,7 @@ uj report --html report.html --csv results.csv
 ```
 
 > 🤖 **面向 AI 编程助手的完整使用手册**：
-> 请直接参阅 [**docs/AGENT_GUIDE.md**](file:///e:/Data/Work/uj-cil/docs/AGENT_GUIDE.md)（含自动化解题循环、命题流水线 Recipe、JSON 字段解析与 Token 优化策略）与 [**AGENTS.md**](file:///e:/Data/Work/uj-cil/AGENTS.md)（系统硬性约束与底层架构地图）。
+> 请直接参阅 [**docs/AGENT_GUIDE.md**](docs/AGENT_GUIDE.md)（含自动化解题循环、命题流水线 Recipe、JSON 字段解析与 Token 优化策略）与 [**AGENTS.md**](AGENTS.md)（系统硬性约束与底层架构地图）。
 
 ---
 
@@ -232,4 +232,4 @@ expect = "TLE"
 
 ## 📜 许可证
 
-本项目采用 [MIT OR Apache-2.0](file:///LICENSE) 双重开源许可证授权。
+本项目采用 [GNU General Public License v3.0 (GPL-3.0)](LICENSE) 开源许可证授权。
