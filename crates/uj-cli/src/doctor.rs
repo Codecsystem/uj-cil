@@ -280,6 +280,163 @@ fn run_problem_checks(checks: &mut Vec<DoctorCheckItem>, root: &Path) {
                             None
                         },
                     });
+
+                    // 1. Check .in / .ans pairing
+                    let mut missing_ans = Vec::new();
+                    for t in &discovered {
+                        if t.answer_path.is_none() {
+                            missing_ans.push(t.name.clone());
+                        }
+                    }
+                    if missing_ans.is_empty() {
+                        checks.push(DoctorCheckItem {
+                            name: "Test Input/Answer Pairing".to_string(),
+                            status: CheckStatus::Pass,
+                            message: "All test inputs have matching .ans files".to_string(),
+                            recommendation: None,
+                        });
+                    } else {
+                        checks.push(DoctorCheckItem {
+                            name: "Test Input/Answer Pairing".to_string(),
+                            status: CheckStatus::Warn,
+                            message: format!(
+                                "Missing .ans for {} test(s): {}",
+                                missing_ans.len(),
+                                missing_ans.join(", ")
+                            ),
+                            recommendation: Some(
+                                "Generate answer files using 'uj ans'".to_string(),
+                            ),
+                        });
+                    }
+
+                    // 2. Check for duplicate test data (hash)
+                    let mut hashes: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    let mut duplicates = Vec::new();
+                    for t in &discovered {
+                        if let Ok(bytes) = std::fs::read(&t.input_path) {
+                            let hash = blake3::hash(&bytes).to_hex().to_string();
+                            if let Some(existing) = hashes.get(&hash) {
+                                duplicates.push(format!("'{}' == '{}'", t.name, existing));
+                            } else {
+                                hashes.insert(hash, t.name.clone());
+                            }
+                        }
+                    }
+                    if duplicates.is_empty() {
+                        checks.push(DoctorCheckItem {
+                            name: "Test Data Uniqueness".to_string(),
+                            status: CheckStatus::Pass,
+                            message: "No duplicate input files detected".to_string(),
+                            recommendation: None,
+                        });
+                    } else {
+                        checks.push(DoctorCheckItem {
+                            name: "Test Data Uniqueness".to_string(),
+                            status: CheckStatus::Warn,
+                            message: format!(
+                                "Duplicate test data found: {}",
+                                duplicates.join(", ")
+                            ),
+                            recommendation: Some(
+                                "Remove redundant duplicate test inputs".to_string(),
+                            ),
+                        });
+                    }
+
+                    // 3. Check subtask coverage
+                    if !cfg.subtasks.is_empty() {
+                        let uncovered: Vec<_> = discovered
+                            .iter()
+                            .filter(|t| t.subtask_id.is_none())
+                            .map(|t| t.name.as_str())
+                            .collect();
+                        if uncovered.is_empty() {
+                            checks.push(DoctorCheckItem {
+                                name: "Subtask Coverage".to_string(),
+                                status: CheckStatus::Pass,
+                                message: "All test cases are covered by configured subtasks"
+                                    .to_string(),
+                                recommendation: None,
+                            });
+                        } else {
+                            checks.push(DoctorCheckItem {
+                                name: "Subtask Coverage".to_string(),
+                                status: CheckStatus::Warn,
+                                message: format!(
+                                    "Tests not assigned to any subtask: {}",
+                                    uncovered.join(", ")
+                                ),
+                                recommendation: Some(
+                                    "Update subtask tests pattern in problem.toml".to_string(),
+                                ),
+                            });
+                        }
+                    }
+
+                    // 4. Check checker and validator compilation
+                    if let Some(ref chk_path) = cfg.checker.path {
+                        let full_p = if chk_path.is_absolute() {
+                            chk_path.clone()
+                        } else {
+                            root.join(chk_path)
+                        };
+                        match uj_engine::compiler::Compiler::compile(&full_p, false) {
+                            Ok(_) => {
+                                checks.push(DoctorCheckItem {
+                                    name: "Checker Compilation".to_string(),
+                                    status: CheckStatus::Pass,
+                                    message: format!(
+                                        "Checker '{}' compiles cleanly",
+                                        chk_path.display()
+                                    ),
+                                    recommendation: None,
+                                });
+                            }
+                            Err(e) => {
+                                checks.push(DoctorCheckItem {
+                                    name: "Checker Compilation".to_string(),
+                                    status: CheckStatus::Fail,
+                                    message: format!("Failed to compile checker: {e}"),
+                                    recommendation: Some(
+                                        "Fix syntax/compiler errors in checker".to_string(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+
+                    if let Some(ref val_path) = cfg.validator {
+                        let full_p = if val_path.is_absolute() {
+                            val_path.clone()
+                        } else {
+                            root.join(val_path)
+                        };
+                        match uj_engine::compiler::Compiler::compile(&full_p, false) {
+                            Ok(_) => {
+                                checks.push(DoctorCheckItem {
+                                    name: "Validator Compilation".to_string(),
+                                    status: CheckStatus::Pass,
+                                    message: format!(
+                                        "Validator '{}' compiles cleanly",
+                                        val_path.display()
+                                    ),
+                                    recommendation: None,
+                                });
+                            }
+                            Err(e) => {
+                                checks.push(DoctorCheckItem {
+                                    name: "Validator Compilation".to_string(),
+                                    status: CheckStatus::Fail,
+                                    message: format!("Failed to compile validator: {e}"),
+                                    recommendation: Some(
+                                        "Fix syntax/compiler errors in validator".to_string(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     checks.push(DoctorCheckItem {

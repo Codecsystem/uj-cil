@@ -128,18 +128,61 @@ pub enum Commands {
 
     #[command(about = "Compile problem binaries (checker, validator, solutions)")]
     Build {
+        #[arg(
+            short = 'p',
+            long = "problem",
+            default_value = ".",
+            help = "Problem directory"
+        )]
+        problem: PathBuf,
         #[arg(help = "Specific build targets or empty for all")]
         targets: Vec<String>,
     },
 
     #[command(about = "Generate test inputs according to [[tests.gen]]")]
-    Gen,
+    Gen {
+        #[arg(
+            short = 'p',
+            long = "problem",
+            default_value = ".",
+            help = "Problem directory"
+        )]
+        problem: PathBuf,
+        #[arg(
+            long = "force",
+            default_value_t = false,
+            help = "Regenerate tests even if cache matches"
+        )]
+        force: bool,
+    },
 
     #[command(about = "Validate test inputs with validator")]
-    Validate,
+    Validate {
+        #[arg(
+            short = 'p',
+            long = "problem",
+            default_value = ".",
+            help = "Problem directory"
+        )]
+        problem: PathBuf,
+    },
 
     #[command(about = "Generate expected .ans files using main solution")]
-    Ans,
+    Ans {
+        #[arg(
+            short = 'p',
+            long = "problem",
+            default_value = ".",
+            help = "Problem directory"
+        )]
+        problem: PathBuf,
+        #[arg(
+            long = "force",
+            default_value_t = false,
+            help = "Regenerate answers even if cache matches"
+        )]
+        force: bool,
+    },
 
     #[command(about = "Judge one or more submission sources against problem tests")]
     Judge {
@@ -184,6 +227,13 @@ pub enum Commands {
 
     #[command(about = "Differential testing (stress testing)")]
     Stress {
+        #[arg(
+            short = 'p',
+            long = "problem",
+            default_value = ".",
+            help = "Problem directory"
+        )]
+        problem: PathBuf,
         #[arg(long = "gen", required = true, help = "Generator executable/source")]
         generator: String,
         #[arg(long = "sol", required = true, help = "Target solution to test")]

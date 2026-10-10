@@ -1,3 +1,4 @@
+mod author_cmd;
 mod cli;
 mod doctor;
 mod error;
@@ -47,9 +48,9 @@ fn main() -> ExitCode {
         }
     });
 
-    match args.command {
+    match &args.command {
         Commands::Schema { target } => {
-            let schema_str = match target {
+            let schema_str = match *target {
                 SchemaTarget::Result => uj_report::schema::generate_result_schema(),
                 SchemaTarget::Config => uj_report::schema::generate_config_schema(),
                 SchemaTarget::Events => uj_report::schema::generate_events_schema(),
@@ -61,7 +62,7 @@ fn main() -> ExitCode {
             problem,
             fix_apparmor,
         } => {
-            let report = doctor::run_doctor(problem, fix_apparmor);
+            let report = doctor::run_doctor(*problem, *fix_apparmor);
             if format == OutputFormat::Json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
@@ -126,7 +127,7 @@ fn main() -> ExitCode {
             });
 
             let spec = uj_core::run::RunSpec {
-                argv: cmd.into_iter().map(std::ffi::OsString::from).collect(),
+                argv: cmd.iter().map(std::ffi::OsString::from).collect(),
                 env: vec![],
                 work_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 ro_binds: vec![],
@@ -199,10 +200,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Commands::Judge {
-            ref sources,
-            ref problem,
-        } => {
+        Commands::Judge { sources, problem } => {
             let cancel = uj_sandbox::CancelToken::new();
             let cancel_clone = cancel.clone();
             let _ = ctrlc::set_handler(move || {
@@ -218,6 +216,85 @@ fn main() -> ExitCode {
             format,
         ),
         Commands::Clean => judge_cmd::run_clean(std::path::Path::new(".")),
+        Commands::Init { dir, problem_type } => author_cmd::run_init(dir, problem_type, format),
+        Commands::Build { problem, targets } => {
+            author_cmd::run_build(problem, targets, args.no_cache, format)
+        }
+        Commands::Gen { problem, force } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            author_cmd::run_gen(problem, *force, format, &cancel)
+        }
+        Commands::Validate { problem } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            author_cmd::run_validate(problem, format, &cancel)
+        }
+        Commands::Ans { problem, force } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            author_cmd::run_ans(problem, *force, format, &cancel)
+        }
+        Commands::Verify { problem } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            author_cmd::run_verify(problem, &args, format, &cancel)
+        }
+        Commands::Tl { problem, apply } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            author_cmd::run_tl(problem, *apply, &args, format, &cancel)
+        }
+        Commands::Stress {
+            problem,
+            generator,
+            solution,
+            brute,
+            count,
+            seed,
+            time_budget,
+        } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            author_cmd::run_stress(
+                problem,
+                generator,
+                solution,
+                brute,
+                *count,
+                *seed,
+                time_budget,
+                &args,
+                format,
+                &cancel,
+            )
+        }
+        Commands::Pipeline { problem } => {
+            let cancel = uj_sandbox::CancelToken::new();
+            let cancel_clone = cancel.clone();
+            let _ = ctrlc::set_handler(move || {
+                cancel_clone.cancel();
+            });
+            author_cmd::run_pipeline(problem, &args, format, &cancel)
+        }
         _ => {
             if format == OutputFormat::Json {
                 let err_obj = serde_json::json!({
