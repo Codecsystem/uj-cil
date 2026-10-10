@@ -48,6 +48,7 @@ impl Scheduler {
         problem_dir: &Path,
         problem_config: &ProblemConfig,
         compiled: &CompileResult,
+        submission_name: &str,
         tests: Vec<TestCase>,
         user_jobs: Option<usize>,
         event_sender: Option<Sender<JudgeEvent>>,
@@ -496,11 +497,7 @@ impl Scheduler {
 
         let report = aggregate_submission_report(
             &problem_config.name,
-            &compiled
-                .binary_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
+            submission_name,
             problem_config,
             test_results,
         );

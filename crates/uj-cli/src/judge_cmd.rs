@@ -142,8 +142,40 @@ pub fn run_judge(
             return ExitCode::from(EXIT_INTERRUPTED);
         }
 
-        // Set up NDJSON event streaming if requested
-        let (event_sender, event_thread) = if format == OutputFormat::Ndjson {
+        let source_name = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let test_names: Vec<String> = tests.iter().map(|t| t.name.clone()).collect();
+        let mem_limit = problem_config
+            .to_limits()
+            .map(|l| l.memory_bytes)
+            .unwrap_or(512 * 1024 * 1024);
+        let slot_count = uj_engine::topology::Topology::detect(mem_limit, cli.jobs)
+            .slots
+            .len();
+
+        // Set up event streaming: TUI, NDJSON, or indicatif progress bar
+        let (event_sender, event_thread) = if cli.tui {
+            let (tx, rx) = unbounded::<JudgeEvent>();
+            let prob_name = problem_config.name.clone();
+            let sub_name = source_name.clone();
+            let cancel_clone = cancel.clone();
+
+            let handle = thread::spawn(move || {
+                let _ = uj_tui::run_tui(
+                    &prob_name,
+                    &sub_name,
+                    &test_names,
+                    slot_count,
+                    rx,
+                    cancel_clone,
+                    true,
+                );
+            });
+            (Some(tx), Some(handle))
+        } else if format == OutputFormat::Ndjson {
             let (tx, rx) = unbounded::<JudgeEvent>();
             let handle = thread::spawn(move || {
                 for ev in rx {
@@ -151,6 +183,32 @@ pub fn run_judge(
                         println!("{line}");
                     }
                 }
+            });
+            (Some(tx), Some(handle))
+        } else if format == OutputFormat::Human {
+            let (tx, rx) = unbounded::<JudgeEvent>();
+            let total_cnt = tests.len() as u64;
+            let handle = thread::spawn(move || {
+                let pb = indicatif::ProgressBar::new(total_cnt);
+                pb.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template("{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                        .progress_chars("=>-"),
+                );
+                for ev in rx {
+                    match ev {
+                        JudgeEvent::TestDone(ref res) => {
+                            pb.inc(1);
+                            pb.set_message(format!("{}: {}", res.id, res.verdict.short_code()));
+                        }
+                        JudgeEvent::SubmissionDone(_) => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                pb.finish_and_clear();
             });
             (Some(tx), Some(handle))
         } else {
@@ -265,6 +323,7 @@ pub fn run_judge(
             problem_dir,
             &problem_config,
             &compiled,
+            &source_name,
             tests.clone(),
             cli.jobs,
             event_sender,

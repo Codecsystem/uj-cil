@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 uj-core.workspace = true
+uj-sandbox.workspace = true
+uj-report.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 crossbeam-channel.workspace = true

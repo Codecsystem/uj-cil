@@ -3,6 +3,7 @@ mod cli;
 mod doctor;
 mod error;
 mod judge_cmd;
+mod report_cmd;
 
 use clap::Parser;
 use std::io::IsTerminal;
@@ -295,6 +296,13 @@ fn main() -> ExitCode {
             });
             author_cmd::run_pipeline(problem, &args, format, &cancel)
         }
+        Commands::Report { run_id, html, csv } => report_cmd::run_report(
+            std::path::Path::new("."),
+            run_id.as_deref(),
+            html.as_deref(),
+            csv.as_deref(),
+            format,
+        ),
         _ => {
             if format == OutputFormat::Json {
                 let err_obj = serde_json::json!({

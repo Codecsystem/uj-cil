@@ -808,10 +808,12 @@ pub fn run_verify(
             }
         };
 
+        let sol_name = sol.path.file_name().unwrap_or_default().to_string_lossy();
         let report = match scheduler.judge_submission(
             problem_dir,
             &cfg,
             &compiled,
+            &sol_name,
             tests.clone(),
             cli.jobs,
             None,
@@ -1057,6 +1059,7 @@ pub fn run_tl(
             }
         };
 
+        let sol_name = sol.path.file_name().unwrap_or_default().to_string_lossy();
         // Run 3 times in exclusive mode (jobs = 1)
         for _ in 0..3 {
             if cancel.is_cancelled() {
@@ -1066,6 +1069,7 @@ pub fn run_tl(
                 problem_dir,
                 &cfg,
                 &compiled,
+                &sol_name,
                 tests.clone(),
                 Some(1),
                 None,
