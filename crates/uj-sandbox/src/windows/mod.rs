@@ -90,14 +90,20 @@ impl Sandbox for WindowsSandbox {
     fn run_group(
         &self,
         specs: &[RunSpec],
-        _wiring: &Wiring,
+        wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
-        let mut results = Vec::with_capacity(specs.len());
-        for spec in specs {
-            results.push(self.run(spec, cancel)?);
+        let ac = self.app_container.as_deref();
+        match process::execute_group_in_jobs(specs, wiring, ac, cancel, self.tier) {
+            Ok(results) => Ok(results),
+            Err(e) if self.allow_fallback && ac.is_some() => {
+                tracing::debug!(
+                    "AppContainer run_group failed ({e}); falling back to Job Object (Degraded tier)"
+                );
+                process::execute_group_in_jobs(specs, wiring, None, cancel, Tier::Degraded)
+            }
+            Err(e) => Err(e),
         }
-        Ok(results)
     }
 
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError> {

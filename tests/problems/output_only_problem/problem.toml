@@ -1,0 +1,11 @@
+schema = 1
+name = "output_only_test"
+type = "output_only"
+
+[limits]
+time = "1.0s"
+memory = "256MB"
+
+[tests]
+dir = "tests"
+pattern = "*.in"

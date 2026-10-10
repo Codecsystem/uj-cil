@@ -239,20 +239,31 @@ impl Sandbox for NoneSandbox {
             stderr_tail,
             residue_cleaned: false,
             sandbox_tier: Tier::None,
+            exit_order: None,
         })
     }
 
     fn run_group(
         &self,
         specs: &[RunSpec],
-        _wiring: &Wiring,
+        wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
-        let mut results = Vec::with_capacity(specs.len());
-        for spec in specs {
-            results.push(self.run(spec, cancel)?);
+        if specs.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(results)
+        #[cfg(windows)]
+        {
+            crate::windows::process::execute_group_in_jobs(specs, wiring, None, cancel, Tier::None)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut results = Vec::with_capacity(specs.len());
+            for spec in specs {
+                results.push(self.run(spec, cancel)?);
+            }
+            Ok(results)
+        }
     }
 
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError> {

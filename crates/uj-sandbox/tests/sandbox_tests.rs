@@ -207,3 +207,66 @@ fn test_windows_sandbox_cancel_token() {
     let res = sandbox.run(&spec, &cancel).expect("sandbox run failed");
     assert_eq!(res.killed_by, Some(KillReason::UserCancel));
 }
+
+#[test]
+fn test_windows_run_group_wiring() {
+    use uj_sandbox::{PipeConnection, Wiring};
+
+    let sandbox = create_sandbox("auto", false).expect("failed to create sandbox");
+    let work_dir = uj_sandbox::get_sandbox_scratch_dir();
+
+    let spec_sender = RunSpec {
+        argv: vec![
+            OsString::from("cmd.exe"),
+            OsString::from("/c"),
+            OsString::from("echo WIRE_TOKEN_12345"),
+        ],
+        env: vec![],
+        work_dir: work_dir.clone(),
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(5000, 256 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+    };
+
+    let spec_receiver = RunSpec {
+        argv: vec![OsString::from("findstr.exe"), OsString::from("WIRE_TOKEN")],
+        env: vec![],
+        work_dir,
+        ro_binds: vec![],
+        stdin: Stdio::Pipe,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(5000, 256 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+    };
+
+    let wiring = Wiring {
+        connections: vec![PipeConnection {
+            from_proc: 0,
+            to_proc: 1,
+        }],
+    };
+
+    let cancel = CancelToken::new();
+    let results = sandbox
+        .run_group(&[spec_sender, spec_receiver], &wiring, &cancel)
+        .expect("run_group failed");
+
+    assert_eq!(results.len(), 2);
+    assert!(results[0].status.is_success());
+    assert!(results[1].status.is_success());
+
+    let recv_out = results[1].stdout.as_ref().expect("receiver stdout missing");
+    let text = String::from_utf8_lossy(&recv_out.bytes);
+    assert!(
+        text.contains("WIRE_TOKEN_12345"),
+        "Expected receiver to receive piped token, got: {text}"
+    );
+}

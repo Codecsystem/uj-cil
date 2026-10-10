@@ -10,7 +10,7 @@ use uj_core::verdict::Verdict;
 use uj_report::result::{
     DiffSummary, ExitInfo, SingleTestResult, SubmissionJudgeReport, SubtaskResult, TimingInfo,
 };
-use uj_sandbox::{CancelToken, Sandbox};
+use uj_sandbox::{CancelToken, PipeConnection, Sandbox, Wiring};
 
 #[derive(Debug, Clone)]
 pub enum ResolvedChecker {
@@ -429,5 +429,613 @@ pub fn aggregate_submission_report(
         max_memory_kb,
         subtasks: subtask_results,
         tests: test_results,
+    }
+}
+
+/// Execute an interactive test case with solution and interactor wired together.
+#[allow(clippy::too_many_arguments)]
+pub fn judge_interactive_test(
+    sandbox: &dyn Sandbox,
+    exe_path: &Path,
+    interpreter_cmd: Option<&[String]>,
+    interactor_exe: &Path,
+    test: &TestCase,
+    limits: &Limits,
+    checker: Option<&ResolvedChecker>,
+    pe_as_wa: bool,
+    cancel: &CancelToken,
+) -> SingleTestResult {
+    let argv_sol = if let Some(cmd) = interpreter_cmd {
+        cmd.iter().map(std::ffi::OsString::from).collect()
+    } else {
+        vec![exe_path.as_os_str().to_os_string()]
+    };
+
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let pid = std::process::id();
+    let time_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    let tout_file = scratch_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
+    let result_file = scratch_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
+
+    let spec_sol = RunSpec {
+        argv: argv_sol,
+        env: vec![],
+        work_dir: scratch_dir.clone(),
+        ro_binds: vec![],
+        stdin: Stdio::Pipe,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: limits.clone(),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+    };
+
+    let mut argv_int = vec![
+        interactor_exe.as_os_str().to_os_string(),
+        test.input_path.as_os_str().to_os_string(),
+        tout_file.as_os_str().to_os_string(),
+    ];
+    if let Some(ref ans_path) = test.answer_path {
+        argv_int.push(ans_path.as_os_str().to_os_string());
+    } else {
+        argv_int.push(test.input_path.as_os_str().to_os_string());
+    }
+    argv_int.push(result_file.as_os_str().to_os_string());
+    argv_int.push(std::ffi::OsString::from("-appes"));
+
+    let mut int_limits = Limits::new(limits.cpu_time_ms * 2 + 5000, 1024 * 1024 * 1024);
+    int_limits.wall_time_ms = limits.wall_time_ms + 2000;
+
+    let spec_int = RunSpec {
+        argv: argv_int,
+        env: vec![],
+        work_dir: scratch_dir.clone(),
+        ro_binds: vec![],
+        stdin: Stdio::Pipe,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: int_limits,
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+    };
+
+    let wiring = Wiring {
+        connections: vec![
+            PipeConnection {
+                from_proc: 1, // interactor stdout -> solution stdin
+                to_proc: 0,
+            },
+            PipeConnection {
+                from_proc: 0, // solution stdout -> interactor stdin
+                to_proc: 1,
+            },
+        ],
+    };
+
+    let start_instant = Instant::now();
+    let group_res = sandbox.run_group(&[spec_sol, spec_int], &wiring, cancel);
+    let duration_ms = start_instant.elapsed().as_millis() as u64;
+
+    let results = match group_res {
+        Ok(r) if r.len() >= 2 => r,
+        Ok(_) => {
+            let _ = fs::remove_file(&tout_file);
+            let _ = fs::remove_file(&result_file);
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms: duration_ms,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                checker: Some("Incomplete process group results".to_string()),
+                diff: None,
+                timing: Default::default(),
+            };
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tout_file);
+            let _ = fs::remove_file(&result_file);
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms: duration_ms,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                checker: Some(format!("Sandbox run_group error: {e}")),
+                diff: None,
+                timing: Default::default(),
+            };
+        }
+    };
+
+    let sol_res = &results[0];
+    let int_res = &results[1];
+
+    let time_ms = (sol_res.cpu_time_us / 1000).max(1);
+    let wall_ms = (sol_res.wall_time_us / 1000).max(1);
+    let memory_kb = sol_res.memory_peak_bytes / 1024;
+
+    let int_stderr = String::from_utf8_lossy(&int_res.stderr_tail).to_string();
+
+    // Parse interactor outcome from -appes XML or exit code
+    let interactor_check = if result_file.is_file() {
+        if let Ok(xml) = fs::read_to_string(&result_file) {
+            uj_checker::testlib::parse_appes_xml(&xml, pe_as_wa)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let interactor_res = interactor_check.unwrap_or_else(|| {
+        let code = match int_res.status {
+            ExitStatus::Exited(c) => c,
+            _ => 3, // FAIL
+        };
+        uj_checker::testlib::parse_testlib_exit_code(code, &int_stderr, pe_as_wa)
+    });
+
+    let _ = fs::remove_file(&result_file);
+
+    let interactor_finished_first = match (int_res.exit_order, sol_res.exit_order) {
+        (Some(i_ord), Some(s_ord)) => i_ord < s_ord,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    // ------------------------------------------------------------------------
+    // Section 7.4 Interactive Verdict Rules
+    // ------------------------------------------------------------------------
+    let (verdict, score_ratio, checker_msg) = if cancel.is_cancelled() {
+        (
+            Verdict::JudgeFailed,
+            0.0,
+            Some("Cancelled by user".to_string()),
+        )
+    } else if sol_res.killed_by == Some(KillReason::WallLimit)
+        && (int_res.killed_by == Some(KillReason::WallLimit) || time_ms < limits.cpu_time_ms / 2)
+    {
+        // Rule 4: Both processes blocked or wall limit reached with low CPU -> Idleness limit exceeded
+        (
+            Verdict::TimeLimitExceeded,
+            0.0,
+            Some("Idleness limit exceeded (deadlock or blocked waiting on input)".to_string()),
+        )
+    } else if int_res.status.code() == Some(3)
+        || interactor_res.verdict == Verdict::JudgeFailed
+        || (!int_res.status.is_success()
+            && int_res.status.code() != Some(1)
+            && int_res.status.code() != Some(2))
+    {
+        // Rule 1: Interactor returns FAIL or crashes -> JudgeFailed
+        (
+            Verdict::JudgeFailed,
+            0.0,
+            interactor_res
+                .message
+                .or_else(|| Some("Interactor failed or crashed".to_string())),
+        )
+    } else if !interactor_finished_first {
+        // Rule 2: Solution exceeded limits or crashed BEFORE interactor ended
+        if sol_res.killed_by == Some(KillReason::CpuLimit) || time_ms > limits.cpu_time_ms {
+            (Verdict::TimeLimitExceeded, 0.0, None)
+        } else if sol_res.killed_by == Some(KillReason::MemoryLimit)
+            || sol_res.oom_killed
+            || sol_res.memory_peak_bytes > limits.memory_bytes
+        {
+            (Verdict::MemoryLimitExceeded, 0.0, None)
+        } else if sol_res.killed_by == Some(KillReason::OutputLimit) {
+            (Verdict::OutputLimitExceeded, 0.0, None)
+        } else if sol_res.killed_by == Some(KillReason::Seccomp) {
+            (
+                Verdict::RestrictedFunction,
+                0.0,
+                Some("Restricted syscall blocked by security policy".to_string()),
+            )
+        } else if !sol_res.status.is_success() {
+            let msg = match sol_res.status {
+                ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
+                ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
+                ExitStatus::NtStatus(nt) => {
+                    let name = uj_sandbox::ntstatus::format_ntstatus(nt);
+                    format!("Process crashed: {name} (0x{nt:08X})")
+                }
+            };
+            (Verdict::RuntimeError, 0.0, Some(msg))
+        } else {
+            // Solution exited cleanly first, use interactor's verdict
+            (
+                interactor_res.verdict,
+                interactor_res.score_ratio,
+                interactor_res.message,
+            )
+        }
+    } else {
+        // Rule 3 & 5: Interactor finished first
+        if interactor_res.verdict != Verdict::Accepted {
+            // Interactor decided WA/PE/PC, solution exited afterward due to EOF/broken pipe -> not RE
+            (
+                interactor_res.verdict,
+                interactor_res.score_ratio,
+                interactor_res.message,
+            )
+        } else {
+            // Interactor said Accepted!
+            if let Some(chk) = checker
+                && tout_file.is_file()
+            {
+                // Run post-checker on tout_file if configured
+                let empty_path = PathBuf::new();
+                let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
+                match chk {
+                    ResolvedChecker::Builtin(b) => {
+                        let tout_bytes = fs::read(&tout_file).unwrap_or_default();
+                        let ans_bytes = uj_checker::read_file_bytes(ans_file).unwrap_or_default();
+                        let check_res = b.check(&tout_bytes, &ans_bytes);
+                        (check_res.verdict, check_res.score_ratio, check_res.message)
+                    }
+                    ResolvedChecker::Testlib(chk_exe) => {
+                        let check_res = uj_checker::testlib::run_testlib_checker(
+                            sandbox,
+                            chk_exe,
+                            &test.input_path,
+                            &tout_file,
+                            ans_file,
+                            pe_as_wa,
+                            cancel,
+                        );
+                        (check_res.verdict, check_res.score_ratio, check_res.message)
+                    }
+                    ResolvedChecker::Lemon {
+                        path: chk_exe,
+                        full_score,
+                    } => {
+                        let check_res = uj_checker::lemon::run_lemon_checker(
+                            sandbox,
+                            chk_exe,
+                            &test.input_path,
+                            &tout_file,
+                            ans_file,
+                            *full_score,
+                            cancel,
+                        );
+                        (check_res.verdict, check_res.score_ratio, check_res.message)
+                    }
+                }
+            } else {
+                (
+                    interactor_res.verdict,
+                    interactor_res.score_ratio,
+                    interactor_res.message,
+                )
+            }
+        }
+    };
+
+    let _ = fs::remove_file(&tout_file);
+
+    let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
+
+    let exit_info = match sol_res.status {
+        ExitStatus::Exited(c) => ExitInfo {
+            code: Some(c),
+            signal: None,
+            nt_status: None,
+        },
+        ExitStatus::Signaled(s) => ExitInfo {
+            code: None,
+            signal: Some(s),
+            nt_status: None,
+        },
+        ExitStatus::NtStatus(nt) => ExitInfo {
+            code: None,
+            signal: None,
+            nt_status: Some(nt),
+        },
+    };
+
+    SingleTestResult {
+        id: test.name.clone(),
+        subtask: test.subtask_id,
+        verdict,
+        score: allocated_score,
+        time_ms,
+        wall_ms,
+        memory_kb,
+        exit: exit_info,
+        checker: checker_msg,
+        diff: None,
+        timing: TimingInfo {
+            rejudged: false,
+            confidence: if sol_res.sandbox_tier == Tier::Full {
+                "high".to_string()
+            } else {
+                "medium".to_string()
+            },
+            samples_ms: vec![time_ms],
+        },
+    }
+}
+
+/// Evaluate a submitted output file for an output-only problem.
+pub fn judge_output_only_test(
+    sandbox: &dyn Sandbox,
+    submission_dir: &Path,
+    test: &TestCase,
+    checker: &ResolvedChecker,
+    pe_as_wa: bool,
+    cancel: &CancelToken,
+) -> SingleTestResult {
+    let out_candidate = submission_dir.join(format!("{}.out", test.name));
+    let ans_candidate = submission_dir.join(format!("{}.ans", test.name));
+
+    let out_path = if out_candidate.is_file() {
+        Some(out_candidate)
+    } else if ans_candidate.is_file() {
+        Some(ans_candidate)
+    } else {
+        None
+    };
+
+    let Some(existing_out) = out_path else {
+        return SingleTestResult {
+            id: test.name.clone(),
+            subtask: test.subtask_id,
+            verdict: Verdict::WrongAnswer,
+            score: 0.0,
+            time_ms: 0,
+            wall_ms: 0,
+            memory_kb: 0,
+            exit: ExitInfo::default(),
+            checker: Some("Output file not found in submission".to_string()),
+            diff: None,
+            timing: TimingInfo {
+                rejudged: false,
+                confidence: "high".to_string(),
+                samples_ms: vec![0],
+            },
+        };
+    };
+
+    let empty_path = PathBuf::new();
+    let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
+
+    let (mut verdict, score_ratio, checker_msg, diff) = match checker {
+        ResolvedChecker::Builtin(b) => {
+            let out_bytes = fs::read(&existing_out).unwrap_or_default();
+            let ans_bytes = uj_checker::read_file_bytes(ans_file).unwrap_or_default();
+            let check_res = b.check(&out_bytes, &ans_bytes);
+            let diff = check_res.diff.map(|d| DiffSummary {
+                line: d.line,
+                column: d.column,
+                token_index: d.token_index,
+                expected: d.expected,
+                found: d.actual,
+                truncated: false,
+            });
+            (
+                check_res.verdict,
+                check_res.score_ratio,
+                check_res.message,
+                diff,
+            )
+        }
+        ResolvedChecker::Testlib(chk_exe) => {
+            let check_res = uj_checker::testlib::run_testlib_checker(
+                sandbox,
+                chk_exe,
+                &test.input_path,
+                &existing_out,
+                ans_file,
+                pe_as_wa,
+                cancel,
+            );
+            (
+                check_res.verdict,
+                check_res.score_ratio,
+                check_res.message,
+                None,
+            )
+        }
+        ResolvedChecker::Lemon {
+            path: chk_exe,
+            full_score,
+        } => {
+            let check_res = uj_checker::lemon::run_lemon_checker(
+                sandbox,
+                chk_exe,
+                &test.input_path,
+                &existing_out,
+                ans_file,
+                *full_score,
+                cancel,
+            );
+            (
+                check_res.verdict,
+                check_res.score_ratio,
+                check_res.message,
+                None,
+            )
+        }
+    };
+
+    if pe_as_wa && verdict == Verdict::PresentationError {
+        verdict = Verdict::WrongAnswer;
+    }
+
+    let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
+
+    SingleTestResult {
+        id: test.name.clone(),
+        subtask: test.subtask_id,
+        verdict,
+        score: allocated_score,
+        time_ms: 0,
+        wall_ms: 0,
+        memory_kb: 0,
+        exit: ExitInfo::default(),
+        checker: checker_msg,
+        diff,
+        timing: TimingInfo {
+            rejudged: false,
+            confidence: "high".to_string(),
+            samples_ms: vec![0],
+        },
+    }
+}
+
+/// Evaluate a communication problem with manager and participant instances.
+pub fn judge_communication_test(
+    sandbox: &dyn Sandbox,
+    manager_exe: &Path,
+    participant_exe: &Path,
+    interpreter_cmd: Option<&[String]>,
+    test: &TestCase,
+    limits: &Limits,
+    cancel: &CancelToken,
+) -> SingleTestResult {
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+
+    let argv_sol = if let Some(cmd) = interpreter_cmd {
+        cmd.iter().map(std::ffi::OsString::from).collect()
+    } else {
+        vec![participant_exe.as_os_str().to_os_string()]
+    };
+
+    let mut mgr_limits = Limits::new(limits.cpu_time_ms * 2 + 5000, 1024 * 1024 * 1024);
+    mgr_limits.wall_time_ms = limits.wall_time_ms + 2000;
+
+    let spec_mgr = RunSpec {
+        argv: vec![
+            manager_exe.as_os_str().to_os_string(),
+            test.input_path.as_os_str().to_os_string(),
+        ],
+        env: vec![],
+        work_dir: scratch_dir.clone(),
+        ro_binds: vec![],
+        stdin: Stdio::Inherit,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: mgr_limits,
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+    };
+
+    let spec_sol = RunSpec {
+        argv: argv_sol,
+        env: vec![],
+        work_dir: scratch_dir,
+        ro_binds: vec![],
+        stdin: Stdio::Pipe,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: limits.clone(),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+    };
+
+    let wiring = Wiring {
+        connections: vec![
+            PipeConnection {
+                from_proc: 0,
+                to_proc: 1,
+            },
+            PipeConnection {
+                from_proc: 1,
+                to_proc: 0,
+            },
+        ],
+    };
+
+    let start_instant = Instant::now();
+    let group_res = sandbox.run_group(&[spec_mgr, spec_sol], &wiring, cancel);
+    let wall_ms = start_instant.elapsed().as_millis() as u64;
+
+    let results = match group_res {
+        Ok(r) if r.len() >= 2 => r,
+        Ok(_) | Err(_) => {
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                checker: Some("Communication run_group failed".to_string()),
+                diff: None,
+                timing: Default::default(),
+            };
+        }
+    };
+
+    let mgr_res = &results[0];
+    let sol_res = &results[1];
+
+    let time_ms = (sol_res.cpu_time_us / 1000).max(1);
+    let memory_kb = sol_res.memory_peak_bytes / 1024;
+
+    let mgr_stdout = mgr_res
+        .stdout
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.bytes).trim().to_string())
+        .unwrap_or_default();
+    let mgr_stderr = String::from_utf8_lossy(&mgr_res.stderr_tail)
+        .trim()
+        .to_string();
+
+    let score_float: f64 = mgr_stdout
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0.0);
+    let score_ratio = if score_float > 1.0 {
+        score_float / 100.0
+    } else {
+        score_float
+    }
+    .clamp(0.0, 1.0);
+
+    let verdict = if score_ratio >= 1.0 {
+        Verdict::Accepted
+    } else if score_ratio > 0.0 {
+        Verdict::PartiallyCorrect
+    } else {
+        Verdict::WrongAnswer
+    };
+
+    let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
+    SingleTestResult {
+        id: test.name.clone(),
+        subtask: test.subtask_id,
+        verdict,
+        score: allocated_score,
+        time_ms,
+        wall_ms,
+        memory_kb,
+        exit: ExitInfo::default(),
+        checker: Some(if mgr_stderr.is_empty() {
+            mgr_stdout
+        } else {
+            mgr_stderr
+        }),
+        diff: None,
+        timing: Default::default(),
     }
 }

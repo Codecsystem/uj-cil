@@ -1,0 +1,12 @@
+schema = 1
+name = "interactive_guess"
+type = "interactive"
+interactor = "interactor.cpp"
+
+[limits]
+time = "1.0s"
+memory = "256MB"
+
+[tests]
+dir = "tests"
+pattern = "*.in"

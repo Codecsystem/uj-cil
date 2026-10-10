@@ -1,0 +1,15 @@
+schema = 1
+name = "grader_aplusb"
+type = "grader"
+
+[limits]
+time = "1.0s"
+memory = "256MB"
+
+[grader]
+files = ["grader.cpp"]
+headers = ["aplusb.h"]
+
+[tests]
+dir = "tests"
+pattern = "*.in"

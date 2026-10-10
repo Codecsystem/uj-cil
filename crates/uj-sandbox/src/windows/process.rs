@@ -25,7 +25,7 @@ use windows_core::{PCWSTR, PWSTR};
 use crate::ntstatus::is_ntstatus_exception;
 use crate::windows::job::JobObject;
 use crate::windows::security::AppContainerProfile;
-use crate::{CancelToken, SandboxError};
+use crate::{CancelToken, SandboxError, Wiring};
 
 // Thread attribute keys:
 pub const ATTR_HANDLE_LIST: usize = 0x00020002;
@@ -33,24 +33,22 @@ pub const ATTR_SECURITY_CAPABILITIES: usize = 0x00020009;
 pub const ATTR_CHILD_PROCESS_POLICY: usize = 0x0002000E;
 pub const PROCESS_CREATION_CHILD_PROCESS_RESTRICTED: u32 = 0x01;
 
-pub fn execute_in_job(
+pub(crate) unsafe fn spawn_suspended_process(
     spec: &RunSpec,
-    job: &JobObject,
+    h_stdin: HANDLE,
+    h_stdout: HANDLE,
+    h_stderr: HANDLE,
     app_container: Option<&AppContainerProfile>,
-    cancel: &CancelToken,
-    tier: Tier,
-) -> Result<RunResult, SandboxError> {
+) -> Result<PROCESS_INFORMATION, SandboxError> {
     if spec.argv.is_empty() {
         return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
     }
 
-    // Resolve executable path
     let exe_path =
         which::which(&spec.argv[0]).unwrap_or_else(|_| std::path::PathBuf::from(&spec.argv[0]));
     let mut full_argv = spec.argv.clone();
     full_argv[0] = exe_path.clone().into_os_string();
 
-    // Build command line string (with proper escaping for Windows)
     let cmd_line_str = build_windows_cmd_line(&full_argv);
     let mut cmd_line_utf16: Vec<u16> = cmd_line_str.encode_utf16().chain(Some(0)).collect();
 
@@ -62,14 +60,9 @@ pub fn execute_in_job(
         .collect();
     let pcwstr_work_dir = PCWSTR(work_dir_utf16.as_ptr());
 
-    // Prepare pipes / file handles for stdin, stdout, stderr
-    let (h_stdin, stdin_cleaner) = prepare_stdin(&spec.stdin)?;
-    let (h_stdout, stdout_read_handle, stdout_cleaner) = prepare_stdout(&spec.stdout)?;
-    let (h_stderr, stderr_read_handle, stderr_cleaner) = prepare_stderr(&spec.stderr)?;
-
     let mut inherit_handles = vec![h_stdin, h_stdout, h_stderr];
 
-    let mut attr_count = 1; // At least ATTR_HANDLE_LIST
+    let mut attr_count = 1;
     if app_container.is_some() {
         attr_count += 1;
     }
@@ -93,7 +86,6 @@ pub fn execute_in_job(
         )?;
     }
 
-    // 1. Whitelist handle inheritance (strictly limits inherited handles to stdin, stdout, stderr)
     unsafe {
         UpdateProcThreadAttribute(
             attr_list,
@@ -111,7 +103,6 @@ pub fn execute_in_job(
         })?;
     }
 
-    // 2. Security capabilities (AppContainer sandbox isolation)
     let mut sec_caps = SECURITY_CAPABILITIES::default();
     if let Some(ac) = app_container {
         sec_caps.AppContainerSid = ac.sid();
@@ -141,9 +132,7 @@ pub fn execute_in_job(
     si_ex.StartupInfo.hStdError = h_stderr;
     si_ex.lpAttributeList = attr_list;
 
-    // Build minimal environment block
     let env_block = build_environment_block(&spec.env, &spec.work_dir);
-
     let mut pi = PROCESS_INFORMATION::default();
 
     let flags = EXTENDED_STARTUPINFO_PRESENT
@@ -160,7 +149,7 @@ pub fn execute_in_job(
             PWSTR(cmd_line_utf16.as_mut_ptr()),
             None,
             None,
-            true, // bInheritHandles must be TRUE when using PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+            true,
             flags,
             Some(env_block.as_ptr() as *const _),
             pcwstr_work_dir,
@@ -169,25 +158,44 @@ pub fn execute_in_job(
         )
     };
 
-    // Clean up attribute list
     unsafe {
         DeleteProcThreadAttributeList(attr_list);
     }
+
+    if let Err(ref e) = spawn_res {
+        tracing::debug!(
+            "CreateProcessW error: {e}, app={:?}, work_dir={:?}, cmd={cmd_line_str}",
+            exe_path,
+            spec.work_dir
+        );
+    }
+    spawn_res.map_err(|e| SandboxError::Internal(format!("CreateProcessW failed: {e}")))?;
+
+    Ok(pi)
+}
+
+pub fn execute_in_job(
+    spec: &RunSpec,
+    job: &JobObject,
+    app_container: Option<&AppContainerProfile>,
+    cancel: &CancelToken,
+    tier: Tier,
+) -> Result<RunResult, SandboxError> {
+    if spec.argv.is_empty() {
+        return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
+    }
+
+    // Prepare pipes / file handles for stdin, stdout, stderr
+    let (h_stdin, stdin_cleaner) = prepare_stdin(&spec.stdin)?;
+    let (h_stdout, stdout_read_handle, stdout_cleaner) = prepare_stdout(&spec.stdout)?;
+    let (h_stderr, stderr_read_handle, stderr_cleaner) = prepare_stderr(&spec.stderr)?;
+
+    let pi = unsafe { spawn_suspended_process(spec, h_stdin, h_stdout, h_stderr, app_container)? };
 
     // Close the write end of pipes in the parent so reader threads receive EOF when child exits!
     drop(stdin_cleaner);
     drop(stdout_cleaner);
     drop(stderr_cleaner);
-
-    if let Err(ref e) = spawn_res {
-        tracing::debug!(
-            "CreateProcessW error: {e}, app={:?}, work_dir={:?}, cmd={cmd_line_str}, has_ac={}",
-            exe_path,
-            spec.work_dir,
-            app_container.is_some()
-        );
-    }
-    spawn_res.map_err(|e| SandboxError::Internal(format!("CreateProcessW failed: {e}")))?;
 
     // Assign process to Job Object
     if let Err(e) = job.assign_process(pi.hProcess) {
@@ -341,7 +349,346 @@ pub fn execute_in_job(
         stderr_tail,
         residue_cleaned: false,
         sandbox_tier: tier,
+        exit_order: None,
     })
+}
+
+pub fn execute_group_in_jobs(
+    specs: &[RunSpec],
+    wiring: &Wiring,
+    app_container: Option<&AppContainerProfile>,
+    cancel: &CancelToken,
+    tier: Tier,
+) -> Result<Vec<RunResult>, SandboxError> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let n = specs.len();
+
+    // 1. Create wired pipes
+    let mut wired_stdins: Vec<Option<HANDLE>> = vec![None; n];
+    let mut wired_stdouts: Vec<Option<HANDLE>> = vec![None; n];
+    let mut pipe_cleaners: Vec<HandleCleaner> = Vec::new();
+
+    for conn in &wiring.connections {
+        if conn.from_proc >= n || conn.to_proc >= n {
+            return Err(SandboxError::Internal(format!(
+                "Invalid wiring connection from {} to {} (total procs: {})",
+                conn.from_proc, conn.to_proc, n
+            )));
+        }
+        use windows::Win32::System::Pipes::CreatePipe;
+        let mut h_read = HANDLE::default();
+        let mut h_write = HANDLE::default();
+        unsafe {
+            CreatePipe(&mut h_read, &mut h_write, None, 0)
+                .map_err(|e| SandboxError::Internal(format!("CreatePipe failed: {e}")))?;
+            let _ = SetHandleInformation(h_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+            let _ = SetHandleInformation(h_write, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+        }
+        wired_stdouts[conn.from_proc] = Some(h_write);
+        wired_stdins[conn.to_proc] = Some(h_read);
+        pipe_cleaners.push(HandleCleaner { handle: h_read });
+        pipe_cleaners.push(HandleCleaner { handle: h_write });
+    }
+
+    // 2. Prepare I/O for each process
+    let mut stdin_handles = Vec::with_capacity(n);
+    let mut stdout_handles = Vec::with_capacity(n);
+    let mut stderr_handles = Vec::with_capacity(n);
+    let mut stdout_read_handles = Vec::with_capacity(n);
+    let mut stderr_read_handles = Vec::with_capacity(n);
+    let mut extra_cleaners = Vec::new();
+
+    for i in 0..n {
+        let (h_in, in_cleaner) = if let Some(h) = wired_stdins[i] {
+            (h, None)
+        } else {
+            prepare_stdin(&specs[i].stdin)?
+        };
+        stdin_handles.push(h_in);
+        if let Some(c) = in_cleaner {
+            extra_cleaners.push(c);
+        }
+
+        let (h_out, r_out, out_cleaner) = if let Some(h) = wired_stdouts[i] {
+            (h, None, None)
+        } else {
+            prepare_stdout(&specs[i].stdout)?
+        };
+        stdout_handles.push(h_out);
+        stdout_read_handles.push(r_out);
+        if let Some(c) = out_cleaner {
+            extra_cleaners.push(c);
+        }
+
+        let (h_err, r_err, err_cleaner) = prepare_stderr(&specs[i].stderr)?;
+        stderr_handles.push(h_err);
+        stderr_read_handles.push(r_err);
+        if let Some(c) = err_cleaner {
+            extra_cleaners.push(c);
+        }
+    }
+
+    // 3. Create Job Objects and Spawn suspended processes
+    let mut jobs = Vec::with_capacity(n);
+    let mut proc_infos = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let job = JobObject::create(None).map_err(|e| {
+            SandboxError::Internal(format!("Failed to create Job Object for proc {i}: {e}"))
+        })?;
+        job.set_limits(
+            specs[i].limits.memory_bytes,
+            specs[i].limits.max_processes,
+            specs[i].cpu_affinity.as_deref(),
+        )
+        .map_err(|e| SandboxError::Internal(format!("Failed to set limits for proc {i}: {e}")))?;
+
+        let ac = if i == 0 { app_container } else { None };
+        let pi = unsafe {
+            spawn_suspended_process(
+                &specs[i],
+                stdin_handles[i],
+                stdout_handles[i],
+                stderr_handles[i],
+                ac,
+            )?
+        };
+
+        if let Err(e) = job.assign_process(pi.hProcess) {
+            unsafe {
+                let _ = CloseHandle(pi.hThread);
+                let _ = CloseHandle(pi.hProcess);
+            }
+            return Err(SandboxError::Internal(format!(
+                "AssignProcessToJobObject for proc {i} failed: {e}"
+            )));
+        }
+
+        jobs.push(job);
+        proc_infos.push(pi);
+    }
+
+    // 4. IMPORTANT: Close all parent copies of pipe handles so children receive EOF!
+    drop(pipe_cleaners);
+    drop(extra_cleaners);
+
+    // 5. Start background readers
+    let mut ole_flags = Vec::with_capacity(n);
+    let mut stdout_threads = Vec::with_capacity(n);
+    let mut stderr_threads = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let ole_flag = Arc::new(AtomicBool::new(false));
+        ole_flags.push(ole_flag.clone());
+
+        let stdout_limit = specs[i].limits.output_bytes as usize;
+        let s_thread = if let Some(r_handle) = stdout_read_handles[i] {
+            let flag_clone = ole_flag.clone();
+            let raw_h = r_handle.0 as usize;
+            Some(thread::spawn(move || {
+                let handle = HANDLE(raw_h as *mut _);
+                read_pipe_to_end(handle, stdout_limit, Some(flag_clone))
+            }))
+        } else {
+            None
+        };
+        stdout_threads.push(s_thread);
+
+        let stderr_limit = specs[i].limits.stderr_bytes as usize;
+        let e_thread = if let Some(r_handle) = stderr_read_handles[i] {
+            let raw_h = r_handle.0 as usize;
+            Some(thread::spawn(move || {
+                let handle = HANDLE(raw_h as *mut _);
+                read_pipe_to_end(handle, stderr_limit, None)
+            }))
+        } else {
+            None
+        };
+        stderr_threads.push(e_thread);
+    }
+
+    // 6. Resume all threads simultaneously
+    let start_time = Instant::now();
+    for pi in &proc_infos {
+        unsafe {
+            let _ = ResumeThread(pi.hThread);
+            let _ = CloseHandle(pi.hThread);
+        }
+    }
+
+    // 7. Group monitoring loop
+    let mut finished = vec![false; n];
+    let mut killed_by: Vec<Option<KillReason>> = vec![None; n];
+    let mut exit_order: Vec<Option<u32>> = vec![None; n];
+    let mut order_counter = 1u32;
+    let mut exit_statuses = vec![ExitStatus::Exited(0); n];
+    let mut final_cpu_us = vec![0u64; n];
+    let mut final_wall_us = vec![0u64; n];
+    let mut final_peak_mem = vec![0u64; n];
+
+    let group_wall_limit = specs
+        .iter()
+        .map(|s| s.limits.wall_time_ms)
+        .max()
+        .unwrap_or(10000);
+    let poll_interval = Duration::from_millis(5);
+
+    loop {
+        if finished.iter().all(|&f| f) {
+            break;
+        }
+
+        // 1. Cancellation check
+        if cancel.is_cancelled() {
+            for i in 0..n {
+                if !finished[i] {
+                    killed_by[i] = Some(KillReason::UserCancel);
+                    let _ = jobs[i].terminate(3);
+                }
+            }
+            break;
+        }
+
+        // 2. Wall clock check across group
+        let wall_ms = start_time.elapsed().as_millis() as u64;
+        if wall_ms > group_wall_limit {
+            for i in 0..n {
+                if !finished[i] {
+                    killed_by[i] = Some(KillReason::WallLimit);
+                    let _ = jobs[i].terminate(3);
+                }
+            }
+            break;
+        }
+
+        // 3. Check each process
+        for i in 0..n {
+            if finished[i] {
+                continue;
+            }
+
+            // OLE check
+            if ole_flags[i].load(Ordering::SeqCst) {
+                killed_by[i] = Some(KillReason::OutputLimit);
+                let _ = jobs[i].terminate(3);
+                finished[i] = true;
+                exit_order[i] = Some(order_counter);
+                order_counter += 1;
+                continue;
+            }
+
+            // CPU check
+            if let Ok(cpu_us) = jobs[i].query_cpu_time_us()
+                && (cpu_us / 1000) > specs[i].limits.cpu_time_ms
+            {
+                killed_by[i] = Some(KillReason::CpuLimit);
+                let _ = jobs[i].terminate(3);
+                finished[i] = true;
+                exit_order[i] = Some(order_counter);
+                order_counter += 1;
+                continue;
+            }
+
+            // Memory check
+            if let Ok(mem) = jobs[i].query_peak_memory_bytes()
+                && mem > specs[i].limits.memory_bytes
+            {
+                killed_by[i] = Some(KillReason::MemoryLimit);
+                let _ = jobs[i].terminate(3);
+                finished[i] = true;
+                exit_order[i] = Some(order_counter);
+                order_counter += 1;
+                continue;
+            }
+
+            // Process exit check
+            let wait_res = unsafe { WaitForSingleObject(proc_infos[i].hProcess, 0) };
+            if wait_res == WAIT_OBJECT_0 {
+                finished[i] = true;
+                exit_order[i] = Some(order_counter);
+                order_counter += 1;
+
+                let mut exit_code: u32 = 0;
+                unsafe {
+                    let _ = GetExitCodeProcess(proc_infos[i].hProcess, &mut exit_code);
+                }
+                exit_statuses[i] = if is_ntstatus_exception(exit_code) {
+                    ExitStatus::NtStatus(exit_code)
+                } else {
+                    ExitStatus::Exited(exit_code as i32)
+                };
+                final_cpu_us[i] = jobs[i].query_cpu_time_us().unwrap_or(0);
+                final_peak_mem[i] = jobs[i].query_peak_memory_bytes().unwrap_or(0);
+                final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+            }
+        }
+
+        thread::sleep(poll_interval);
+    }
+
+    // 8. Collect results for all processes
+    let mut results = Vec::with_capacity(n);
+    for i in 0..n {
+        unsafe {
+            let _ = WaitForSingleObject(proc_infos[i].hProcess, 100);
+        }
+
+        if !finished[i] {
+            let mut exit_code: u32 = 0;
+            unsafe {
+                let _ = GetExitCodeProcess(proc_infos[i].hProcess, &mut exit_code);
+            }
+            exit_statuses[i] = if is_ntstatus_exception(exit_code) {
+                ExitStatus::NtStatus(exit_code)
+            } else {
+                ExitStatus::Exited(exit_code as i32)
+            };
+            final_cpu_us[i] = jobs[i].query_cpu_time_us().unwrap_or(0);
+            final_peak_mem[i] = jobs[i].query_peak_memory_bytes().unwrap_or(0);
+            final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+            exit_order[i] = Some(order_counter);
+            order_counter += 1;
+        }
+
+        unsafe {
+            let _ = CloseHandle(proc_infos[i].hProcess);
+        }
+
+        let captured_stdout = if let Some(Some(h)) = stdout_threads.get_mut(i).map(|t| t.take()) {
+            let bytes = h.join().unwrap_or_default();
+            let truncated = ole_flags[i].load(Ordering::SeqCst);
+            Some(CapturedOutput { bytes, truncated })
+        } else {
+            None
+        };
+
+        let stderr_tail = if let Some(Some(h)) = stderr_threads.get_mut(i).map(|t| t.take()) {
+            h.join().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let oom_killed = killed_by[i] == Some(KillReason::MemoryLimit);
+
+        results.push(RunResult {
+            status: exit_statuses[i],
+            cpu_time_us: final_cpu_us[i],
+            wall_time_us: final_wall_us[i],
+            memory_peak_bytes: final_peak_mem[i],
+            killed_by: killed_by[i],
+            oom_killed,
+            stdout: captured_stdout,
+            stderr_tail,
+            residue_cleaned: false,
+            sandbox_tier: if i == 0 { tier } else { Tier::Degraded },
+            exit_order: exit_order[i],
+        });
+    }
+
+    Ok(results)
 }
 
 // ----------------------------------------------------------------------------

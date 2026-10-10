@@ -67,6 +67,16 @@ pub struct Compiler;
 impl Compiler {
     /// Compile source file, utilizing .uj/cache/bin/<blake3> caching.
     pub fn compile(source_path: &Path, no_cache: bool) -> Result<CompileResult, CompileError> {
+        Self::compile_with_options(source_path, &[], &[], no_cache)
+    }
+
+    /// Compile source file with extra source files (e.g. grader.cpp) and include directories.
+    pub fn compile_with_options(
+        source_path: &Path,
+        extra_sources: &[PathBuf],
+        include_dirs: &[PathBuf],
+        no_cache: bool,
+    ) -> Result<CompileResult, CompileError> {
         let lang = Language::from_path(source_path)?;
         let source_bytes = fs::read(source_path)?;
 
@@ -151,6 +161,15 @@ impl Compiler {
             hasher.update(arg.as_bytes());
         }
         hasher.update(&source_bytes);
+        for extra in extra_sources {
+            if let Ok(b) = fs::read(extra) {
+                hasher.update(extra.to_string_lossy().as_bytes());
+                hasher.update(&b);
+            }
+        }
+        for inc in include_dirs {
+            hasher.update(inc.to_string_lossy().as_bytes());
+        }
         let cache_hash = hasher.finalize().to_hex().to_string();
 
         let cache_dir = PathBuf::from(".uj/cache/bin").join(&cache_hash);
@@ -175,7 +194,14 @@ impl Compiler {
         for arg in &default_args {
             cmd.arg(arg);
         }
+        for inc in include_dirs {
+            cmd.arg("-I");
+            cmd.arg(inc);
+        }
         cmd.arg(source_path);
+        for extra in extra_sources {
+            cmd.arg(extra);
+        }
         cmd.arg("-o");
         cmd.arg(&cached_bin);
 

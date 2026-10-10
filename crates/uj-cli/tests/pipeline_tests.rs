@@ -3,6 +3,10 @@ use std::sync::Mutex;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn lock_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn get_uj_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // pop test binary name
@@ -29,7 +33,7 @@ fn uj_cmd() -> Command {
 
 #[test]
 fn test_judge_pipeline_ac() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
     let output = uj_cmd()
         .arg("judge")
         .arg("tests/problems/aplusb/solutions/ac.cpp")
@@ -59,7 +63,7 @@ fn test_judge_pipeline_ac() {
 
 #[test]
 fn test_judge_pipeline_wa() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
     let output = uj_cmd()
         .arg("judge")
         .arg("tests/problems/aplusb/solutions/wa.cpp")
@@ -88,7 +92,7 @@ fn test_judge_pipeline_wa() {
 
 #[test]
 fn test_judge_pipeline_tle() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
     let output = uj_cmd()
         .arg("judge")
         .arg("tests/problems/aplusb/solutions/tle.cpp")
@@ -114,7 +118,7 @@ fn test_judge_pipeline_tle() {
 
 #[test]
 fn test_judge_pipeline_re() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
     let output = uj_cmd()
         .arg("judge")
         .arg("tests/problems/aplusb/solutions/re.cpp")
@@ -135,7 +139,7 @@ fn test_judge_pipeline_re() {
 
 #[test]
 fn test_judge_pipeline_ce() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
     let output = uj_cmd()
         .arg("judge")
         .arg("tests/problems/aplusb/solutions/ce.cpp")
@@ -157,7 +161,7 @@ fn test_judge_pipeline_ce() {
 
 #[test]
 fn test_last_and_show() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
 
     // 1. Run AC
     let _ = uj_cmd()
@@ -196,7 +200,7 @@ fn test_last_and_show() {
 
 #[test]
 fn test_parallel_consistency() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
 
     // Run with 1 slot
     let out_j1 = uj_cmd()
@@ -238,7 +242,7 @@ fn test_parallel_consistency() {
 
 #[test]
 fn test_judge_pipeline_testlib_checker() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
 
     // 1. Test AC on testlib problem
     let ac_out = uj_cmd()
@@ -285,7 +289,7 @@ fn test_judge_pipeline_testlib_checker() {
 
 #[test]
 fn test_judge_pipeline_lemon_checker() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
 
     // 1. Test AC on Lemon SPJ problem
     let ac_out = uj_cmd()
@@ -327,7 +331,7 @@ fn test_judge_pipeline_lemon_checker() {
 
 #[test]
 fn test_judge_pipeline_fail_fast() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = lock_test();
     let output = uj_cmd()
         .arg("judge")
         .arg("tests/problems/aplusb/solutions/wa.cpp")
@@ -349,4 +353,165 @@ fn test_judge_pipeline_fail_fast() {
     let tests = report["tests"].as_array().unwrap();
     // At least one test in subtask 1 was evaluated as WA
     assert!(tests.iter().any(|t| t["verdict"] == "WA"));
+}
+
+#[test]
+fn test_judge_pipeline_interactive_ac() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/interactive_problem/solutions/ac.cpp")
+        .arg("-p")
+        .arg("tests/problems/interactive_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Interactive AC solution failed. Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "AC");
+    assert_eq!(report["score"], 100.0);
+}
+
+#[test]
+fn test_judge_pipeline_interactive_wa() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/interactive_problem/solutions/wa.cpp")
+        .arg("-p")
+        .arg("tests/problems/interactive_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "WA");
+    assert_eq!(report["score"], 0.0);
+}
+
+#[test]
+fn test_judge_pipeline_interactive_deadlock() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/interactive_problem/solutions/deadlock.cpp")
+        .arg("-p")
+        .arg("tests/problems/interactive_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "TLE");
+    assert_eq!(report["score"], 0.0);
+    let msg = report["tests"][0]["checker"].as_str().unwrap_or_default();
+    assert!(msg.contains("Idleness limit exceeded") || msg.contains("Process idleness"));
+}
+
+#[test]
+fn test_judge_pipeline_grader_ac() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/grader_problem/solutions/ac.cpp")
+        .arg("-p")
+        .arg("tests/problems/grader_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Grader AC solution failed. Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "AC");
+    assert_eq!(report["score"], 100.0);
+}
+
+#[test]
+fn test_judge_pipeline_grader_wa() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/grader_problem/solutions/wa.cpp")
+        .arg("-p")
+        .arg("tests/problems/grader_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "WA");
+    assert_eq!(report["score"], 0.0);
+}
+
+#[test]
+fn test_judge_pipeline_output_only_ac() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/output_only_problem/solutions/ac")
+        .arg("-p")
+        .arg("tests/problems/output_only_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Output-only AC failed. Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "AC");
+    assert_eq!(report["score"], 100.0);
+    assert_eq!(report["tests"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_judge_pipeline_output_only_wa() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/output_only_problem/solutions/wa")
+        .arg("-p")
+        .arg("tests/problems/output_only_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "PC");
+    assert_eq!(report["score"], 50.0);
 }

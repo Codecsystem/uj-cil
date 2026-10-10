@@ -160,6 +160,8 @@ pub struct RunResult {
     pub stderr_tail: Vec<u8>,
     pub residue_cleaned: bool,
     pub sandbox_tier: Tier,
+    #[serde(default)]
+    pub exit_order: Option<u32>,
 }
 
 impl RunResult {

@@ -9,14 +9,17 @@ use crossbeam_channel::{Sender, bounded, unbounded};
 use parking_lot::Mutex;
 
 use uj_checker::builtin::BuiltinCheckerType;
-use uj_core::config::{CheckerType, ProblemConfig};
+use uj_core::config::{CheckerType, ProblemConfig, ProblemType};
 use uj_core::tests::TestCase;
 use uj_core::verdict::Verdict;
 use uj_report::result::{JudgeEvent, SingleTestResult, SubmissionJudgeReport};
 use uj_sandbox::{CancelToken, create_sandbox};
 
 use crate::compiler::{CompileResult, Compiler};
-use crate::judge::{JudgeOptions, ResolvedChecker, aggregate_submission_report, judge_single_test};
+use crate::judge::{
+    JudgeOptions, ResolvedChecker, aggregate_submission_report, judge_communication_test,
+    judge_interactive_test, judge_output_only_test, judge_single_test,
+};
 use crate::topology::{Slot, Topology};
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +141,70 @@ impl Scheduler {
             }
         };
 
+        let interactor_bin = if problem_config.problem_type == ProblemType::Interactive {
+            let int_path = problem_config
+                .interactor
+                .as_ref()
+                .map(|p| {
+                    if p.is_absolute() {
+                        p.clone()
+                    } else {
+                        problem_dir.join(p)
+                    }
+                })
+                .ok_or_else(|| {
+                    SchedulerError::Config(
+                        "interactor path not specified in problem.toml".to_string(),
+                    )
+                })?;
+
+            let bin_path = if int_path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+            {
+                int_path
+            } else {
+                let compiled_int = Compiler::compile(&int_path, false).map_err(|e| {
+                    SchedulerError::Config(format!("Failed to compile interactor: {e}"))
+                })?;
+                compiled_int.binary_path
+            };
+            Some(bin_path)
+        } else {
+            None
+        };
+
+        let manager_bin = if problem_config.problem_type == ProblemType::Communication {
+            let mgr_path = problem_config
+                .manager
+                .as_ref()
+                .map(|p| {
+                    if p.is_absolute() {
+                        p.clone()
+                    } else {
+                        problem_dir.join(p)
+                    }
+                })
+                .ok_or_else(|| {
+                    SchedulerError::Config("manager path not specified in problem.toml".to_string())
+                })?;
+
+            let bin_path = if mgr_path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+            {
+                mgr_path
+            } else {
+                let compiled_mgr = Compiler::compile(&mgr_path, false).map_err(|e| {
+                    SchedulerError::Config(format!("Failed to compile manager: {e}"))
+                })?;
+                compiled_mgr.binary_path
+            };
+            Some(bin_path)
+        } else {
+            None
+        };
+
         // Sort tests by input file size descending (LPT heuristic)
         let mut sorted_tests = tests.clone();
         sorted_tests.sort_by(|a, b| {
@@ -180,6 +247,9 @@ impl Scheduler {
             let require_tier = self.options.require_tier;
             let fail_fast = self.options.fail_fast;
             let checker_clone = resolved_checker.clone();
+            let problem_type = problem_config.problem_type;
+            let interactor_bin_clone = interactor_bin.clone();
+            let manager_bin_clone = manager_bin.clone();
 
             let handle = thread::spawn(move || {
                 let sandbox = match create_sandbox(&sandbox_mode, require_tier) {
@@ -221,17 +291,68 @@ impl Scheduler {
                         });
                     }
 
-                    let res = judge_single_test(
-                        sandbox.as_ref(),
-                        &exe_path,
-                        interpreter_cmd.as_deref(),
-                        &test,
-                        &limits_clone,
-                        &checker_clone,
-                        pe_as_wa,
-                        s.cpu_core,
-                        &cancel_clone,
-                    );
+                    let res = match problem_type {
+                        ProblemType::Interactive => {
+                            let int_exe = interactor_bin_clone
+                                .as_ref()
+                                .expect("interactor binary must exist");
+                            judge_interactive_test(
+                                sandbox.as_ref(),
+                                &exe_path,
+                                interpreter_cmd.as_deref(),
+                                int_exe,
+                                &test,
+                                &limits_clone,
+                                Some(&checker_clone),
+                                pe_as_wa,
+                                &cancel_clone,
+                            )
+                        }
+                        ProblemType::OutputOnly => judge_output_only_test(
+                            sandbox.as_ref(),
+                            &exe_path,
+                            &test,
+                            &checker_clone,
+                            pe_as_wa,
+                            &cancel_clone,
+                        ),
+                        ProblemType::Communication => {
+                            if let Some(ref mgr_exe) = manager_bin_clone {
+                                judge_communication_test(
+                                    sandbox.as_ref(),
+                                    mgr_exe,
+                                    &exe_path,
+                                    interpreter_cmd.as_deref(),
+                                    &test,
+                                    &limits_clone,
+                                    &cancel_clone,
+                                )
+                            } else {
+                                judge_single_test(
+                                    sandbox.as_ref(),
+                                    &exe_path,
+                                    interpreter_cmd.as_deref(),
+                                    &test,
+                                    &limits_clone,
+                                    &checker_clone,
+                                    pe_as_wa,
+                                    s.cpu_core,
+                                    &cancel_clone,
+                                )
+                            }
+                        }
+                        ProblemType::Traditional | ProblemType::Grader => judge_single_test(
+                            sandbox.as_ref(),
+                            &exe_path,
+                            interpreter_cmd.as_deref(),
+                            &test,
+                            &limits_clone,
+                            &checker_clone,
+                            pe_as_wa,
+                            s.cpu_core,
+                            &cancel_clone,
+                        ),
+                    };
 
                     if fail_fast
                         && !res.verdict.is_accepted()
@@ -278,7 +399,10 @@ impl Scheduler {
         // --------------------------------------------------------------------
         // Section 6.3 Precise Rejudging for Edge Cases (--precise)
         // --------------------------------------------------------------------
-        if self.options.precise && !cancel.is_cancelled() {
+        if self.options.precise
+            && !cancel.is_cancelled()
+            && problem_config.problem_type != ProblemType::OutputOnly
+        {
             let tl_ms = limits.cpu_time_ms;
             let lower_bound = (tl_ms as f64 * 0.9) as u64;
             let upper_bound = (tl_ms as f64 * 1.5) as u64;
@@ -315,17 +439,36 @@ impl Scheduler {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        let rerun = judge_single_test(
-                            exclusive_sandbox.as_ref(),
-                            &compiled.binary_path,
-                            compiled.interpreter_cmd.as_deref(),
-                            orig_test,
-                            &limits,
-                            &resolved_checker,
-                            pe_as_wa,
-                            Some(1),
-                            cancel,
-                        );
+                        let rerun = match problem_config.problem_type {
+                            ProblemType::Interactive => {
+                                let int_exe = interactor_bin
+                                    .as_ref()
+                                    .expect("interactor binary must exist");
+                                judge_interactive_test(
+                                    exclusive_sandbox.as_ref(),
+                                    &compiled.binary_path,
+                                    compiled.interpreter_cmd.as_deref(),
+                                    int_exe,
+                                    orig_test,
+                                    &limits,
+                                    Some(&resolved_checker),
+                                    pe_as_wa,
+                                    cancel,
+                                )
+                            }
+                            ProblemType::OutputOnly => unreachable!(),
+                            _ => judge_single_test(
+                                exclusive_sandbox.as_ref(),
+                                &compiled.binary_path,
+                                compiled.interpreter_cmd.as_deref(),
+                                orig_test,
+                                &limits,
+                                &resolved_checker,
+                                pe_as_wa,
+                                Some(1),
+                                cancel,
+                            ),
+                        };
                         samples.push(rerun.time_ms);
                         if rerun.time_ms < best_result.time_ms {
                             best_result = rerun;
