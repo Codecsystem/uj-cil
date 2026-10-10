@@ -156,6 +156,32 @@ fn bench_checker_ncmp() {
     );
 }
 
+fn bench_checker_wcmp() {
+    let mut data = Vec::with_capacity(6 * 1024 * 1024);
+    for i in 0..100_000 {
+        data.extend_from_slice(format!("        word_{} \r\n", i).as_bytes());
+    }
+
+    // Warmup
+    let _ = uj_checker::builtin::check_wcmp(&data, &data);
+
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        let res = uj_checker::builtin::check_wcmp(&data, &data);
+        times.push(start.elapsed().as_micros());
+        assert_eq!(res.verdict, uj_core::verdict::Verdict::Accepted);
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    println!(
+        "[Checker wcmp 100k Words] Median: {} µs ({} ms), Raw: {:?} µs",
+        median,
+        median as f64 / 1000.0,
+        times
+    );
+}
+
 fn get_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -366,6 +392,7 @@ fn main() {
     bench_checker_fcmp();
     bench_checker_hcmp();
     bench_checker_ncmp();
+    bench_checker_wcmp();
     let count = std::env::var("UJ_BENCH_TESTS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

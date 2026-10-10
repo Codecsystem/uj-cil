@@ -102,6 +102,21 @@ impl<'a> Iterator for TokenIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         // Skip whitespace
         while self.pos < self.input.len() {
+            // Fast path: skip 8 consecutive spaces (0x20)
+            while self.pos + 8 <= self.input.len() {
+                let chunk =
+                    u64::from_le_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
+                if chunk == 0x2020202020202020 {
+                    self.pos += 8;
+                    self.col += 8;
+                } else {
+                    break;
+                }
+            }
+            if self.pos >= self.input.len() {
+                break;
+            }
+
             let b = self.input[self.pos];
             if b == b'\n' {
                 self.line += 1;
@@ -123,7 +138,23 @@ impl<'a> Iterator for TokenIterator<'a> {
         let start_line = self.line;
         let start_col = self.col;
 
-        // Scan token characters
+        // Fast path: scan 8 non-whitespace ASCII characters at a time using SWAR
+        while self.pos + 8 <= self.input.len() {
+            let chunk = u64::from_le_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
+            // Break if any byte has high bit set (non-ASCII >= 0x80)
+            if (chunk & 0x8080808080808080) != 0 {
+                break;
+            }
+            // If any byte <= 0x20 (ASCII whitespace / control), (chunk - 0x2121...) will borrow to high bit
+            let sub = chunk.wrapping_sub(0x2121212121212121);
+            if (sub & 0x8080808080808080) != 0 {
+                break;
+            }
+            self.pos += 8;
+            self.col += 8;
+        }
+
+        // Tail: standard byte-by-byte scan
         while self.pos < self.input.len() {
             let b = self.input[self.pos];
             if b.is_ascii_whitespace() {
@@ -1006,5 +1037,25 @@ mod tests {
         assert_eq!(super::fast_parse_i64(b"-"), None);
         assert_eq!(super::fast_parse_i64(b"12a34"), None);
         assert_eq!(super::fast_parse_i64(b" 42"), None);
+    }
+
+    #[test]
+    fn test_swar_tokenizer() {
+        // Words of varying lengths (>= 8, < 8, exact 8, multiple 8s)
+        let input = b"        12345678  123456789  1234567  abcdefghijklmnop  \n  \t  utf8_\xe4\xbd\xa0\xe5\xa5\xbd_test  end";
+        let tokens: Vec<_> = TokenIterator::new(input)
+            .map(|t| (t.as_str().to_string(), t.line, t.col))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                ("12345678".to_string(), 1, 9),
+                ("123456789".to_string(), 1, 19),
+                ("1234567".to_string(), 1, 30),
+                ("abcdefghijklmnop".to_string(), 1, 39),
+                ("utf8_\u{4f60}\u{597d}_test".to_string(), 2, 6),
+                ("end".to_string(), 2, 24),
+            ]
+        );
     }
 }
