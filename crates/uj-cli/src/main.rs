@@ -64,21 +64,17 @@ fn main() -> ExitCode {
             && unsafe { libc::getuid() } != 0
             && std::env::var_os("UJ_IN_SYSTEMD_SCOPE").is_none()
         {
-            let bus_available = std::process::Command::new("systemd-run")
-                .args(["--user", "--scope", "--quiet", "true"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-            if bus_available {
-                let in_delegated_scope = if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+            let in_delegated_scope =
+                if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
                     let rel = cgroup
                         .lines()
                         .find_map(|l| l.strip_prefix("0::"))
                         .unwrap_or("")
                         .trim_start_matches('/');
                     let p = std::path::Path::new("/sys/fs/cgroup").join(rel);
-                    p.file_name().map(|n| n.to_string_lossy().contains(".scope")).unwrap_or(false)
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().contains(".scope"))
+                        .unwrap_or(false)
                         && p.join("cgroup.controllers").exists()
                         && std::fs::OpenOptions::new()
                             .write(true)
@@ -88,7 +84,16 @@ fn main() -> ExitCode {
                     false
                 };
 
-                if !in_delegated_scope && let Ok(exe) = std::env::current_exe() {
+            if !in_delegated_scope {
+                let bus_available = std::process::Command::new("systemd-run")
+                    .args(["--user", "--scope", "--quiet", "true"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if bus_available && let Ok(exe) = std::env::current_exe() {
                     let mut cmd = std::process::Command::new("systemd-run");
                     cmd.arg("--user")
                         .arg("--scope")

@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use uj_core::run::{KillReason, Limits, RunSpec, Stdio};
-use uj_sandbox::{create_sandbox, CancelToken};
+use uj_sandbox::{CancelToken, create_sandbox};
 
 #[test]
 fn test_windows_sandbox_echo() {
@@ -144,7 +144,10 @@ fn test_windows_appcontainer_stack_overflow() {
     let elapsed = start.elapsed();
     println!(
         "SO AppContainer run result: status={:?}, killed_by={:?}, wall_ms={}, elapsed={:?}",
-        res.status, res.killed_by, res.wall_time_us / 1000, elapsed
+        res.status,
+        res.killed_by,
+        res.wall_time_us / 1000,
+        elapsed
     );
 }
 
@@ -198,7 +201,8 @@ fn test_windows_sandbox_wall_time_limit() {
 fn test_windows_sandbox_output_limit() {
     let sandbox = create_sandbox("auto", false).expect("failed to create sandbox");
 
-    let work_dir = std::env::temp_dir();
+    let work_dir = std::env::temp_dir().join("uj_test_out");
+    let _ = std::fs::create_dir_all(&work_dir);
     let mut limits = Limits::new(5000, 256 * 1024 * 1024);
     limits.output_bytes = 100; // Small limit: 100 bytes
 
@@ -254,7 +258,8 @@ fn test_windows_sandbox_output_limit() {
 fn test_windows_sandbox_cancel_token() {
     let sandbox = create_sandbox("degraded", false).expect("failed to create sandbox");
 
-    let work_dir = std::env::temp_dir();
+    let work_dir = std::env::temp_dir().join("uj_test_cancel");
+    let _ = std::fs::create_dir_all(&work_dir);
     let argv = if cfg!(windows) {
         vec![
             OsString::from("powershell.exe"),
@@ -379,7 +384,8 @@ fn test_windows_run_group_wiring() {
 fn test_windows_sandbox_memory_limit() {
     let sandbox = create_sandbox("degraded", false).expect("failed to create sandbox");
 
-    let work_dir = std::env::temp_dir();
+    let work_dir = std::env::temp_dir().join("uj_test_mem");
+    let _ = std::fs::create_dir_all(&work_dir);
     let limits = Limits::new(5000, 32 * 1024 * 1024);
 
     let argv = if cfg!(windows) {

@@ -10,9 +10,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use uj_core::run::{CapturedOutput, ExitStatus, KillReason, RunResult, RunSpec, Stdio, Tier};
 use crate::linux::cgroup::CgroupV2;
 use crate::{CancelToken, SandboxError, Wiring};
+use uj_core::run::{CapturedOutput, ExitStatus, KillReason, RunResult, RunSpec, Stdio, Tier};
+
+/// Packet sent from container init (PID 1) to supervisor process over anonymous pipe
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct SandboxStatusPacket {
+    is_signaled: u8,
+    pad: [u8; 3],
+    code_or_sig: i32,
+    ru_utime_us: u64,
+    ru_stime_us: u64,
+    ru_maxrss_kb: u64,
+}
 
 /// Helper to open a pidfd on Linux (syscall 434).
 fn pidfd_open(pid: i32) -> Result<i32, std::io::Error> {
@@ -27,7 +39,7 @@ fn pidfd_open(pid: i32) -> Result<i32, std::io::Error> {
 /// Executes a single process in Linux sandbox (cgroup v2 + namespaces).
 pub fn execute_in_sandbox(
     spec: &RunSpec,
-    cgroup_base: &Path,
+    cgroup_base: Option<&Path>,
     cancel: &CancelToken,
     tier: Tier,
 ) -> Result<RunResult, SandboxError> {
@@ -37,7 +49,7 @@ pub fn execute_in_sandbox(
 /// Executes a single process in Linux sandbox with optional raw stdin/stdout fds.
 pub fn execute_in_sandbox_with_stdio(
     spec: &RunSpec,
-    cgroup_base: &Path,
+    cgroup_base: Option<&Path>,
     cancel: &CancelToken,
     tier: Tier,
     custom_stdin: Option<std::os::unix::io::RawFd>,
@@ -49,9 +61,14 @@ pub fn execute_in_sandbox_with_stdio(
         return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
     }
 
-    // 1. Create dedicated cgroup v2
-    let cgroup = CgroupV2::create_for_run(cgroup_base, "uj")?;
-    cgroup.set_limits(&spec.limits, spec.cpu_affinity.as_deref())?;
+    // 1. Create dedicated cgroup v2 if cgroup_base is provided
+    let cgroup = if let Some(base) = cgroup_base {
+        let cg = CgroupV2::create_for_run(base, "uj")?;
+        cg.set_limits(&spec.limits, spec.cpu_affinity.as_deref())?;
+        Some(cg)
+    } else {
+        None
+    };
 
     // 2. Prepare Command
     let exe_path = which::which(&spec.argv[0]).unwrap_or_else(|_| PathBuf::from(&spec.argv[0]));
@@ -113,10 +130,12 @@ pub fn execute_in_sandbox_with_stdio(
 
     // 3. Configure Namespace & Isolation via pre_exec
     let work_dir = spec.work_dir.clone();
-    let stack_limit = spec
-        .limits
-        .stack_bytes
-        .unwrap_or_else(|| spec.limits.memory_bytes.saturating_sub(4 * 1024 * 1024).max(8 * 1024 * 1024));
+    let stack_limit = spec.limits.stack_bytes.unwrap_or_else(|| {
+        spec.limits
+            .memory_bytes
+            .saturating_sub(4 * 1024 * 1024)
+            .max(8 * 1024 * 1024)
+    });
     let is_trusted = spec.trusted;
 
     let host_exe = if exe_path.is_absolute() {
@@ -142,19 +161,38 @@ pub fn execute_in_sandbox_with_stdio(
     let jail_env: Vec<(String, String)> = spec
         .env
         .iter()
-        .map(|(k, v)| (k.to_string_lossy().to_string(), v.to_string_lossy().to_string()))
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().to_string(),
+                v.to_string_lossy().to_string(),
+            )
+        })
         .collect();
 
-    let cgroup_procs_file = cgroup.path().join("cgroup.procs");
+    let cgroup_procs_file = cgroup.as_ref().map(|cg| cg.path().join("cgroup.procs"));
+    let mem_limit_bytes = spec.limits.memory_bytes;
+    let cpu_limit_ms = spec.limits.cpu_time_ms;
+    let max_procs = spec.limits.max_processes;
+    let output_limit_bytes = spec.limits.output_bytes;
+    let has_cgroup = cgroup.is_some();
+
+    let mut status_pipe = [0i32; 2];
+    if unsafe { libc::pipe2(status_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(SandboxError::Io(std::io::Error::last_os_error()));
+    }
+    let status_read_fd = status_pipe[0];
+    let status_write_fd = status_pipe[1];
 
     unsafe {
         cmd.pre_exec(move || {
             // Immediately join the cgroup v2 before unsharing or execing
-            if fs::write(&cgroup_procs_file, b"0\n").is_err() {
-                return Err(std::io::Error::last_os_error());
+            if let Some(ref procs_file) = cgroup_procs_file {
+                if fs::write(procs_file, b"0\n").is_err() {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
 
-            if !is_trusted && tier == Tier::Full {
+            if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
                 // Get real UID and GID BEFORE unshare
                 let real_uid = libc::getuid();
                 let real_gid = libc::getgid();
@@ -190,7 +228,15 @@ pub fn execute_in_sandbox_with_stdio(
                 }
 
                 // 4. Create minimal rootfs on a private tmpfs
-                let rootfs = work_dir.join(".uj_rootfs");
+                let rootfs = if work_dir == Path::new("/tmp") || work_dir.starts_with("/tmp") {
+                    if Path::new("/dev/shm").is_dir() {
+                        PathBuf::from(format!("/dev/shm/.uj_rootfs_{}", std::process::id()))
+                    } else {
+                        PathBuf::from(format!("/run/.uj_rootfs_{}", std::process::id()))
+                    }
+                } else {
+                    work_dir.join(".uj_rootfs")
+                };
                 fs::create_dir_all(&rootfs)?;
                 let c_rootfs = std::ffi::CString::new(rootfs.to_string_lossy().as_bytes())
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -226,7 +272,11 @@ pub fn execute_in_sandbox_with_stdio(
                     std::ptr::null(),
                     c_usr.as_ptr(),
                     std::ptr::null(),
-                    libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC | libc::MS_NOSUID,
+                    libc::MS_BIND
+                        | libc::MS_REMOUNT
+                        | libc::MS_RDONLY
+                        | libc::MS_REC
+                        | libc::MS_NOSUID,
                     std::ptr::null(),
                 ) != 0
                 {
@@ -234,7 +284,11 @@ pub fn execute_in_sandbox_with_stdio(
                 }
 
                 // Symlink /bin, /lib, /lib64 to usr equivalents (standard Debian/Ubuntu)
-                for (link_name, target) in [("bin", "usr/bin"), ("lib", "usr/lib"), ("lib64", "usr/lib64")] {
+                for (link_name, target) in [
+                    ("bin", "usr/bin"),
+                    ("lib", "usr/lib"),
+                    ("lib64", "usr/lib64"),
+                ] {
                     let link_path = rootfs.join(link_name);
                     let _ = std::os::unix::fs::symlink(target, &link_path);
                 }
@@ -256,13 +310,16 @@ pub fn execute_in_sandbox_with_stdio(
                 }
 
                 // Bind mount binary if outside /usr
-                let jail_exe_path = if host_exe.starts_with("/usr") || host_exe.starts_with("/bin") {
+                let jail_exe_path = if host_exe.starts_with("/usr") || host_exe.starts_with("/bin")
+                {
                     host_exe.to_string_lossy().to_string()
                 } else {
                     let target_exe = rootfs.join("box").join("__uj_bin");
                     File::create(&target_exe)?;
-                    let c_target_exe = std::ffi::CString::new(target_exe.to_string_lossy().as_bytes())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                    let c_target_exe = std::ffi::CString::new(
+                        target_exe.to_string_lossy().as_bytes(),
+                    )
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                     let c_host_exe = std::ffi::CString::new(host_exe.to_string_lossy().as_bytes())
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                     if libc::mount(
@@ -298,11 +355,25 @@ pub fn execute_in_sandbox_with_stdio(
                             }
                             let _ = File::create(&target);
                         }
-                        if let Ok(c_src) = std::ffi::CString::new(ro_bind.to_string_lossy().as_bytes())
-                            && let Ok(c_dst) = std::ffi::CString::new(target.to_string_lossy().as_bytes())
+                        if let Ok(c_src) =
+                            std::ffi::CString::new(ro_bind.to_string_lossy().as_bytes())
+                            && let Ok(c_dst) =
+                                std::ffi::CString::new(target.to_string_lossy().as_bytes())
                         {
-                            let _ = libc::mount(c_src.as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null());
-                            let _ = libc::mount(std::ptr::null(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, std::ptr::null());
+                            let _ = libc::mount(
+                                c_src.as_ptr(),
+                                c_dst.as_ptr(),
+                                std::ptr::null(),
+                                libc::MS_BIND,
+                                std::ptr::null(),
+                            );
+                            let _ = libc::mount(
+                                std::ptr::null(),
+                                c_dst.as_ptr(),
+                                std::ptr::null(),
+                                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                                std::ptr::null(),
+                            );
                         }
                     }
                 }
@@ -340,8 +411,20 @@ pub fn execute_in_sandbox_with_stdio(
                     if let Ok(c_dst) = std::ffi::CString::new(dst.to_string_lossy().as_bytes())
                         && let Ok(c_src) = std::ffi::CString::new(format!("/dev/{dev}"))
                     {
-                        let _ = libc::mount(c_src.as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null());
-                        let _ = libc::mount(std::ptr::null(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, std::ptr::null());
+                        let _ = libc::mount(
+                            c_src.as_ptr(),
+                            c_dst.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND,
+                            std::ptr::null(),
+                        );
+                        let _ = libc::mount(
+                            std::ptr::null(),
+                            c_dst.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                            std::ptr::null(),
+                        );
                     }
                 }
 
@@ -350,21 +433,41 @@ pub fn execute_in_sandbox_with_stdio(
                     let dst_ld = rootfs.join("etc").join("ld.so.cache");
                     let _ = File::create(&dst_ld);
                     if let Ok(c_dst) = std::ffi::CString::new(dst_ld.to_string_lossy().as_bytes()) {
-                        let _ = libc::mount(c"/etc/ld.so.cache".as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null());
-                        let _ = libc::mount(std::ptr::null(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, std::ptr::null());
+                        let _ = libc::mount(
+                            c"/etc/ld.so.cache".as_ptr(),
+                            c_dst.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND,
+                            std::ptr::null(),
+                        );
+                        let _ = libc::mount(
+                            std::ptr::null(),
+                            c_dst.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                            std::ptr::null(),
+                        );
                     }
                 }
                 if Path::new("/etc/alternatives").is_dir() {
                     let dst_alt = rootfs.join("etc").join("alternatives");
                     let _ = fs::create_dir_all(&dst_alt);
-                    if let Ok(c_dst) = std::ffi::CString::new(dst_alt.to_string_lossy().as_bytes()) {
-                        let _ = libc::mount(c"/etc/alternatives".as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_RDONLY, std::ptr::null());
+                    if let Ok(c_dst) = std::ffi::CString::new(dst_alt.to_string_lossy().as_bytes())
+                    {
+                        let _ = libc::mount(
+                            c"/etc/alternatives".as_ptr(),
+                            c_dst.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND | libc::MS_RDONLY,
+                            std::ptr::null(),
+                        );
                     }
                 }
 
                 // 5. pivot_root
-                let c_oldroot = std::ffi::CString::new(rootfs.join("old_root").to_string_lossy().as_bytes())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let c_oldroot =
+                    std::ffi::CString::new(rootfs.join("old_root").to_string_lossy().as_bytes())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 if libc::syscall(libc::SYS_pivot_root, c_rootfs.as_ptr(), c_oldroot.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -400,9 +503,17 @@ pub fn execute_in_sandbox_with_stdio(
                     // Automatically kill PID 1 if intermediate host process dies
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
 
-                    // Close all fds >= 3 so parent Command::spawn() error pipe reaches EOF
-                    if libc::syscall(libc::SYS_close_range, 3, !0u32, 0) != 0 {
-                        for fd in 3..256 {
+                    let status_tx_fd = 3;
+                    if status_write_fd != status_tx_fd {
+                        if libc::dup2(status_write_fd, status_tx_fd) < 0 {
+                            libc::_exit(124);
+                        }
+                        libc::close(status_write_fd);
+                    }
+
+                    // Close all fds >= 4 so parent Command::spawn() error pipe reaches EOF
+                    if libc::syscall(libc::SYS_close_range, 4, !0u32, 0) != 0 {
+                        for fd in 4..256 {
                             libc::close(fd);
                         }
                     }
@@ -431,6 +542,7 @@ pub fn execute_in_sandbox_with_stdio(
                     }
 
                     if contestant_pid == 0 {
+                        libc::close(status_tx_fd);
                         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
 
                         let rlim = libc::rlimit {
@@ -444,6 +556,37 @@ pub fn execute_in_sandbox_with_stdio(
                             rlim_max: 0,
                         };
                         libc::setrlimit(libc::RLIMIT_CORE, &rlim_zero);
+
+                        if tier == Tier::Degraded || !has_cgroup {
+                            if mem_limit_bytes > 0 {
+                                let rlim_as = libc::rlimit {
+                                    rlim_cur: mem_limit_bytes,
+                                    rlim_max: mem_limit_bytes,
+                                };
+                                libc::setrlimit(libc::RLIMIT_AS, &rlim_as);
+                            }
+                            if cpu_limit_ms > 0 {
+                                let cpu_sec = (cpu_limit_ms + 999) / 1000;
+                                let rlim_cpu = libc::rlimit {
+                                    rlim_cur: cpu_sec,
+                                    rlim_max: cpu_sec + 1,
+                                };
+                                libc::setrlimit(libc::RLIMIT_CPU, &rlim_cpu);
+                            }
+                            let nproc = if max_procs > 0 { max_procs } else { 32 };
+                            let rlim_nproc = libc::rlimit {
+                                rlim_cur: nproc as u64,
+                                rlim_max: nproc as u64,
+                            };
+                            libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc);
+                            if output_limit_bytes > 0 {
+                                let rlim_fsize = libc::rlimit {
+                                    rlim_cur: output_limit_bytes,
+                                    rlim_max: output_limit_bytes,
+                                };
+                                libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
+                            }
+                        }
 
                         if crate::linux::seccomp::apply_seccomp_filter().is_err() {
                             libc::_exit(125);
@@ -482,26 +625,60 @@ pub fn execute_in_sandbox_with_stdio(
                     } else {
                         // PID 1 init process: wait for contestant PID 2, then reap any zombies
                         let mut status = 0;
-                        while libc::waitpid(contestant_pid, &mut status, 0) < 0 {
+                        let mut rusage: libc::rusage = std::mem::zeroed();
+                        while libc::wait4(contestant_pid, &mut status, 0, &mut rusage) < 0 {
                             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                                 break;
                             }
                         }
                         while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
 
-                        if libc::WIFEXITED(status) {
-                            libc::_exit(libc::WEXITSTATUS(status));
-                        } else if libc::WIFSIGNALED(status) {
-                            let sig = libc::WTERMSIG(status);
-                            libc::signal(sig, libc::SIG_DFL);
-                            libc::kill(libc::getpid(), sig);
-                            libc::_exit(128 + sig);
+                        let is_signaled = if libc::WIFSIGNALED(status) { 1u8 } else { 0u8 };
+                        let code_or_sig = if libc::WIFSIGNALED(status) {
+                            libc::WTERMSIG(status)
+                        } else if libc::WIFEXITED(status) {
+                            libc::WEXITSTATUS(status)
                         } else {
-                            libc::_exit(1);
+                            1
+                        };
+
+                        let packet = SandboxStatusPacket {
+                            is_signaled,
+                            pad: [0; 3],
+                            code_or_sig,
+                            ru_utime_us: (rusage.ru_utime.tv_sec as u64) * 1_000_000
+                                + (rusage.ru_utime.tv_usec as u64),
+                            ru_stime_us: (rusage.ru_stime.tv_sec as u64) * 1_000_000
+                                + (rusage.ru_stime.tv_usec as u64),
+                            ru_maxrss_kb: rusage.ru_maxrss as u64,
+                        };
+
+                        let packet_bytes = std::slice::from_raw_parts(
+                            &packet as *const _ as *const u8,
+                            std::mem::size_of::<SandboxStatusPacket>(),
+                        );
+                        let mut written = 0;
+                        while written < packet_bytes.len() {
+                            let n = libc::write(
+                                status_tx_fd,
+                                packet_bytes[written..].as_ptr() as *const libc::c_void,
+                                packet_bytes.len() - written,
+                            );
+                            if n <= 0 {
+                                break;
+                            }
+                            written += n as usize;
+                        }
+                        libc::close(status_tx_fd);
+
+                        if is_signaled != 0 {
+                            libc::_exit(128 + code_or_sig);
+                        } else {
+                            libc::_exit(code_or_sig);
                         }
                     }
                 } else {
-                    // Close all fds >= 3 (including Rust's internal error reporting socket so parent cmd.spawn() completes)
+                    // Close all fds >= 3 (including Rust's internal error reporting socket and status_write_fd)
                     if libc::syscall(libc::SYS_close_range, 3, !0u32, 0) != 0 {
                         for fd in 3..256 {
                             libc::close(fd);
@@ -519,9 +696,21 @@ pub fn execute_in_sandbox_with_stdio(
                         }
                     }
                     if libc::WIFEXITED(status) {
-                        libc::_exit(libc::WEXITSTATUS(status));
+                        let code = libc::WEXITSTATUS(status);
+                        if code > 128 && code <= 128 + 64 {
+                            let sig = code - 128;
+                            let mut set: libc::sigset_t = std::mem::zeroed();
+                            libc::sigemptyset(&mut set);
+                            libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+                            libc::signal(sig, libc::SIG_DFL);
+                            libc::kill(libc::getpid(), sig);
+                        }
+                        libc::_exit(code);
                     } else if libc::WIFSIGNALED(status) {
                         let sig = libc::WTERMSIG(status);
+                        let mut set: libc::sigset_t = std::mem::zeroed();
+                        libc::sigemptyset(&mut set);
+                        libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
                         libc::signal(sig, libc::SIG_DFL);
                         libc::kill(libc::getpid(), sig);
                         libc::_exit(128 + sig);
@@ -549,12 +738,28 @@ pub fn execute_in_sandbox_with_stdio(
     }
 
     let start_time = Instant::now();
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| SandboxError::Internal(format!("Failed to spawn child: {e}")))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe {
+                libc::close(status_read_fd);
+                libc::close(status_write_fd);
+            }
+            return Err(SandboxError::Internal(format!(
+                "Failed to spawn child: {e}"
+            )));
+        }
+    };
 
-    // 4. Attach child to cgroup v2
-    let _ = cgroup.add_process(child.id() as i32);
+    // Close supervisor's write end of the status pipe
+    unsafe {
+        libc::close(status_write_fd);
+    }
+
+    // 4. Attach child to cgroup v2 if available
+    if let Some(ref cg) = cgroup {
+        let _ = cg.add_process(child.id() as i32);
+    }
 
     // 5. Output capture reader threads
     let stdout_limit = spec.limits.output_bytes as usize;
@@ -613,7 +818,9 @@ pub fn execute_in_sandbox_with_stdio(
     loop {
         if cancel.is_cancelled() {
             killed_by = Some(KillReason::UserCancel);
-            cgroup.kill();
+            if let Some(ref cg) = cgroup {
+                cg.kill();
+            }
             let _ = child.kill();
             break;
         }
@@ -621,32 +828,38 @@ pub fn execute_in_sandbox_with_stdio(
         let wall_ms = start_time.elapsed().as_millis() as u64;
         if wall_ms > spec.limits.wall_time_ms {
             killed_by = Some(KillReason::WallLimit);
-            cgroup.kill();
+            if let Some(ref cg) = cgroup {
+                cg.kill();
+            }
             let _ = child.kill();
             break;
         }
 
         // Check CPU time limit
-        let cpu_us = cgroup.read_cpu_time_us();
-        if cpu_us / 1000 > spec.limits.cpu_time_ms {
-            killed_by = Some(KillReason::CpuLimit);
-            cgroup.kill();
-            let _ = child.kill();
-            break;
-        }
+        if let Some(ref cg) = cgroup {
+            let cpu_us = cg.read_cpu_time_us();
+            if cpu_us / 1000 > spec.limits.cpu_time_ms {
+                killed_by = Some(KillReason::CpuLimit);
+                cg.kill();
+                let _ = child.kill();
+                break;
+            }
 
-        // Check Memory limit violation
-        if cgroup.read_oom_killed() {
-            killed_by = Some(KillReason::MemoryLimit);
-            cgroup.kill();
-            let _ = child.kill();
-            break;
+            // Check Memory limit violation
+            if cg.read_oom_killed() {
+                killed_by = Some(KillReason::MemoryLimit);
+                cg.kill();
+                let _ = child.kill();
+                break;
+            }
         }
 
         // Check Output limit violation
         if ole_flag.load(Ordering::SeqCst) {
             killed_by = Some(KillReason::OutputLimit);
-            cgroup.kill();
+            if let Some(ref cg) = cgroup {
+                cg.kill();
+            }
             let _ = child.kill();
             break;
         }
@@ -682,17 +895,52 @@ pub fn execute_in_sandbox_with_stdio(
 
     // Immediately kill any surviving child/orphan processes in this cgroup
     // so all pipe write ends close and reader threads can reach EOF.
-    cgroup.kill();
-
-    let cpu_time_us = cgroup.read_cpu_time_us();
-    let memory_peak_bytes = cgroup.read_peak_memory();
-    let oom_killed = cgroup.read_oom_killed();
-
-    if (oom_killed || (spec.limits.memory_bytes > 0 && memory_peak_bytes >= spec.limits.memory_bytes))
-        && killed_by.is_none()
-    {
-        killed_by = Some(KillReason::MemoryLimit);
+    if let Some(ref cg) = cgroup {
+        cg.kill();
     }
+
+    // Read status packet from pipe
+    let status_from_packet = unsafe {
+        let mut packet = std::mem::zeroed::<SandboxStatusPacket>();
+        let mut read_bytes = 0;
+        let packet_buf = std::slice::from_raw_parts_mut(
+            &mut packet as *mut _ as *mut u8,
+            std::mem::size_of::<SandboxStatusPacket>(),
+        );
+        while read_bytes < packet_buf.len() {
+            let n = libc::read(
+                status_read_fd,
+                packet_buf[read_bytes..].as_mut_ptr() as *mut libc::c_void,
+                packet_buf.len() - read_bytes,
+            );
+            if n <= 0 {
+                break;
+            }
+            read_bytes += n as usize;
+        }
+        libc::close(status_read_fd);
+        if read_bytes == std::mem::size_of::<SandboxStatusPacket>() {
+            Some(packet)
+        } else {
+            None
+        }
+    };
+
+    let (cpu_time_us, memory_peak_bytes, oom_killed) = if let Some(ref cg) = cgroup {
+        (
+            cg.read_cpu_time_us(),
+            cg.read_peak_memory(),
+            cg.read_oom_killed(),
+        )
+    } else if let Some(ref pkt) = status_from_packet {
+        (
+            pkt.ru_utime_us + pkt.ru_stime_us,
+            pkt.ru_maxrss_kb * 1024,
+            false,
+        )
+    } else {
+        (wall_time_us, 0, false)
+    };
 
     // Join readers
     let captured_stdout = if let Some(h) = stdout_handle {
@@ -702,10 +950,6 @@ pub fn execute_in_sandbox_with_stdio(
     } else {
         None
     };
-
-    if captured_stdout.as_ref().is_some_and(|o| o.truncated) && killed_by.is_none() {
-        killed_by = Some(KillReason::OutputLimit);
-    }
 
     let captured_stderr = if let Some(h) = stderr_handle {
         let bytes = h.join().unwrap_or_default();
@@ -718,14 +962,46 @@ pub fn execute_in_sandbox_with_stdio(
     };
 
     // Nuclear kill and cleanup
-    cgroup.kill();
+    if let Some(ref cg) = cgroup {
+        cg.kill();
+    }
 
-    let exit_status = if let Some(code) = status.code() {
-        ExitStatus::Exited(code)
+    let exit_status = if let Some(ref pkt) = status_from_packet {
+        if pkt.is_signaled != 0 {
+            ExitStatus::Signaled(pkt.code_or_sig)
+        } else {
+            ExitStatus::Exited(pkt.code_or_sig)
+        }
+    } else if let Some(code) = status.code() {
+        if code > 128 && code <= 128 + 64 {
+            ExitStatus::Signaled(code - 128)
+        } else {
+            ExitStatus::Exited(code)
+        }
     } else {
         use std::os::unix::process::ExitStatusExt;
         ExitStatus::Signaled(status.signal().unwrap_or(0))
     };
+
+    if (oom_killed
+        || (spec.limits.memory_bytes > 0 && memory_peak_bytes >= spec.limits.memory_bytes))
+        && killed_by.is_none()
+    {
+        killed_by = Some(KillReason::MemoryLimit);
+    } else if spec.limits.cpu_time_ms > 0
+        && cpu_time_us / 1000 > spec.limits.cpu_time_ms
+        && killed_by.is_none()
+    {
+        killed_by = Some(KillReason::CpuLimit);
+    } else if matches!(exit_status, ExitStatus::Signaled(24)) && killed_by.is_none() {
+        // SIGXCPU
+        killed_by = Some(KillReason::CpuLimit);
+    } else if matches!(exit_status, ExitStatus::Signaled(25)) && killed_by.is_none() {
+        // SIGXFSZ
+        killed_by = Some(KillReason::OutputLimit);
+    } else if captured_stdout.as_ref().is_some_and(|o| o.truncated) && killed_by.is_none() {
+        killed_by = Some(KillReason::OutputLimit);
+    }
 
     Ok(RunResult {
         status: exit_status,
@@ -746,7 +1022,7 @@ pub fn execute_in_sandbox_with_stdio(
 pub fn execute_group_in_sandbox(
     specs: &[RunSpec],
     wiring: &Wiring,
-    cgroup_base: &Path,
+    cgroup_base: Option<&Path>,
     cancel: &CancelToken,
     tier: Tier,
 ) -> Result<Vec<RunResult>, SandboxError> {
@@ -802,4 +1078,3 @@ pub fn execute_group_in_sandbox(
 
     results
 }
-

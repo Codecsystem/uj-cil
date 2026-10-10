@@ -4,10 +4,10 @@ pub mod cgroup;
 pub mod runner;
 pub mod seccomp;
 
-use std::path::PathBuf;
-use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
-use uj_core::run::{RunResult, RunSpec, Tier};
 use self::cgroup::CgroupV2;
+use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
+use std::path::PathBuf;
+use uj_core::run::{RunResult, RunSpec, Tier};
 
 pub struct LinuxSandbox {
     tier: Tier,
@@ -28,7 +28,10 @@ impl LinuxSandbox {
                 .unwrap_or("0")
                 .parse()
                 .unwrap_or(0);
-            if (major < 5 || (major == 5 && minor < 19)) && !allow_fallback && requested_tier == Tier::Full {
+            if (major < 5 || (major == 5 && minor < 19))
+                && !allow_fallback
+                && requested_tier == Tier::Full
+            {
                 return Err(SandboxError::Internal(format!(
                     "Kernel version {release} is below required minimum 5.19"
                 )));
@@ -47,29 +50,31 @@ impl LinuxSandbox {
                     cgroup_base: base,
                 })
             }
-            Tier::Full => {
-                match CgroupV2::find_base_dir() {
-                    Ok(base) => Ok(Self {
-                        tier: Tier::Full,
-                        cgroup_base: Some(base),
-                    }),
-                    Err(e) => {
-                        if !allow_fallback {
-                            return Err(SandboxError::TierMismatch {
-                                required: Tier::Full,
-                                actual: Tier::None,
-                            });
-                        }
-                        eprintln!(
-                            "WARNING: Linux Full sandbox unavailable ({e}); falling back to None tier."
-                        );
-                        Ok(Self {
-                            tier: Tier::None,
-                            cgroup_base: None,
-                        })
+            Tier::Full => match CgroupV2::find_base_dir() {
+                Ok(base) => Ok(Self {
+                    tier: Tier::Full,
+                    cgroup_base: Some(base),
+                }),
+                Err(e) => {
+                    if !allow_fallback {
+                        return Err(SandboxError::TierMismatch {
+                            required: Tier::Full,
+                            actual: Tier::Degraded,
+                        });
                     }
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "WARNING: Linux Full sandbox unavailable ({e}); falling back to Degraded tier (namespaces + seccomp + rlimit, without cgroup v2)."
+                        );
+                    }
+                    Ok(Self {
+                        tier: Tier::Degraded,
+                        cgroup_base: None,
+                    })
                 }
-            }
+            },
         }
     }
 }
@@ -80,13 +85,13 @@ impl Sandbox for LinuxSandbox {
     }
 
     fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
-        if let Some(ref base) = self.cgroup_base {
-            runner::execute_in_sandbox(spec, base, cancel, self.tier)
-        } else {
+        if self.tier == Tier::None {
             let fallback = crate::none::NoneSandbox::new();
             let mut res = fallback.run(spec, cancel)?;
             res.sandbox_tier = self.tier;
             Ok(res)
+        } else {
+            runner::execute_in_sandbox(spec, self.cgroup_base.as_deref(), cancel, self.tier)
         }
     }
 
@@ -96,15 +101,21 @@ impl Sandbox for LinuxSandbox {
         wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
-        if let Some(ref base) = self.cgroup_base {
-            runner::execute_group_in_sandbox(specs, wiring, base, cancel, self.tier)
-        } else {
+        if self.tier == Tier::None {
             let fallback = crate::none::NoneSandbox::new();
             let mut res = fallback.run_group(specs, wiring, cancel)?;
             for r in &mut res {
                 r.sandbox_tier = self.tier;
             }
             Ok(res)
+        } else {
+            runner::execute_group_in_sandbox(
+                specs,
+                wiring,
+                self.cgroup_base.as_deref(),
+                cancel,
+                self.tier,
+            )
         }
     }
 
