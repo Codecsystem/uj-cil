@@ -74,6 +74,9 @@ pub struct CompileSession {
     inner: std::sync::Arc<CompileSessionInner>,
 }
 
+type FastCompileKey = (PathBuf, Vec<PathBuf>, Vec<PathBuf>);
+type FastCompileValue = (std::time::SystemTime, u64, CompileResult);
+
 #[derive(Default)]
 struct CompileSessionInner {
     compiler_bins: parking_lot::Mutex<std::collections::HashMap<String, Result<PathBuf, String>>>,
@@ -82,6 +85,7 @@ struct CompileSessionInner {
         std::collections::HashMap<Option<PathBuf>, uj_core::config::LanguagesConfig>,
     >,
     problem_limits: parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, u64, u64)>>,
+    fast_results: parking_lot::Mutex<std::collections::HashMap<FastCompileKey, FastCompileValue>>,
 }
 
 impl CompileSession {
@@ -223,6 +227,28 @@ impl CompileSession {
         no_cache: bool,
     ) -> Result<CompileResult, CompileError> {
         let start = Instant::now();
+        let cache_key = (
+            source_path.to_path_buf(),
+            extra_sources.to_vec(),
+            include_dirs.to_vec(),
+        );
+
+        if !no_cache && let Ok(meta) = fs::metadata(source_path) {
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let size = meta.len();
+            let fast_cache = self.inner.fast_results.lock();
+            if let Some((cached_mtime, cached_size, cached_res)) = fast_cache.get(&cache_key)
+                && *cached_mtime == mtime
+                && *cached_size == size
+                && cached_res.binary_path.exists()
+            {
+                let mut res = cached_res.clone();
+                res.cached = true;
+                res.duration_ms = start.elapsed().as_millis() as u64;
+                return Ok(res);
+            }
+        }
+
         let source_bytes = fs::read(source_path)?;
 
         let problem_dir = source_path
@@ -353,14 +379,21 @@ impl CompileSession {
         let cached_bin = cache_dir.join(format!("prog{exe_ext}"));
 
         if !no_cache && cached_bin.exists() {
-            return Ok(CompileResult {
+            let res = CompileResult {
                 binary_path: cached_bin,
                 is_interpreted: false,
                 interpreter_cmd: None,
                 compiler_output: String::new(),
                 duration_ms: start.elapsed().as_millis() as u64,
                 cached: true,
-            });
+            };
+            if let Ok(meta) = fs::metadata(source_path) {
+                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                let size = meta.len();
+                let mut fast_cache = self.inner.fast_results.lock();
+                fast_cache.insert(cache_key, (mtime, size, res.clone()));
+            }
+            return Ok(res);
         }
 
         fs::create_dir_all(&cache_dir)?;
@@ -446,14 +479,23 @@ impl CompileSession {
             return Err(CompileError::Failed(truncated));
         }
 
-        Ok(CompileResult {
+        let res = CompileResult {
             binary_path: cached_bin,
             is_interpreted: false,
             interpreter_cmd: None,
             compiler_output: truncate_10k(&combined_output),
             duration_ms,
             cached: false,
-        })
+        };
+
+        if !no_cache && let Ok(meta) = fs::metadata(source_path) {
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let size = meta.len();
+            let mut fast_cache = self.inner.fast_results.lock();
+            fast_cache.insert(cache_key, (mtime, size, res.clone()));
+        }
+
+        Ok(res)
     }
 }
 
@@ -539,5 +581,26 @@ mod tests {
         let s = "你好世界！".repeat(2000);
         let truncated = truncate_10k(&s);
         assert!(truncated.contains("Output truncated to 10 KiB"));
+    }
+
+    #[test]
+    fn test_compile_session_fast_cache() {
+        let tmp_dir = std::env::temp_dir().join(format!("uj_test_cache_{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let src = tmp_dir.join("test_sol.cpp");
+        fs::write(&src, b"int main() { return 0; }").unwrap();
+
+        let session = CompileSession::new();
+        // First compilation creates/resolves binary
+        if let Ok(res1) = session.compile(&src, false) {
+            assert!(res1.binary_path.exists());
+
+            // Second compilation within same session should hit fast memory cache
+            let res2 = session.compile(&src, false).unwrap();
+            assert!(res2.cached);
+            assert_eq!(res2.binary_path, res1.binary_path);
+        }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

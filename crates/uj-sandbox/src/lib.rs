@@ -282,6 +282,17 @@ pub fn create_slot_box_dir(
     Ok(SlotBoxGuard { box_dir, run_dir })
 }
 
+type PreparedBinaryKey = (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::time::SystemTime,
+    u64,
+);
+
+static PREPARED_BINARIES_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PreparedBinaryKey, std::path::PathBuf>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
 static AUTHORIZED_BINARIES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
@@ -292,6 +303,19 @@ pub fn prepare_binary_content(
     exe_path: &std::path::Path,
     base_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf, std::io::Error> {
+    let meta_opt = std::fs::metadata(exe_path).ok();
+    if let Some(ref meta) = meta_opt {
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let size = meta.len();
+        let key = (exe_path.to_path_buf(), base_dir.to_path_buf(), mtime, size);
+        let cache = PREPARED_BINARIES_CACHE.lock();
+        if let Some(cached_auth) = cache.get(&key)
+            && cached_auth.exists()
+        {
+            return Ok(cached_auth.clone());
+        }
+    }
+
     let bytes = std::fs::read(exe_path)?;
     let hash = blake3::hash(&bytes).to_hex();
     let bin_dir = base_dir.join(".uj").join("tmp").join("bin");
@@ -316,6 +340,14 @@ pub fn prepare_binary_content(
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&authorized_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    if let Some(ref meta) = meta_opt {
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let size = meta.len();
+        let key = (exe_path.to_path_buf(), base_dir.to_path_buf(), mtime, size);
+        let mut cache = PREPARED_BINARIES_CACHE.lock();
+        cache.insert(key, authorized_exe.clone());
     }
 
     Ok(authorized_exe)
