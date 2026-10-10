@@ -5,6 +5,7 @@ mod doctor;
 mod error;
 mod judge_cmd;
 mod lemon_import;
+mod mcp_server;
 mod report_cmd;
 
 use clap::Parser;
@@ -321,5 +322,6 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_USAGE_OR_CONFIG)
             }
         }
+        Commands::Mcp => mcp_server::run_mcp_server(),
     }
 }

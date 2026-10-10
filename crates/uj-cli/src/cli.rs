@@ -342,4 +342,7 @@ pub enum Commands {
         )]
         problem: PathBuf,
     },
+
+    #[command(about = "Start Model Context Protocol (MCP) server over stdio")]
+    Mcp,
 }
