@@ -1,0 +1,14 @@
+[package]
+name = "uj-report"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+uj-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+minijinja.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,33 @@
+[package]
+name = "uj-sandbox"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+uj-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+which.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "0.38", features = ["fs", "process", "thread", "system"] }
+libc = "0.2"

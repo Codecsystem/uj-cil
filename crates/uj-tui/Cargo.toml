@@ -1,0 +1,12 @@
+[package]
+name = "uj-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+uj-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+crossbeam-channel.workspace = true

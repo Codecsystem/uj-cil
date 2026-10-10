@@ -1,0 +1,59 @@
+# Default language configurations for uj
+
+[lang.cpp17]
+name = "C++17"
+ext = ["cpp", "cc", "cxx"]
+compile = ["g++", "-std=c++17", "-O2", "-pipe", "-DONLINE_JUDGE", "-o", "{exe}", "{src}", "{extra_srcs}"]
+compile_windows_extra = ["-static", "-Wl,--stack,{stack_bytes}"]
+run = ["{exe}"]
+time_factor = 1.0
+max_processes = 1
+seccomp = "strict"
+
+[lang.c11]
+name = "C11"
+ext = ["c"]
+compile = ["gcc", "-std=c11", "-O2", "-pipe", "-DONLINE_JUDGE", "-o", "{exe}", "{src}", "{extra_srcs}", "-lm"]
+compile_windows_extra = ["-static", "-Wl,--stack,{stack_bytes}"]
+run = ["{exe}"]
+time_factor = 1.0
+max_processes = 1
+seccomp = "strict"
+
+[lang.cpp20]
+name = "C++20"
+ext = ["cpp", "cc", "cxx"]
+compile = ["g++", "-std=c++20", "-O2", "-pipe", "-DONLINE_JUDGE", "-o", "{exe}", "{src}", "{extra_srcs}"]
+compile_windows_extra = ["-static", "-Wl,--stack,{stack_bytes}"]
+run = ["{exe}"]
+time_factor = 1.0
+max_processes = 1
+seccomp = "strict"
+
+[lang.python3]
+name = "Python 3"
+ext = ["py"]
+compile = ["python3", "-m", "py_compile", "{src}"]
+run = ["python3", "{src}"]
+time_factor = 3.0
+max_processes = 1
+seccomp = "default"
+
+[lang.java]
+name = "Java"
+ext = ["java"]
+compile = ["javac", "-encoding", "UTF-8", "-d", "{dir}", "{src}"]
+run = ["java", "-Xss{stack_mb}m", "-Xmx{memory_mb}m", "-XX:+UseSerialGC", "-cp", "{dir}", "Main"]
+time_factor = 2.0
+max_processes = 64
+memory_extra = "64MiB"
+ro_binds = ["/usr/lib/jvm"]
+
+[lang.rust]
+name = "Rust"
+ext = ["rs"]
+compile = ["rustc", "--edition", "2021", "-O", "-o", "{exe}", "{src}"]
+run = ["{exe}"]
+time_factor = 1.0
+max_processes = 1
+seccomp = "strict"

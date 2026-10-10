@@ -1,0 +1,25 @@
+[package]
+name = "uj-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uj"
+path = "src/main.rs"
+
+[dependencies]
+uj-core.workspace = true
+uj-sandbox.workspace = true
+uj-engine.workspace = true
+uj-checker.workspace = true
+uj-report.workspace = true
+uj-tui.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
