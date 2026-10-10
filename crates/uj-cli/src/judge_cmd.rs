@@ -127,27 +127,27 @@ pub fn run_judge(
         SandboxMode::None => "none",
     };
 
-    if cli.require_tier {
-        if let Err(e) = uj_sandbox::create_sandbox(sandbox_mode_str, true) {
-            if format == OutputFormat::Json {
-                let err_obj = serde_json::json!({
-                    "schema_version": 1,
-                    "problem": problem_config.name,
-                    "submission": "",
-                    "verdict": "SE",
-                    "score": 0.0,
-                    "max_time_ms": 0,
-                    "max_memory_kb": 0,
-                    "subtasks": [],
-                    "tests": [],
-                    "judge_failed_error": format!("Sandbox tier requirement not met: {e}")
-                });
-                println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
-            } else {
-                eprintln!("Failed to satisfy sandbox tier requirement: {e}");
-            }
-            return ExitCode::from(EXIT_JUDGE_FAILED);
+    if cli.require_tier
+        && let Err(e) = uj_sandbox::create_sandbox(sandbox_mode_str, true)
+    {
+        if format == OutputFormat::Json {
+            let err_obj = serde_json::json!({
+                "schema_version": 1,
+                "problem": problem_config.name,
+                "submission": "",
+                "verdict": "SE",
+                "score": 0.0,
+                "max_time_ms": 0,
+                "max_memory_kb": 0,
+                "subtasks": [],
+                "tests": [],
+                "judge_failed_error": format!("Sandbox tier requirement not met: {e}")
+            });
+            println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
+        } else {
+            eprintln!("Failed to satisfy sandbox tier requirement: {e}");
         }
+        return ExitCode::from(EXIT_JUDGE_FAILED);
     }
 
     let judge_options = JudgeOptions {
@@ -169,7 +169,9 @@ pub fn run_judge(
             let pattern = s.file_name().unwrap_or_default().to_string_lossy();
             if let Ok(entries) = fs::read_dir(parent) {
                 let mut matched = Vec::new();
-                let glob = globset::Glob::new(&pattern).ok().map(|g| g.compile_matcher());
+                let glob = globset::Glob::new(&pattern)
+                    .ok()
+                    .map(|g| g.compile_matcher());
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if let Some(ref matcher) = glob

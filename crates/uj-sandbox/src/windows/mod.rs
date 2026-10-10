@@ -55,7 +55,9 @@ impl WindowsSandbox {
                         tier: Tier::Degraded,
                         app_container: None,
                         slot_id,
-                        authorized_slot_dirs: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                        authorized_slot_dirs: parking_lot::Mutex::new(
+                            std::collections::HashSet::new(),
+                        ),
                     })
                 }
             },
@@ -68,7 +70,10 @@ impl Sandbox for WindowsSandbox {
         self.tier
     }
 
-    fn create_box_dir(&self, base_dir: &std::path::Path) -> Result<std::path::PathBuf, SandboxError> {
+    fn create_box_dir(
+        &self,
+        base_dir: &std::path::Path,
+    ) -> Result<std::path::PathBuf, SandboxError> {
         let runs_base = base_dir.join(".uj").join("tmp").join("runs");
         let slot_dir = runs_base.join(format!("slot-{}", self.slot_id));
         std::fs::create_dir_all(&slot_dir)?;
@@ -87,9 +92,7 @@ impl Sandbox for WindowsSandbox {
             .unwrap_or(0);
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let cnt = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let box_dir = slot_dir
-            .join(format!("run-{ts}-{cnt}"))
-            .join("box");
+        let box_dir = slot_dir.join(format!("run-{ts}-{cnt}")).join("box");
         std::fs::create_dir_all(&box_dir)?;
 
         Ok(box_dir)

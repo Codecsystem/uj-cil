@@ -463,7 +463,11 @@ pub fn execute_group_in_jobs(
         )
         .map_err(|e| SandboxError::Internal(format!("Failed to set limits for proc {i}: {e}")))?;
 
-        let ac = if specs[i].trusted { None } else { app_container };
+        let ac = if specs[i].trusted {
+            None
+        } else {
+            app_container
+        };
         let pi = unsafe {
             spawn_suspended_process(
                 &specs[i],
@@ -1002,13 +1006,7 @@ pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
     };
 
     let pi = unsafe {
-        spawn_suspended_process(
-            &spec,
-            h_stdin,
-            h_stdout,
-            h_stderr,
-            app_container.as_deref(),
-        )
+        spawn_suspended_process(&spec, h_stdin, h_stdout, h_stderr, app_container.as_deref())
     };
 
     drop(c1);

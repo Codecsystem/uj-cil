@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use uj_core::run::Limits;
 use crate::SandboxError;
+use uj_core::run::Limits;
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -147,7 +147,10 @@ impl CgroupV2 {
         let sub_path = base_dir.join(format!("{prefix}-{ts}-{cnt}"));
 
         fs::create_dir(&sub_path).map_err(|e| {
-            SandboxError::Internal(format!("Failed to create cgroup directory {}: {e}", sub_path.display()))
+            SandboxError::Internal(format!(
+                "Failed to create cgroup directory {}: {e}",
+                sub_path.display()
+            ))
         })?;
 
         Ok(Self { path: sub_path })
@@ -162,7 +165,10 @@ impl CgroupV2 {
         if limits.memory_bytes > 0 {
             let mem_file = self.path.join("memory.max");
             fs::write(&mem_file, limits.memory_bytes.to_string()).map_err(|e| {
-                SandboxError::Internal(format!("Failed to set memory.max in {}: {e}", self.path.display()))
+                SandboxError::Internal(format!(
+                    "Failed to set memory.max in {}: {e}",
+                    self.path.display()
+                ))
             })?;
             // Enforce hard memory limit by forbidding swap
             let swap_file = self.path.join("memory.swap.max");
@@ -198,7 +204,10 @@ impl CgroupV2 {
     pub fn add_process(&self, pid: i32) -> Result<(), SandboxError> {
         let procs_file = self.path.join("cgroup.procs");
         fs::write(&procs_file, pid.to_string()).map_err(|e| {
-            SandboxError::Internal(format!("Failed to add pid {pid} to cgroup {}: {e}", self.path.display()))
+            SandboxError::Internal(format!(
+                "Failed to add pid {pid} to cgroup {}: {e}",
+                self.path.display()
+            ))
         })
     }
 
@@ -229,7 +238,9 @@ impl CgroupV2 {
         let events_file = self.path.join("memory.events");
         if let Ok(content) = fs::read_to_string(events_file) {
             for line in content.lines() {
-                if let Some(rest) = line.strip_prefix("oom_kill ").or_else(|| line.strip_prefix("oom "))
+                if let Some(rest) = line
+                    .strip_prefix("oom_kill ")
+                    .or_else(|| line.strip_prefix("oom "))
                     && rest.trim().parse::<u64>().is_ok_and(|count| count > 0)
                 {
                     return true;

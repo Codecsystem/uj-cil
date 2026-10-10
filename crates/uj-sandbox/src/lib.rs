@@ -79,7 +79,10 @@ pub trait Sandbox: Send + Sync {
         wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError>;
-    fn create_box_dir(&self, base_dir: &std::path::Path) -> Result<std::path::PathBuf, SandboxError> {
+    fn create_box_dir(
+        &self,
+        base_dir: &std::path::Path,
+    ) -> Result<std::path::PathBuf, SandboxError> {
         create_isolated_box_dir(base_dir).map_err(SandboxError::Io)
     }
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError>;
@@ -192,9 +195,7 @@ pub fn create_isolated_box_dir(
             let mut set = AUTHORIZED_RUNS_DIRS.lock();
             set.insert(runs_dir.clone())
         };
-        if needs_auth
-            && let Ok(profile) = windows::security::AppContainerProfile::get_shared()
-        {
+        if needs_auth && let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
             let _ = profile.grant_access_to_path(&runs_dir);
         }
     }
@@ -206,9 +207,7 @@ pub fn create_isolated_box_dir(
         .unwrap_or(0);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let cnt = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let box_dir = runs_dir
-        .join(format!("run-{ts}-{cnt}"))
-        .join("box");
+    let box_dir = runs_dir.join(format!("run-{ts}-{cnt}")).join("box");
     std::fs::create_dir_all(&box_dir)?;
 
     Ok(box_dir)

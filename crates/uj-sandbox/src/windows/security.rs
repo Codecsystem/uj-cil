@@ -135,10 +135,7 @@ impl AppContainerProfile {
         Self::grant_path_access(path, &sid_str)
     }
 
-    pub fn grant_path_access(
-        path: &std::path::Path,
-        sid_str: &str,
-    ) -> Result<(), std::io::Error> {
+    pub fn grant_path_access(path: &std::path::Path, sid_str: &str) -> Result<(), std::io::Error> {
         let _ = std::process::Command::new("icacls")
             .arg(path)
             .arg("/grant")
@@ -174,8 +171,8 @@ impl Drop for AppContainerProfile {
 pub fn cleanup_stale_appcontainers() -> usize {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
-        KEY_READ, REG_SZ,
+        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+        RegQueryValueExW,
     };
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
@@ -223,15 +220,8 @@ pub fn cleanup_stale_appcontainers() -> usize {
         index += 1;
 
         let mut child_key = HKEY::default();
-        let open_child = unsafe {
-            RegOpenKeyExW(
-                hkey,
-                PCWSTR(key_name.as_ptr()),
-                0,
-                KEY_READ,
-                &mut child_key,
-            )
-        };
+        let open_child =
+            unsafe { RegOpenKeyExW(hkey, PCWSTR(key_name.as_ptr()), 0, KEY_READ, &mut child_key) };
         if open_child.is_ok() {
             let val_name: Vec<u16> = "Moniker\0".encode_utf16().collect();
             let mut val_data = [0u16; 256];
@@ -257,7 +247,9 @@ pub fn cleanup_stale_appcontainers() -> usize {
                     .to_string();
                 if moniker.starts_with("uj.sandbox.") {
                     let parts: Vec<&str> = moniker.split('.').collect();
-                    if parts.len() >= 3 && let Ok(pid) = parts[2].parse::<u32>() {
+                    if parts.len() >= 3
+                        && let Ok(pid) = parts[2].parse::<u32>()
+                    {
                         let is_dead = unsafe {
                             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
                             match handle {

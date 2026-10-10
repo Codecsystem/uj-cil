@@ -78,7 +78,10 @@ mod tests {
     #[test]
     fn test_topology_detection() {
         let topo = Topology::detect(256 * 1024 * 1024, None);
-        println!("Topology: p_cores={}, logical={}, slots={:?}", topo.physical_cores, topo.logical_cores, topo.slots);
+        println!(
+            "Topology: p_cores={}, logical={}, slots={:?}",
+            topo.physical_cores, topo.logical_cores, topo.slots
+        );
         assert!(topo.physical_cores >= 1);
         assert!(topo.logical_cores >= 1);
         assert!(!topo.slots.is_empty());

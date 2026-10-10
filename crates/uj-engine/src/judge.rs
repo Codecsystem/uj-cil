@@ -75,8 +75,12 @@ pub fn judge_single_test(
     let is_file_io = io.is_some_and(|i| {
         i.mode == uj_core::config::IoMode::File || i.input_name.is_some() || i.output_name.is_some()
     });
-    let in_name = io.and_then(|i| i.input_name.as_deref()).unwrap_or("input.txt");
-    let out_name = io.and_then(|i| i.output_name.as_deref()).unwrap_or("output.txt");
+    let in_name = io
+        .and_then(|i| i.input_name.as_deref())
+        .unwrap_or("input.txt");
+    let out_name = io
+        .and_then(|i| i.output_name.as_deref())
+        .unwrap_or("output.txt");
 
     if is_file_io {
         let _ = fs::copy(&test.input_path, box_dir.join(in_name));
@@ -1137,8 +1141,9 @@ pub fn judge_communication_test(
         }
         modified_cmd
     } else {
-        let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(participant_exe, base_dir)
-            .unwrap_or_else(|_| participant_exe.to_path_buf());
+        let authorized_exe =
+            uj_sandbox::get_or_prepare_authorized_binary(participant_exe, base_dir)
+                .unwrap_or_else(|_| participant_exe.to_path_buf());
         vec![authorized_exe.into_os_string()]
     };
 

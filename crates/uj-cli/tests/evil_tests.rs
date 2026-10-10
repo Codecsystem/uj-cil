@@ -47,7 +47,10 @@ fn judge_evil_sol(sol_name: &str) -> serde_json::Value {
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
-        panic!("Failed to parse JSON for {sol_name}: {e}. Output was: {stdout_str}\nStderr: {}", String::from_utf8_lossy(&output.stderr));
+        panic!(
+            "Failed to parse JSON for {sol_name}: {e}. Output was: {stdout_str}\nStderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     })
 }
 
@@ -76,7 +79,10 @@ fn test_evil_cheat_write_blocked() {
 
     let rep = judge_evil_sol("cheat_write.cpp");
     assert_eq!(rep["verdict"], "AC");
-    assert!(!hacked_path.exists(), "HACKED.txt must NOT be created in tests directory!");
+    assert!(
+        !hacked_path.exists(),
+        "HACKED.txt must NOT be created in tests directory!"
+    );
 }
 
 #[test]
@@ -141,11 +147,17 @@ fn test_evil_mle() {
 
     // mle_touch: loops allocating and touching memory
     let rep_touch = judge_evil_sol("mle_touch.cpp");
-    assert_eq!(rep_touch["verdict"], "MLE", "mle_touch must be judged as MLE");
+    assert_eq!(
+        rep_touch["verdict"], "MLE",
+        "mle_touch must be judged as MLE"
+    );
 
     // mle_vector: instant large chunk allocation exceeding limit
     let rep_vector = judge_evil_sol("mle_vector.cpp");
-    assert_eq!(rep_vector["verdict"], "MLE", "mle_vector (vector resize 600MB) must be judged as MLE");
+    assert_eq!(
+        rep_vector["verdict"], "MLE",
+        "mle_vector (vector resize 600MB) must be judged as MLE"
+    );
 }
 
 #[test]
@@ -178,15 +190,27 @@ fn test_evil_batch_all_seeds() {
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let arr: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
-        panic!("Failed to parse batch JSON: {e}\nStdout: {stdout_str}\nStderr: {}", String::from_utf8_lossy(&output.stderr));
+        panic!(
+            "Failed to parse batch JSON: {e}\nStdout: {stdout_str}\nStderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     });
 
-    let items = arr.as_array().expect("Batch judging with multiple files must output a JSON array");
-    assert!(items.len() >= 20, "Expected at least 20 evil solutions evaluated, got {}", items.len());
+    let items = arr
+        .as_array()
+        .expect("Batch judging with multiple files must output a JSON array");
+    assert!(
+        items.len() >= 20,
+        "Expected at least 20 evil solutions evaluated, got {}",
+        items.len()
+    );
 
     // Ensure HACKED.txt was never written during batch judging
     let hacked_path = get_workspace_root().join("tests/evil/tests/HACKED.txt");
-    assert!(!hacked_path.exists(), "HACKED.txt must NOT exist after batch evaluation");
+    assert!(
+        !hacked_path.exists(),
+        "HACKED.txt must NOT exist after batch evaluation"
+    );
 }
 
 #[test]
@@ -216,10 +240,16 @@ fn test_evil_linux_lx_all() {
         let g: i32 = map.get("G").and_then(|v| v.parse().ok()).unwrap_or(-99);
         let f: i32 = map.get("F").and_then(|v| v.parse().ok()).unwrap_or(-99);
 
-        assert_eq!(c, 0, "C == 0: Writing to problem directory / rootfs must fail");
+        assert_eq!(
+            c, 0,
+            "C == 0: Writing to problem directory / rootfs must fail"
+        );
         assert_eq!(e, 0, "E == 0: Writing to /home must fail");
         assert_eq!(g, 0, "G == 0: Reading sensitive host files must fail");
-        assert!(f <= 3, "F <= 3: Visible /proc numeric entries must not exceed 3, got {f}");
+        assert!(
+            f <= 3,
+            "F <= 3: Visible /proc numeric entries must not exceed 3, got {f}"
+        );
 
         if test0["sandbox_tier"] == "full" {
             let pid: i32 = map.get("pid").and_then(|v| v.parse().ok()).unwrap_or(-99);
@@ -332,4 +362,3 @@ fn test_evil_windows_win_probe() {
         assert!(!root.join("PWNED_win.txt").exists());
     }
 }
-

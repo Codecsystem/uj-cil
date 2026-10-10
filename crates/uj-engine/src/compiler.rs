@@ -101,8 +101,10 @@ impl Compiler {
                 .join("languages.toml");
             if global_cfg_path.is_file()
                 && let Ok(content) = fs::read_to_string(&global_cfg_path)
-                && let Ok(c) =
-                    uj_core::config::LanguagesConfig::from_toml_str(&content, Some(&global_cfg_path))
+                && let Ok(c) = uj_core::config::LanguagesConfig::from_toml_str(
+                    &content,
+                    Some(&global_cfg_path),
+                )
             {
                 lang_configs.merge_overlay(c);
             }
@@ -159,7 +161,9 @@ impl Compiler {
 
         // 3. Resolve compile command template from lang_cfg
         let compile_template = lang_cfg.compile.as_ref().ok_or_else(|| {
-            CompileError::Failed(format!("Language '{lang_id}' has no compile command defined"))
+            CompileError::Failed(format!(
+                "Language '{lang_id}' has no compile command defined"
+            ))
         })?;
 
         let compiler_cmd_name = &compile_template[0];
@@ -183,7 +187,8 @@ impl Compiler {
             let ptoml = pdir.join("problem.toml");
             if ptoml.is_file()
                 && let Ok(content) = fs::read_to_string(&ptoml)
-                && let Ok(pcfg) = uj_core::config::ProblemConfig::from_toml_str(&content, Some(&ptoml))
+                && let Ok(pcfg) =
+                    uj_core::config::ProblemConfig::from_toml_str(&content, Some(&ptoml))
             {
                 if let Ok(b) = uj_core::config::parse_bytes(&pcfg.limits.memory) {
                     mem_mb = b / (1024 * 1024);

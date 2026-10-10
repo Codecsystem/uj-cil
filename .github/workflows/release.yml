@@ -5,11 +5,15 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build-release:
     name: Build Release Binary (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -39,6 +43,7 @@ jobs:
       - name: Package artifacts (Linux)
         if: runner.os == 'Linux'
         run: |
+          cp install.sh target/${{ matrix.target }}/release/
           tar -czf ${{ matrix.asset_name }} -C target/${{ matrix.target }}/release ${{ matrix.binary_name }} install.sh
 
       - name: Package artifacts (Windows)

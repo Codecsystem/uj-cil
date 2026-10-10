@@ -36,8 +36,8 @@ impl NoneSandbox {
             return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
         }
 
-        let exe = which::which(&spec.argv[0])
-            .unwrap_or_else(|_| std::path::PathBuf::from(&spec.argv[0]));
+        let exe =
+            which::which(&spec.argv[0]).unwrap_or_else(|_| std::path::PathBuf::from(&spec.argv[0]));
         let mut cmd = Command::new(exe);
         if spec.argv.len() > 1 {
             cmd.args(&spec.argv[1..]);
@@ -322,9 +322,7 @@ impl NoneSandbox {
             for (i, spec) in specs.iter().enumerate() {
                 let in_fd = wired_stdins[i];
                 let out_fd = wired_stdouts[i];
-                handles.push(s.spawn(move || {
-                    self.run_impl(spec, cancel, in_fd, out_fd)
-                }));
+                handles.push(s.spawn(move || self.run_impl(spec, cancel, in_fd, out_fd)));
             }
 
             let mut res = Vec::new();

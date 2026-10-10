@@ -124,7 +124,8 @@ impl JobObject {
                 self.handle,
                 windows::Win32::System::JobObjects::JobObjectBasicUIRestrictions,
                 &ui_restrictions as *const _ as *const _,
-                size_of::<windows::Win32::System::JobObjects::JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+                size_of::<windows::Win32::System::JobObjects::JOBOBJECT_BASIC_UI_RESTRICTIONS>()
+                    as u32,
             );
         }
 

@@ -540,7 +540,10 @@ fn test_judge_require_tier_mismatch_fails() {
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
-        assert_ne!(val["verdict"], "AC", "Must never report AC on failed require-tier");
+        assert_ne!(
+            val["verdict"], "AC",
+            "Must never report AC on failed require-tier"
+        );
     }
 }
 
