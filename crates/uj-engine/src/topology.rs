@@ -47,6 +47,14 @@ impl Topology {
         };
 
         let calculated_slots = default_slots.min(memory_constrained_slots);
+        if let Some(uj) = user_jobs
+            && uj > available_worker_cores.len()
+        {
+            eprintln!(
+                "Notice: requested jobs ({uj}) exceeds available physical P-cores ({}); CPU cores will be shared.",
+                available_worker_cores.len()
+            );
+        }
         let final_count = user_jobs.unwrap_or(calculated_slots).max(1);
 
         let mut slots = Vec::with_capacity(final_count);

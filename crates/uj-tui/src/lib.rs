@@ -659,6 +659,7 @@ mod tests {
             wall_ms: 5,
             memory_kb: 1024,
             exit: Default::default(),
+            message: None,
             checker: None,
             diff: None,
             timing: Default::default(),

@@ -169,11 +169,33 @@ pub fn create_sandbox(
     }
 }
 
-/// Create an isolated, unique box directory inside `<base_dir>/.uj/tmp/run-<id>/box`.
-/// On Windows, grants AppContainer access ONLY to uj's own AppContainer SID on this box directory.
+#[cfg(windows)]
+static AUTHORIZED_RUNS_DIRS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+/// Create an isolated, unique box directory inside `<base_dir>/.uj/tmp/runs/run-<id>/box`.
+/// Authorizes `<base_dir>/.uj/tmp/runs` once per base_dir so child box directories automatically
+/// inherit full access without incurring per-test `icacls` process spawn overhead.
 pub fn create_isolated_box_dir(
     base_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf, std::io::Error> {
+    let runs_dir = base_dir.join(".uj").join("tmp").join("runs");
+    std::fs::create_dir_all(&runs_dir)?;
+
+    #[cfg(windows)]
+    {
+        let needs_auth = {
+            let mut set = AUTHORIZED_RUNS_DIRS.lock();
+            set.insert(runs_dir.clone())
+        };
+        if needs_auth
+            && let Ok(profile) = windows::security::AppContainerProfile::get_shared()
+        {
+            let _ = profile.grant_access_to_path(&runs_dir);
+        }
+    }
+
     use std::time::SystemTime;
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -181,21 +203,71 @@ pub fn create_isolated_box_dir(
         .unwrap_or(0);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let cnt = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let box_dir = base_dir
-        .join(".uj")
-        .join("tmp")
+    let box_dir = runs_dir
         .join(format!("run-{ts}-{cnt}"))
         .join("box");
     std::fs::create_dir_all(&box_dir)?;
 
+    Ok(box_dir)
+}
+
+static AUTHORIZED_BINARIES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+/// Prepares a shared authorized copy of a binary in `<base_dir>/.uj/tmp/bin/<hash>.exe`
+/// (authorized and prewarmed once, reused across all test cases).
+pub fn get_or_prepare_authorized_binary(
+    exe_path: &std::path::Path,
+    base_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    let bytes = std::fs::read(exe_path)?;
+    let hash = blake3::hash(&bytes).to_hex();
+    let bin_dir = base_dir.join(".uj").join("tmp").join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+
     #[cfg(windows)]
+    let authorized_exe = bin_dir.join(format!("{}.exe", &hash[..16]));
+    #[cfg(not(windows))]
+    let authorized_exe = bin_dir.join(&hash[..16]);
+
+    let needs_prep = {
+        let mut set = AUTHORIZED_BINARIES.lock();
+        set.insert(authorized_exe.clone())
+    };
+
+    if !authorized_exe.exists() {
+        let temp_exe = bin_dir.join(format!("{}.tmp.{}", &hash[..16], std::process::id()));
+        std::fs::write(&temp_exe, &bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temp_exe, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::rename(&temp_exe, &authorized_exe);
+    }
+    #[cfg(unix)]
     {
-        if let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
-            let _ = profile.grant_access_to_path(&box_dir);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&authorized_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    if needs_prep {
+        #[cfg(windows)]
+        {
+            if let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
+                let _ = profile.grant_access_to_path(&authorized_exe);
+            }
+            if let Ok(box_dir) = create_isolated_box_dir(base_dir) {
+                prewarm_binary(&authorized_exe, &box_dir);
+                if let Some(run_dir) = box_dir.parent() {
+                    let _ = std::fs::remove_dir_all(run_dir);
+                }
+            }
         }
     }
 
-    Ok(box_dir)
+    Ok(authorized_exe)
 }
 
 /// Fallback scratch directory for temp files
@@ -209,7 +281,7 @@ pub fn get_sandbox_scratch_dir() -> std::path::PathBuf {
 pub use windows::process::{detect_p_core_primary_cpus, prewarm_binary};
 
 #[cfg(not(windows))]
-pub fn prewarm_binary(_exe_path: &std::path::Path) {}
+pub fn prewarm_binary(_exe_path: &std::path::Path, _work_dir: &std::path::Path) {}
 
 #[cfg(not(windows))]
 pub fn detect_p_core_primary_cpus() -> Vec<usize> {

@@ -132,6 +132,19 @@ fn test_evil_ole() {
 }
 
 #[test]
+fn test_evil_mle() {
+    let _guard = lock_test();
+
+    // mle_touch: loops allocating and touching memory
+    let rep_touch = judge_evil_sol("mle_touch.cpp");
+    assert_eq!(rep_touch["verdict"], "MLE", "mle_touch must be judged as MLE");
+
+    // mle_vector: instant large chunk allocation exceeding limit
+    let rep_vector = judge_evil_sol("mle_vector.cpp");
+    assert_eq!(rep_vector["verdict"], "MLE", "mle_vector (vector resize 600MB) must be judged as MLE");
+}
+
+#[test]
 fn test_evil_timeouts() {
     let _guard = lock_test();
 

@@ -88,13 +88,9 @@ pub fn judge_single_test(
         }
         modified_cmd
     } else {
-        #[cfg(target_os = "windows")]
-        let box_exe = box_dir.join("prog.exe");
-        #[cfg(not(target_os = "windows"))]
-        let box_exe = box_dir.join("prog");
-        let _ = std::fs::copy(exe_path, &box_exe);
-        uj_sandbox::prewarm_binary(&box_exe);
-        vec![box_exe.into_os_string()]
+        let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(exe_path, base_dir)
+            .unwrap_or_else(|_| exe_path.to_path_buf());
+        vec![authorized_exe.into_os_string()]
     };
 
     let spec = RunSpec {
@@ -117,7 +113,11 @@ pub fn judge_single_test(
     let mut duration_ms = start_instant.elapsed().as_millis() as u64;
 
     // Windows Defender mitigation retry:
-    // If killed by WallLimit and CPU time < 10% TL (or < 50ms), re-run once.
+    // Only allowed on the FIRST execution of a binary to avoid 10s stalls on real blocking/sleep tests.
+    static RETRIED_BINARIES: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashSet<PathBuf>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
     if let Ok(ref res) = run_res {
         let cpu_ms = res.cpu_time_us / 1000;
         let threshold_ms = ((limits.cpu_time_ms / 10).max(50)).min(limits.cpu_time_ms);
@@ -125,12 +125,18 @@ pub fn judge_single_test(
             && cpu_ms < threshold_ms
             && !cancel.is_cancelled()
         {
-            let mut retry_spec = spec.clone();
-            retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(10000);
-            let retry_start = Instant::now();
-            if let Ok(retry_res) = sandbox.run(&retry_spec, cancel) {
-                run_res = Ok(retry_res);
-                duration_ms = retry_start.elapsed().as_millis() as u64;
+            let should_retry = {
+                let mut set = RETRIED_BINARIES.lock();
+                set.insert(exe_path.to_path_buf())
+            };
+            if should_retry {
+                let mut retry_spec = spec.clone();
+                retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(10000);
+                let retry_start = Instant::now();
+                if let Ok(retry_res) = sandbox.run(&retry_spec, cancel) {
+                    run_res = Ok(retry_res);
+                    duration_ms = retry_start.elapsed().as_millis() as u64;
+                }
             }
         }
     }
@@ -148,7 +154,8 @@ pub fn judge_single_test(
                 wall_ms: duration_ms,
                 memory_kb: 0,
                 exit: ExitInfo::default(),
-                checker: Some(format!("Sandbox error: {e}")),
+                message: Some(format!("Sandbox error: {e}")),
+                checker: None,
                 diff: None,
                 timing: TimingInfo {
                     rejudged: false,
@@ -183,75 +190,83 @@ pub fn judge_single_test(
 
     // ------------------------------------------------------------------------
     // Section 5.4 Verdict Order Evaluation
+    // MLE takes precedence over RuntimeError (e.g. bad_alloc / fastfail crash)
     // ------------------------------------------------------------------------
-    let is_fatal_crash = match res.status {
-        ExitStatus::NtStatus(nt) => nt >= 0xC0000000,
-        ExitStatus::Signaled(_) => true,
-        _ => false,
-    };
-
-    let (mut verdict, score_ratio, checker_msg, diff_summary) = if is_fatal_crash {
-        let msg = match res.status {
-            ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
-            ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
-            ExitStatus::NtStatus(nt) => {
-                let name = uj_sandbox::ntstatus::format_ntstatus(nt);
-                format!("Process crashed: {name} (0x{nt:08X})")
+    let (mut verdict, score_ratio, test_message, checker_msg, diff_summary) = match res.killed_by {
+        Some(KillReason::UserCancel) => (
+            Verdict::JudgeFailed,
+            0.0,
+            Some("Cancelled by user".to_string()),
+            None,
+            None,
+        ),
+        Some(KillReason::MemoryLimit) => {
+            if res.status == ExitStatus::NtStatus(0xC00000FD) {
+                let name = uj_sandbox::ntstatus::format_ntstatus(0xC00000FD);
+                (
+                    Verdict::RuntimeError,
+                    0.0,
+                    Some(format!("Process crashed: {name} (0xC00000FD)")),
+                    None,
+                    None,
+                )
+            } else {
+                (Verdict::MemoryLimitExceeded, 0.0, None, None, None)
             }
-        };
-        (Verdict::RuntimeError, 0.0, Some(msg), None)
-    } else {
-        match res.killed_by {
-            Some(KillReason::CpuLimit) => (Verdict::TimeLimitExceeded, 0.0, None, None),
-            Some(KillReason::WallLimit) => (
-                Verdict::TimeLimitExceeded,
-                0.0,
-                if time_ms < limits.cpu_time_ms / 2 {
-                    Some("Process idleness detected (waiting on input or sleeping)".to_string())
-                } else {
-                    None
-                },
-                None,
-            ),
-            Some(KillReason::MemoryLimit) => (Verdict::MemoryLimitExceeded, 0.0, None, None),
-            Some(KillReason::OutputLimit) => (Verdict::OutputLimitExceeded, 0.0, None, None),
-            Some(KillReason::ProcessLimit) => (
-                Verdict::RuntimeError,
-                0.0,
-                Some("Process limit exceeded".to_string()),
-                None,
-            ),
-            Some(KillReason::Seccomp) => (
-                Verdict::RestrictedFunction,
-                0.0,
-                Some("Restricted syscall blocked by security policy".to_string()),
-                None,
-            ),
-            Some(KillReason::UserCancel) => (
-                Verdict::JudgeFailed,
-                0.0,
-                Some("Cancelled by user".to_string()),
-                None,
-            ),
-            None => {
-                // Check limits even if process exited cleanly
-                if time_ms > limits.cpu_time_ms {
-                    (Verdict::TimeLimitExceeded, 0.0, None, None)
-                } else if res.oom_killed {
-                    (Verdict::MemoryLimitExceeded, 0.0, None, None)
-                } else if !res.status.is_success() {
-                    let msg = match res.status {
-                        ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
-                        ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
-                        ExitStatus::NtStatus(nt) => {
-                            let name = uj_sandbox::ntstatus::format_ntstatus(nt);
-                            format!("Process crashed: {name} (0x{nt:08X})")
-                        }
-                    };
-                    (Verdict::RuntimeError, 0.0, Some(msg), None)
-                } else if res.memory_peak_bytes > limits.memory_bytes {
-                    (Verdict::MemoryLimitExceeded, 0.0, None, None)
-                } else {
+        }
+        Some(KillReason::OutputLimit) => (Verdict::OutputLimitExceeded, 0.0, None, None, None),
+        Some(KillReason::CpuLimit) => (Verdict::TimeLimitExceeded, 0.0, None, None, None),
+        Some(KillReason::WallLimit) => (
+            Verdict::TimeLimitExceeded,
+            0.0,
+            if time_ms < limits.cpu_time_ms / 2 {
+                Some("Process idleness detected (waiting on input or sleeping)".to_string())
+            } else {
+                None
+            },
+            None,
+            None,
+        ),
+        Some(KillReason::Seccomp) => (
+            Verdict::RestrictedFunction,
+            0.0,
+            Some("Restricted syscall blocked by security policy".to_string()),
+            None,
+            None,
+        ),
+        Some(KillReason::ProcessLimit) => (
+            Verdict::RuntimeError,
+            0.0,
+            Some("Process limit exceeded".to_string()),
+            None,
+            None,
+        ),
+        None => {
+            // Check limits even if process exited cleanly
+            if res.status == ExitStatus::NtStatus(0xC00000FD) {
+                let name = uj_sandbox::ntstatus::format_ntstatus(0xC00000FD);
+                (
+                    Verdict::RuntimeError,
+                    0.0,
+                    Some(format!("Process crashed: {name} (0xC00000FD)")),
+                    None,
+                    None,
+                )
+            } else if res.oom_killed || res.memory_peak_bytes > limits.memory_bytes {
+                (Verdict::MemoryLimitExceeded, 0.0, None, None, None)
+            } else if time_ms > limits.cpu_time_ms {
+                (Verdict::TimeLimitExceeded, 0.0, None, None, None)
+            } else if !res.status.is_success() {
+                let msg = match res.status {
+                    ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
+                    ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
+                    ExitStatus::NtStatus(nt) => {
+                        let name = uj_sandbox::ntstatus::format_ntstatus(nt);
+                        format!("Process crashed: {name} (0x{nt:08X})")
+                    }
+                };
+                (Verdict::RuntimeError, 0.0, Some(msg), None, None)
+            } else {
                 // Program exited cleanly (Exit code 0), run checker
                 let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
                 match checker {
@@ -271,10 +286,10 @@ pub fn judge_single_test(
                             found: d.actual,
                             truncated: false,
                         });
-
                         (
                             check_res.verdict,
                             check_res.score_ratio,
+                            None,
                             check_res.message,
                             diff,
                         )
@@ -306,6 +321,7 @@ pub fn judge_single_test(
                         (
                             check_res.verdict,
                             check_res.score_ratio,
+                            None,
                             check_res.message,
                             None,
                         )
@@ -340,6 +356,7 @@ pub fn judge_single_test(
                         (
                             check_res.verdict,
                             check_res.score_ratio,
+                            None,
                             check_res.message,
                             None,
                         )
@@ -347,7 +364,6 @@ pub fn judge_single_test(
                 }
             }
         }
-    }
     };
 
     if pe_as_wa && verdict == Verdict::PresentationError {
@@ -368,6 +384,7 @@ pub fn judge_single_test(
         wall_ms,
         memory_kb,
         exit: exit_info,
+        message: test_message,
         checker: checker_msg,
         diff: diff_summary,
         timing: TimingInfo {
@@ -569,13 +586,9 @@ pub fn judge_interactive_test(
         }
         modified_cmd
     } else {
-        #[cfg(target_os = "windows")]
-        let box_exe = box_dir.join("prog.exe");
-        #[cfg(not(target_os = "windows"))]
-        let box_exe = box_dir.join("prog");
-        let _ = std::fs::copy(exe_path, &box_exe);
-        uj_sandbox::prewarm_binary(&box_exe);
-        vec![box_exe.into_os_string()]
+        let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(exe_path, base_dir)
+            .unwrap_or_else(|_| exe_path.to_path_buf());
+        vec![authorized_exe.into_os_string()]
     };
 
     let pid = std::process::id();
@@ -663,7 +676,8 @@ pub fn judge_interactive_test(
                 wall_ms: duration_ms,
                 memory_kb: 0,
                 exit: ExitInfo::default(),
-                checker: Some("Incomplete process group results".to_string()),
+                message: Some("Incomplete process group results".to_string()),
+                checker: None,
                 diff: None,
                 timing: Default::default(),
             };
@@ -679,7 +693,8 @@ pub fn judge_interactive_test(
                 wall_ms: duration_ms,
                 memory_kb: 0,
                 exit: ExitInfo::default(),
-                checker: Some(format!("Sandbox run_group error: {e}")),
+                message: Some(format!("Sandbox run_group error: {e}")),
+                checker: None,
                 diff: None,
                 timing: Default::default(),
             };
@@ -873,6 +888,11 @@ pub fn judge_interactive_test(
         },
     };
 
+    let (test_message, checker_message) = match verdict {
+        Verdict::RuntimeError | Verdict::JudgeFailed => (checker_msg, None),
+        _ => (None, checker_msg),
+    };
+
     SingleTestResult {
         id: test.name.clone(),
         subtask: test.subtask_id,
@@ -882,7 +902,8 @@ pub fn judge_interactive_test(
         wall_ms,
         memory_kb,
         exit: exit_info,
-        checker: checker_msg,
+        message: test_message,
+        checker: checker_message,
         diff: None,
         timing: TimingInfo {
             rejudged: false,
@@ -926,7 +947,8 @@ pub fn judge_output_only_test(
             wall_ms: 0,
             memory_kb: 0,
             exit: ExitInfo::default(),
-            checker: Some("Output file not found in submission".to_string()),
+            message: Some("Output file not found in submission".to_string()),
+            checker: None,
             diff: None,
             timing: TimingInfo {
                 rejudged: false,
@@ -1013,6 +1035,7 @@ pub fn judge_output_only_test(
         wall_ms: 0,
         memory_kb: 0,
         exit: ExitInfo::default(),
+        message: None,
         checker: checker_msg,
         diff,
         timing: TimingInfo {
@@ -1070,13 +1093,9 @@ pub fn judge_communication_test(
         }
         modified_cmd
     } else {
-        #[cfg(target_os = "windows")]
-        let box_exe = box_dir.join("prog.exe");
-        #[cfg(not(target_os = "windows"))]
-        let box_exe = box_dir.join("prog");
-        let _ = std::fs::copy(participant_exe, &box_exe);
-        uj_sandbox::prewarm_binary(&box_exe);
-        vec![box_exe.into_os_string()]
+        let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(participant_exe, base_dir)
+            .unwrap_or_else(|_| participant_exe.to_path_buf());
+        vec![authorized_exe.into_os_string()]
     };
 
     let mut mgr_limits = Limits::new(limits.cpu_time_ms * 2 + 5000, 1024 * 1024 * 1024);
@@ -1145,7 +1164,8 @@ pub fn judge_communication_test(
                 wall_ms,
                 memory_kb: 0,
                 exit: ExitInfo::default(),
-                checker: Some("Communication run_group failed".to_string()),
+                message: Some("Communication run_group failed".to_string()),
+                checker: None,
                 diff: None,
                 timing: Default::default(),
             };
@@ -1201,6 +1221,7 @@ pub fn judge_communication_test(
         wall_ms,
         memory_kb,
         exit: ExitInfo::default(),
+        message: None,
         checker: Some(if mgr_stderr.is_empty() {
             mgr_stdout
         } else {

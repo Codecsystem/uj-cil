@@ -38,6 +38,8 @@ pub struct SingleTestResult {
     pub wall_ms: u64,
     pub memory_kb: u64,
     pub exit: ExitInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     pub checker: Option<String>,
     pub diff: Option<DiffSummary>,
     pub timing: TimingInfo,

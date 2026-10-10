@@ -174,10 +174,40 @@ impl Compiler {
             .unwrap_or_default();
         let version_line = version_output.lines().next().unwrap_or("unknown");
 
+        // Dynamically resolve memory_mb, stack_mb, and stack_bytes from problem.toml if available
+        let mut mem_mb: u64 = 256;
+        let mut stack_mb: u64 = 256;
+        let mut stack_bytes: u64 = 268435456;
+
+        if let Some(pdir) = problem_dir {
+            let ptoml = pdir.join("problem.toml");
+            if ptoml.is_file()
+                && let Ok(content) = fs::read_to_string(&ptoml)
+                && let Ok(pcfg) = uj_core::config::ProblemConfig::from_toml_str(&content, Some(&ptoml))
+            {
+                if let Ok(b) = uj_core::config::parse_bytes(&pcfg.limits.memory) {
+                    mem_mb = b / (1024 * 1024);
+                }
+                if let Some(ref stk) = pcfg.limits.stack {
+                    if stk.eq_ignore_ascii_case("same") || stk.eq_ignore_ascii_case("unlimited") {
+                        stack_mb = mem_mb;
+                        stack_bytes = stack_mb * 1024 * 1024;
+                    } else if let Ok(b) = uj_core::config::parse_bytes(stk) {
+                        stack_bytes = b;
+                        stack_mb = b / (1024 * 1024);
+                    }
+                } else {
+                    stack_mb = mem_mb;
+                    stack_bytes = stack_mb * 1024 * 1024;
+                }
+            }
+        }
+
         // 4. Compute Blake3 cache key (including source, flags, version, and headers)
         let mut hasher = blake3::Hasher::new();
         hasher.update(lang_id.as_bytes());
         hasher.update(version_line.as_bytes());
+        hasher.update(format!("{mem_mb}:{stack_mb}:{stack_bytes}").as_bytes());
         for t in compile_template {
             hasher.update(t.as_bytes());
         }
@@ -263,9 +293,9 @@ impl Compiler {
                         final_args.push(extra.to_string_lossy().to_string());
                     }
                 }
-                "{stack_bytes}" => final_args.push("268435456".to_string()),
-                "{stack_mb}" => final_args.push("256".to_string()),
-                "{memory_mb}" => final_args.push("256".to_string()),
+                "{stack_bytes}" => final_args.push(stack_bytes.to_string()),
+                "{stack_mb}" => final_args.push(stack_mb.to_string()),
+                "{memory_mb}" => final_args.push(mem_mb.to_string()),
                 other => final_args.push(other.to_string()),
             }
         }
@@ -281,8 +311,8 @@ impl Compiler {
             if let Some(ref win_extra) = lang_cfg.compile_windows_extra {
                 for extra in win_extra {
                     let replaced = extra
-                        .replace("{stack_bytes}", "268435456")
-                        .replace("{stack_mb}", "256");
+                        .replace("{stack_bytes}", &stack_bytes.to_string())
+                        .replace("{stack_mb}", &stack_mb.to_string());
                     final_args.push(replaced);
                 }
             }
@@ -331,9 +361,6 @@ impl Compiler {
             let truncated = truncate_10k(&combined_output);
             return Err(CompileError::Failed(truncated));
         }
-
-        // 7. Prewarm binary on Windows to eliminate cold Defender latency on 1st run
-        uj_sandbox::prewarm_binary(&cached_bin);
 
         Ok(CompileResult {
             binary_path: cached_bin,

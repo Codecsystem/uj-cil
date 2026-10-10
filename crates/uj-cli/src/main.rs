@@ -41,6 +41,34 @@ fn init_logging(verbose: u8, quiet: bool) {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("UJ_IN_SYSTEMD_SCOPE").is_none()
+            && let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup")
+        {
+            let trimmed = cgroup.trim();
+            if (trimmed.ends_with("/init.scope") || !trimmed.contains("user@"))
+                && let Ok(exe) = std::env::current_exe()
+            {
+                let mut cmd = std::process::Command::new("systemd-run");
+                cmd.arg("--user")
+                    .arg("--scope")
+                    .arg("--quiet")
+                    .arg("-p")
+                    .arg("Delegate=yes")
+                    .arg("-E")
+                    .arg("UJ_IN_SYSTEMD_SCOPE=1")
+                    .arg("--")
+                    .arg(&exe)
+                    .args(std::env::args_os().skip(1));
+                if let Ok(mut child) = cmd.spawn() {
+                    let status = child.wait().unwrap_or_default();
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            }
+        }
+    }
+
     let args = Cli::parse();
     init_logging(args.verbose, args.quiet);
 

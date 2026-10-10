@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::Read;
+#[allow(unused_imports)]
 use std::process::{Child, Command, Stdio as StdProcessStdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +39,9 @@ impl Sandbox for NoneSandbox {
             return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
         }
 
-        let mut cmd = Command::new(&spec.argv[0]);
+        let exe = which::which(&spec.argv[0])
+            .unwrap_or_else(|_| std::path::PathBuf::from(&spec.argv[0]));
+        let mut cmd = Command::new(exe);
         if spec.argv.len() > 1 {
             cmd.args(&spec.argv[1..]);
         }
@@ -246,7 +249,7 @@ impl Sandbox for NoneSandbox {
     fn run_group(
         &self,
         specs: &[RunSpec],
-        wiring: &Wiring,
+        _wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
         if specs.is_empty() {
@@ -254,9 +257,15 @@ impl Sandbox for NoneSandbox {
         }
         #[cfg(windows)]
         {
-            crate::windows::process::execute_group_in_jobs(specs, wiring, None, cancel, Tier::None)
+            crate::windows::process::execute_group_in_jobs(specs, _wiring, None, cancel, Tier::None)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let cgroup_base = crate::linux::cgroup::CgroupV2::find_base_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/sys/fs/cgroup"));
+            crate::linux::runner::execute_group_in_sandbox(specs, _wiring, &cgroup_base, cancel, Tier::None)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let mut results = Vec::with_capacity(specs.len());
             for spec in specs {

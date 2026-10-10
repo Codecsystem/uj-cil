@@ -291,6 +291,12 @@ pub fn execute_in_job(
         }
 
         // 6. Memory check
+        if job.check_memory_limit_violation() {
+            killed_by = Some(KillReason::MemoryLimit);
+            let _ = job.terminate(3);
+            break;
+        }
+
         if let Ok(peak_mem) = job.query_peak_memory_bytes()
             && peak_mem > spec.limits.memory_bytes
         {
@@ -309,6 +315,10 @@ pub fn execute_in_job(
 
     let cpu_time_us = job.query_cpu_time_us().unwrap_or(0);
     let memory_peak_bytes = job.query_peak_memory_bytes().unwrap_or(0);
+    let mem_violated = job.check_memory_limit_violation();
+    if mem_violated && killed_by.is_none() {
+        killed_by = Some(KillReason::MemoryLimit);
+    }
 
     let mut exit_code: u32 = 0;
     unsafe {
@@ -341,7 +351,9 @@ pub fn execute_in_job(
         ExitStatus::Exited(exit_code as i32)
     };
 
-    let oom_killed = killed_by == Some(KillReason::MemoryLimit);
+    let oom_killed = killed_by == Some(KillReason::MemoryLimit)
+        || mem_violated
+        || memory_peak_bytes > spec.limits.memory_bytes;
 
     Ok(RunResult {
         status,
@@ -620,6 +632,15 @@ pub fn execute_group_in_jobs(
             }
 
             // Memory check
+            if jobs[i].check_memory_limit_violation() {
+                killed_by[i] = Some(KillReason::MemoryLimit);
+                let _ = jobs[i].terminate(3);
+                finished[i] = true;
+                exit_order[i] = Some(order_counter);
+                order_counter += 1;
+                continue;
+            }
+
             if let Ok(mem) = jobs[i].query_peak_memory_bytes()
                 && mem > specs[i].limits.memory_bytes
             {
@@ -640,6 +661,11 @@ pub fn execute_group_in_jobs(
     for i in 0..n {
         unsafe {
             let _ = WaitForSingleObject(proc_infos[i].hProcess, 100);
+        }
+
+        let mem_violated = jobs[i].check_memory_limit_violation();
+        if mem_violated && killed_by[i].is_none() {
+            killed_by[i] = Some(KillReason::MemoryLimit);
         }
 
         if !finished[i] {
@@ -677,7 +703,9 @@ pub fn execute_group_in_jobs(
             Vec::new()
         };
 
-        let oom_killed = killed_by[i] == Some(KillReason::MemoryLimit);
+        let oom_killed = killed_by[i] == Some(KillReason::MemoryLimit)
+            || mem_violated
+            || final_peak_mem[i] > specs[i].limits.memory_bytes;
 
         results.push(RunResult {
             status: exit_statuses[i],
@@ -940,33 +968,57 @@ fn build_environment_block(
     block
 }
 
-/// Pre-warm newly compiled binary to trigger Windows Defender scan ahead of timed execution.
-/// Creates the process suspended, waits 50ms for Defender filter driver to attach, then terminates.
-pub fn prewarm_binary(exe_path: &Path) {
-    let app_name_utf16: Vec<u16> = exe_path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let pcwstr_app_name = PCWSTR(app_name_utf16.as_ptr());
-
-    let si = windows::Win32::System::Threading::STARTUPINFOW {
-        cb: size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
-        ..Default::default()
+/// Pre-warm newly prepared binary to trigger Windows Defender scan ahead of timed execution.
+/// Runs the binary briefly inside AppContainer with CREATE_NO_WINDOW and waits up to 100ms or until it finishes,
+/// then cleanly terminates it.
+pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
+    let app_container = AppContainerProfile::get_shared().ok();
+    let spec = RunSpec {
+        argv: vec![exe_path.into()],
+        env: vec![],
+        work_dir: work_dir.to_path_buf(),
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Null,
+        stderr: Stdio::Null,
+        extra_fds: vec![],
+        limits: uj_core::run::Limits::new(500, 256 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
     };
-    let mut pi = PROCESS_INFORMATION::default();
 
-    unsafe {
-        let res = CreateProcessW(
-            pcwstr_app_name,
-            windows_core::PWSTR::null(),
-            None,
-            None,
-            false,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW,
-            None,
-            None,
-            &si,
-            &mut pi,
-        );
-        if res.is_ok() {
-            thread::sleep(Duration::from_millis(50));
+    let (h_stdin, c1) = match prepare_stdin(&spec.stdin) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let (h_stdout, _, c2) = match prepare_stdout(&spec.stdout) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let (h_stderr, _, c3) = match prepare_stderr(&spec.stderr) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let pi = unsafe {
+        spawn_suspended_process(
+            &spec,
+            h_stdin,
+            h_stdout,
+            h_stderr,
+            app_container.as_deref(),
+        )
+    };
+
+    drop(c1);
+    drop(c2);
+    drop(c3);
+
+    if let Ok(pi) = pi {
+        unsafe {
+            let _ = ResumeThread(pi.hThread);
+            let _ = WaitForSingleObject(pi.hProcess, 100);
             let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 0);
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);

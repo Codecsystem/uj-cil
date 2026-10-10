@@ -271,7 +271,8 @@ impl Scheduler {
                             wall_ms: 0,
                             memory_kb: 0,
                             exit: Default::default(),
-                            checker: Some("Skipped due to --fail-fast".to_string()),
+                            message: Some("Skipped due to --fail-fast".to_string()),
+                            checker: None,
                             diff: None,
                             timing: Default::default(),
                         };

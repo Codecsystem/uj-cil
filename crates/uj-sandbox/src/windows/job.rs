@@ -1,19 +1,25 @@
-//! Job Object RAII wrapper for Windows sandbox execution.
-
 use std::mem::size_of;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_AFFINITY, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOBOBJECT_LIMIT_VIOLATION_INFORMATION, JobObjectAssociateCompletionPortInformation,
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JobObjectLimitViolationInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_core::PCWSTR;
 
+pub const JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT: u32 = 9;
+pub const JOB_OBJECT_MSG_JOB_MEMORY_LIMIT: u32 = 10;
+
 pub struct JobObject {
     handle: HANDLE,
+    iocp: HANDLE,
 }
 
 impl JobObject {
@@ -25,7 +31,33 @@ impl JobObject {
             .unwrap_or(PCWSTR::null());
 
         let handle = unsafe { CreateJobObjectW(None, pcwstr)? };
-        Ok(Self { handle })
+
+        // Create an I/O completion port and associate it with the job object
+        // to receive notification messages (e.g. memory limit exceeded).
+        let iocp = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1)? };
+
+        let assoc = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: handle.0,
+            CompletionPort: iocp,
+        };
+
+        let set_assoc_res = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectAssociateCompletionPortInformation,
+                &assoc as *const _ as *const _,
+                size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+            )
+        };
+        if let Err(e) = set_assoc_res {
+            unsafe {
+                let _ = CloseHandle(iocp);
+                let _ = CloseHandle(handle);
+            }
+            return Err(e.into());
+        }
+
+        Ok(Self { handle, iocp })
     }
 
     pub fn set_limits(
@@ -145,6 +177,52 @@ impl JobObject {
         Ok(info.PeakJobMemoryUsed as u64)
     }
 
+    /// Check if a memory limit violation has occurred via IOCP messages or query.
+    pub fn check_memory_limit_violation(&self) -> bool {
+        // 1. Drain and check IOCP notification messages
+        let mut msg_code: u32 = 0;
+        let mut key: usize = 0;
+        let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+        while unsafe {
+            GetQueuedCompletionStatus(
+                self.iocp,
+                &mut msg_code,
+                &mut key,
+                &mut overlapped,
+                0, // non-blocking
+            )
+        }
+        .is_ok()
+        {
+            if msg_code == JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
+                || msg_code == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
+            {
+                return true;
+            }
+        }
+
+        // 2. Query JobObjectLimitViolationInformation
+        let mut violation = JOBOBJECT_LIMIT_VIOLATION_INFORMATION::default();
+        let query_res = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectLimitViolationInformation,
+                &mut violation as *mut _ as *mut _,
+                size_of::<JOBOBJECT_LIMIT_VIOLATION_INFORMATION>() as u32,
+                None,
+            )
+        };
+        if query_res.is_ok() {
+            let flags = violation.ViolationLimitFlags;
+            let mem_flags = JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            if (flags.0 & mem_flags.0) != 0 {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub fn raw_handle(&self) -> HANDLE {
         self.handle
     }
@@ -152,6 +230,11 @@ impl JobObject {
 
 impl Drop for JobObject {
     fn drop(&mut self) {
+        if !self.iocp.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.iocp);
+            }
+        }
         if !self.handle.is_invalid() {
             unsafe {
                 let _ = CloseHandle(self.handle);

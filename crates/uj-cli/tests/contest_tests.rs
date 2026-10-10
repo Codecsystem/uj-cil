@@ -12,10 +12,7 @@ fn uj_bin() -> PathBuf {
     if path.ends_with("deps") {
         path.pop();
     }
-    path.push("uj.exe");
-    if !path.exists() {
-        path.set_extension("");
-    }
+    path.push(if cfg!(windows) { "uj.exe" } else { "uj" });
     path
 }
 

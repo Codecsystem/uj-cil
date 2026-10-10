@@ -94,6 +94,9 @@ pub fn format_test_details(test: &SingleTestResult) -> String {
     if let Some(nt) = test.exit.nt_status {
         out.push_str(&format!("NTSTATUS:  0x{:08X}\n", nt));
     }
+    if let Some(ref msg) = test.message {
+        out.push_str(&format!("Message:   {}\n", msg));
+    }
     if let Some(ref d) = test.diff {
         out.push_str("\n--- Diff Summary ---\n");
         out.push_str(&format!(

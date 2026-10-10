@@ -77,7 +77,8 @@ fn test_authoring_init_and_pipeline() {
     assert_eq!(
         pipe_out.status.code(),
         Some(0),
-        "uj pipeline failed: {}",
+        "uj pipeline failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&pipe_out.stdout),
         String::from_utf8_lossy(&pipe_out.stderr)
     );
 

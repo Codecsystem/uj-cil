@@ -1,13 +1,16 @@
 //! Linux Sandbox implementation utilizing userns, pidns, mountns, cgroup v2, and seccomp.
 
+pub mod cgroup;
+pub mod runner;
+
+use std::path::PathBuf;
 use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
-use std::time::Instant;
-use uj_core::run::{
-    CapturedOutput, ExitStatus, KillReason, Limits, RunResult, RunSpec, Stdio, Tier,
-};
+use uj_core::run::{RunResult, RunSpec, Tier};
+use self::cgroup::CgroupV2;
 
 pub struct LinuxSandbox {
     tier: Tier,
+    cgroup_base: Option<PathBuf>,
 }
 
 impl LinuxSandbox {
@@ -24,32 +27,46 @@ impl LinuxSandbox {
                 .unwrap_or("0")
                 .parse()
                 .unwrap_or(0);
-            if major < 5 || (major == 5 && minor < 19) {
-                if !allow_fallback && requested_tier == Tier::Full {
-                    return Err(SandboxError::Internal(format!(
-                        "Kernel version {release} is below required minimum 5.19"
-                    )));
+            if (major < 5 || (major == 5 && minor < 19)) && !allow_fallback && requested_tier == Tier::Full {
+                return Err(SandboxError::Internal(format!(
+                    "Kernel version {release} is below required minimum 5.19"
+                )));
+            }
+        }
+
+        match requested_tier {
+            Tier::None => Ok(Self {
+                tier: Tier::None,
+                cgroup_base: None,
+            }),
+            Tier::Degraded => Ok(Self {
+                tier: Tier::Degraded,
+                cgroup_base: None,
+            }),
+            Tier::Full => {
+                match CgroupV2::find_base_dir() {
+                    Ok(base) => Ok(Self {
+                        tier: Tier::Full,
+                        cgroup_base: Some(base),
+                    }),
+                    Err(e) => {
+                        if !allow_fallback {
+                            return Err(SandboxError::TierMismatch {
+                                required: Tier::Full,
+                                actual: Tier::None,
+                            });
+                        }
+                        eprintln!(
+                            "WARNING: Linux Full sandbox unavailable ({e}); falling back to None tier."
+                        );
+                        Ok(Self {
+                            tier: Tier::None,
+                            cgroup_base: None,
+                        })
+                    }
                 }
             }
         }
-
-        if requested_tier == Tier::Full {
-            if !allow_fallback {
-                return Err(SandboxError::UnsupportedPlatform(
-                    "Linux Full tier sandbox (userns + cgroup v2 + seccomp) is currently under development. To run without sandbox isolation, explicitly specify --sandbox none or --sandbox degraded.".into(),
-                ));
-            }
-            eprintln!(
-                "WARNING: Linux Full tier sandbox is under construction; running in Degraded/None tier."
-            );
-            return Ok(Self {
-                tier: Tier::Degraded,
-            });
-        }
-
-        Ok(Self {
-            tier: requested_tier,
-        })
     }
 }
 
@@ -59,24 +76,32 @@ impl Sandbox for LinuxSandbox {
     }
 
     fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
-        let fallback = crate::none::NoneSandbox::new();
-        let mut res = fallback.run(spec, cancel)?;
-        res.sandbox_tier = self.tier;
-        res.timing.confidence = "low".to_string();
-        Ok(res)
+        if self.tier == Tier::Full && let Some(ref base) = self.cgroup_base {
+            runner::execute_in_sandbox(spec, base, cancel, self.tier)
+        } else {
+            let fallback = crate::none::NoneSandbox::new();
+            let mut res = fallback.run(spec, cancel)?;
+            res.sandbox_tier = self.tier;
+            Ok(res)
+        }
     }
 
     fn run_group(
         &self,
         specs: &[RunSpec],
-        _wiring: &Wiring,
+        wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
-        let mut results = Vec::with_capacity(specs.len());
-        for spec in specs {
-            results.push(self.run(spec, cancel)?);
+        if self.tier == Tier::Full && let Some(ref base) = self.cgroup_base {
+            runner::execute_group_in_sandbox(specs, wiring, base, cancel, self.tier)
+        } else {
+            let fallback = crate::none::NoneSandbox::new();
+            let mut res = fallback.run_group(specs, wiring, cancel)?;
+            for r in &mut res {
+                r.sandbox_tier = self.tier;
+            }
+            Ok(res)
         }
-        Ok(results)
     }
 
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError> {

@@ -121,7 +121,6 @@ fn run_windows_checks(checks: &mut Vec<DoctorCheckItem>) {
 #[cfg(target_os = "linux")]
 fn run_linux_checks(checks: &mut Vec<DoctorCheckItem>, fix_apparmor: bool) {
     // 1. Kernel version >= 5.19
-    let mut kernel_ok = false;
     let uname = std::process::Command::new("uname").arg("-r").output();
     if let Ok(out) = uname {
         let release = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -135,7 +134,6 @@ fn run_linux_checks(checks: &mut Vec<DoctorCheckItem>, fix_apparmor: bool) {
                 .parse()
                 .unwrap_or(0);
             if major > 5 || (major == 5 && minor >= 19) {
-                kernel_ok = true;
                 checks.push(DoctorCheckItem {
                     name: "Linux Kernel Version".to_string(),
                     status: CheckStatus::Pass,

@@ -703,6 +703,7 @@ mod tests {
                 wall_ms: 6,
                 memory_kb: 512,
                 exit: Default::default(),
+                message: None,
                 checker: Some("ok answer matches".to_string()),
                 diff: None,
                 timing: Default::default(),

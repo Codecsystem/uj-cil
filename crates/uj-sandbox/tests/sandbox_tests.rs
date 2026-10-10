@@ -1,18 +1,27 @@
 use std::ffi::OsString;
 use uj_core::run::{KillReason, Limits, RunSpec, Stdio};
-use uj_sandbox::{CancelToken, create_sandbox};
+use uj_sandbox::{create_sandbox, CancelToken};
 
 #[test]
 fn test_windows_sandbox_echo() {
     let sandbox = create_sandbox("none", false).expect("failed to create sandbox");
 
     let work_dir = std::env::temp_dir();
-    let spec = RunSpec {
-        argv: vec![
+    let argv = if cfg!(windows) {
+        vec![
             OsString::from("cmd.exe"),
             OsString::from("/c"),
             OsString::from("echo hello_uj_sandbox"),
-        ],
+        ]
+    } else {
+        vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("echo hello_uj_sandbox"),
+        ]
+    };
+    let spec = RunSpec {
+        argv,
         env: vec![],
         work_dir,
         ro_binds: vec![],
@@ -89,6 +98,7 @@ fn test_windows_appcontainer_user_binary() {
     assert!(text.contains("HELLO_FROM_AC"));
 }
 
+#[cfg(windows)]
 #[test]
 fn test_windows_appcontainer_stack_overflow() {
     let sandbox = match create_sandbox("full", false) {
@@ -111,7 +121,7 @@ fn test_windows_appcontainer_stack_overflow() {
     if !compiled {
         return;
     }
-    uj_sandbox::prewarm_binary(&exe);
+    uj_sandbox::prewarm_binary(&exe, &work_dir);
 
     let spec = RunSpec {
         argv: vec![exe.into_os_string()],
@@ -138,22 +148,28 @@ fn test_windows_appcontainer_stack_overflow() {
     );
 }
 
-
 #[test]
 fn test_windows_sandbox_wall_time_limit() {
     let sandbox = create_sandbox("degraded", false).expect("failed to create sandbox");
 
     let work_dir = std::env::temp_dir().join("uj_ac_test");
+    let _ = std::fs::create_dir_all(&work_dir);
     let mut limits = Limits::new(5000, 256 * 1024 * 1024);
     limits.wall_time_ms = 150; // Very short wall time
 
-    let spec = RunSpec {
-        argv: vec![
+    let argv = if cfg!(windows) {
+        vec![
             OsString::from("powershell.exe"),
             OsString::from("-NoProfile"),
             OsString::from("-Command"),
             OsString::from("Start-Sleep -Seconds 5"),
-        ],
+        ]
+    } else {
+        vec![OsString::from("sleep"), OsString::from("5")]
+    };
+
+    let spec = RunSpec {
+        argv,
         env: vec![],
         work_dir,
         ro_binds: vec![],
@@ -186,15 +202,27 @@ fn test_windows_sandbox_output_limit() {
     let mut limits = Limits::new(5000, 256 * 1024 * 1024);
     limits.output_bytes = 100; // Small limit: 100 bytes
 
-    let spec = RunSpec {
-        argv: vec![
+    let argv = if cfg!(windows) {
+        vec![
             OsString::from("cmd.exe"),
             OsString::from("/c"),
             // Echo a string longer than 100 bytes
             OsString::from(
                 "echo 12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890",
             ),
-        ],
+        ]
+    } else {
+        vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from(
+                "echo 12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890",
+            ),
+        ]
+    };
+
+    let spec = RunSpec {
+        argv,
         env: vec![],
         work_dir,
         ro_binds: vec![],
@@ -227,13 +255,19 @@ fn test_windows_sandbox_cancel_token() {
     let sandbox = create_sandbox("degraded", false).expect("failed to create sandbox");
 
     let work_dir = std::env::temp_dir();
-    let spec = RunSpec {
-        argv: vec![
+    let argv = if cfg!(windows) {
+        vec![
             OsString::from("powershell.exe"),
             OsString::from("-NoProfile"),
             OsString::from("-Command"),
             OsString::from("Start-Sleep -Seconds 10"),
-        ],
+        ]
+    } else {
+        vec![OsString::from("sleep"), OsString::from("10")]
+    };
+
+    let spec = RunSpec {
+        argv,
         env: vec![],
         work_dir,
         ro_binds: vec![],
@@ -267,12 +301,22 @@ fn test_windows_run_group_wiring() {
     let sandbox = create_sandbox("auto", false).expect("failed to create sandbox");
     let work_dir = uj_sandbox::get_sandbox_scratch_dir();
 
-    let spec_sender = RunSpec {
-        argv: vec![
+    let argv_sender = if cfg!(windows) {
+        vec![
             OsString::from("cmd.exe"),
             OsString::from("/c"),
             OsString::from("echo WIRE_TOKEN_12345"),
-        ],
+        ]
+    } else {
+        vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("echo WIRE_TOKEN_12345"),
+        ]
+    };
+
+    let spec_sender = RunSpec {
+        argv: argv_sender,
         env: vec![],
         work_dir: work_dir.clone(),
         ro_binds: vec![],
@@ -286,8 +330,14 @@ fn test_windows_run_group_wiring() {
         trusted: false,
     };
 
+    let argv_receiver = if cfg!(windows) {
+        vec![OsString::from("findstr.exe"), OsString::from("WIRE_TOKEN")]
+    } else {
+        vec![OsString::from("grep"), OsString::from("WIRE_TOKEN")]
+    };
+
     let spec_receiver = RunSpec {
-        argv: vec![OsString::from("findstr.exe"), OsString::from("WIRE_TOKEN")],
+        argv: argv_receiver,
         env: vec![],
         work_dir,
         ro_binds: vec![],
@@ -332,13 +382,23 @@ fn test_windows_sandbox_memory_limit() {
     let work_dir = std::env::temp_dir();
     let limits = Limits::new(5000, 32 * 1024 * 1024);
 
-    let spec = RunSpec {
-        argv: vec![
+    let argv = if cfg!(windows) {
+        vec![
             OsString::from("powershell.exe"),
             OsString::from("-NoProfile"),
             OsString::from("-Command"),
             OsString::from("[byte[]]::new(100*1024*1024)"),
-        ],
+        ]
+    } else {
+        vec![
+            OsString::from("python3"),
+            OsString::from("-c"),
+            OsString::from("b = bytearray(100*1024*1024)"),
+        ]
+    };
+
+    let spec = RunSpec {
+        argv,
         env: vec![],
         work_dir,
         ro_binds: vec![],
@@ -361,5 +421,3 @@ fn test_windows_sandbox_memory_limit() {
         res.memory_peak_bytes / (1024 * 1024)
     );
 }
-
-

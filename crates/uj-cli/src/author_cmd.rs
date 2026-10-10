@@ -926,8 +926,14 @@ pub fn run_verify(
         }
 
         if !matches_tag {
+            let msg = report
+                .tests
+                .iter()
+                .find_map(|t| t.message.as_ref())
+                .cloned()
+                .unwrap_or_default();
             verification_failures.push(format!(
-                "{} expected tag '{:?}' but got verdict '{:?}' (score: {})",
+                "{} expected tag '{:?}' but got verdict '{:?}' (score: {}, msg: {msg})",
                 sol.path.display(),
                 sol.tag,
                 report.verdict,
