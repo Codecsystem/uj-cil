@@ -92,6 +92,7 @@ pub fn run_lemon_checker(
         limits: Limits::new(10000, 1024 * 1024 * 1024),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: true,
     };
 
     let run_res = match sandbox.run(&spec, cancel) {

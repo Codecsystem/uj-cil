@@ -1330,6 +1330,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "ctrlc",
+ "globset",
  "indicatif",
  "regex",
  "serde",
@@ -1398,6 +1399,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
+ "num_cpus",
  "parking_lot",
  "rustix 0.38.44",
  "tempfile",

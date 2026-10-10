@@ -33,6 +33,20 @@ impl LinuxSandbox {
             }
         }
 
+        if requested_tier == Tier::Full {
+            if !allow_fallback {
+                return Err(SandboxError::UnsupportedPlatform(
+                    "Linux Full tier sandbox (userns + cgroup v2 + seccomp) is currently under development. To run without sandbox isolation, explicitly specify --sandbox none or --sandbox degraded.".into(),
+                ));
+            }
+            eprintln!(
+                "WARNING: Linux Full tier sandbox is under construction; running in Degraded/None tier."
+            );
+            return Ok(Self {
+                tier: Tier::Degraded,
+            });
+        }
+
         Ok(Self {
             tier: requested_tier,
         })
@@ -48,6 +62,7 @@ impl Sandbox for LinuxSandbox {
         let fallback = crate::none::NoneSandbox::new();
         let mut res = fallback.run(spec, cancel)?;
         res.sandbox_tier = self.tier;
+        res.timing.confidence = "low".to_string();
         Ok(res)
     }
 

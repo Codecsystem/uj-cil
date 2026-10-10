@@ -110,24 +110,17 @@ impl AppContainerProfile {
 
     pub fn grant_access_to_path(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         let sid_str = self.sid_string()?;
+        Self::grant_path_access(path, &sid_str)
+    }
+
+    pub fn grant_path_access(
+        path: &std::path::Path,
+        sid_str: &str,
+    ) -> Result<(), std::io::Error> {
         let _ = std::process::Command::new("icacls")
             .arg(path)
             .arg("/grant")
             .arg(format!("*{sid_str}:(OI)(CI)F"))
-            .arg("/T")
-            .arg("/C")
-            .arg("/Q")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        Ok(())
-    }
-
-    pub fn grant_all_application_packages(path: &std::path::Path) -> Result<(), std::io::Error> {
-        let _ = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/grant")
-            .arg("*S-1-15-2-1:(OI)(CI)F")
             .arg("/T")
             .arg("/C")
             .arg("/Q")

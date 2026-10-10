@@ -17,3 +17,7 @@
 | 11 | LemonLime 子任务依赖标志解析 | 解析 `inputFiles` 中的 `*_lemon_SUbtaskDEPENDENCE_fLAg` 后缀提取依赖 ID | LemonLime CDF 在 JSON 中采用特殊的字符串后缀编码子任务依赖关系，通过解析剥离保障完全向前兼容。 |
 | 12 | 评测报告提交者命名口径 | 统一以 `submission_name`（选手-题目或源码文件名）记入报告 | 避免临时编译二进制文件名（如 `prog.exe` 或 `ac.exe`）覆盖真实提交者名称，保障报表清晰。 |
 | 13 | stdio MCP Server 零标准输出污染 | 内部模块直接以 Rust 原生结构体形式调用，禁止向 stdout 输出日志 | MCP 协议通信强依赖标准输出管道传递纯粹的 JSON-RPC 2.0 数据包，通过结构化直调避免破坏流协议。 |
+| 14 | Windows 授权与工作目录强隔离 | 每次运行独占 `.uj/tmp/run-<id>/box` 目录，仅授权给 uj 自身 AppContainer SID | 禁止使用系统级 `ALL APPLICATION PACKAGES`，杜绝选手程序读取测试答案（`cheat_read`）或篡改数据（`cheat_write`）；评测完毕彻底删除 run 目录，实现零残留。 |
+| 15 | Windows Defender 首次扫描延迟规避 | 挂起预热 + 疑似空闲自动重跑放宽墙钟 | 刚编译的静态二进制首次启动会被 Defender 驱动拦截 3~7 秒。通过 Wall 超时且 CPU < 10% TL 识别为扫描阻滞，自动单次重跑并放宽墙钟上限（CPU 限制不变），确保判定准确。 |
+| 16 | 选手进程与裁判桩沙盒权限分流 | `RunSpec.trusted` 标记与 AppContainer 解耦 | 通信题与标准题中所有选手程序强制置于 AppContainer 沙盒；而 Manager、Interactor、SPJ Checker 作为受信任评测桩，受 Job Object 资源和超时保护，但免除文件/网络阻断，保障其正常读取标准输入输出与答案。 |
+| 17 | 异构大小核架构感知与 P 核独占调度 | `GetLogicalProcessorInformationEx` 识别物理 P 核，按物理核分配独占槽位 | 依据 `EfficiencyClass` 筛选 P 核，利用 `mask.trailing_zeros()` 避开超线程兄弟核；保留核 0 给系统和调度器，worker 与复测均绑定物理 P 核，消除大小核频率差异带来的计时偏差。 |

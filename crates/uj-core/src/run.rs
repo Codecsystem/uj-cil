@@ -23,7 +23,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    pub const DEFAULT_OUTPUT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+    pub const DEFAULT_OUTPUT_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
     pub const DEFAULT_STDERR_BYTES: u64 = 64 * 1024; // 64 KiB
 
     pub fn new(cpu_time_ms: u64, memory_bytes: u64) -> Self {
@@ -144,6 +144,7 @@ pub struct RunSpec {
     pub limits: Limits,
     pub cpu_affinity: Option<Vec<usize>>,
     pub seccomp_profile: SeccompProfile,
+    pub trusted: bool,
 }
 
 /// Result returned from the sandbox execution.

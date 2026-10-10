@@ -169,30 +169,49 @@ pub fn create_sandbox(
     }
 }
 
-/// Returns a scratch/temporary directory suitable for sandboxed runs.
-/// On Windows with AppContainer, ensures permissions (ALL APPLICATION PACKAGES) are granted.
-pub fn get_sandbox_scratch_dir() -> std::path::PathBuf {
+/// Create an isolated, unique box directory inside `<base_dir>/.uj/tmp/run-<id>/box`.
+/// On Windows, grants AppContainer access ONLY to uj's own AppContainer SID on this box directory.
+pub fn create_isolated_box_dir(
+    base_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    use std::time::SystemTime;
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let cnt = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let box_dir = base_dir
+        .join(".uj")
+        .join("tmp")
+        .join(format!("run-{ts}-{cnt}"))
+        .join("box");
+    std::fs::create_dir_all(&box_dir)?;
+
     #[cfg(windows)]
     {
-        let p = std::path::PathBuf::from(r"C:\ProgramData\uj\tmp");
-        if std::fs::create_dir_all(&p).is_ok() {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                let _ = windows::security::AppContainerProfile::grant_all_application_packages(&p);
-            });
-            p
-        } else {
-            let fallback = std::env::temp_dir().join("uj_tmp");
-            let _ = std::fs::create_dir_all(&fallback);
-            let _ =
-                windows::security::AppContainerProfile::grant_all_application_packages(&fallback);
-            fallback
+        if let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
+            let _ = profile.grant_access_to_path(&box_dir);
         }
     }
-    #[cfg(not(windows))]
-    {
-        let p = std::env::temp_dir().join("uj_tmp");
-        let _ = std::fs::create_dir_all(&p);
-        p
-    }
+
+    Ok(box_dir)
+}
+
+/// Fallback scratch directory for temp files
+pub fn get_sandbox_scratch_dir() -> std::path::PathBuf {
+    let p = std::env::temp_dir().join("uj").join("tmp");
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+#[cfg(windows)]
+pub use windows::process::{detect_p_core_primary_cpus, prewarm_binary};
+
+#[cfg(not(windows))]
+pub fn prewarm_binary(_exe_path: &std::path::Path) {}
+
+#[cfg(not(windows))]
+pub fn detect_p_core_primary_cpus() -> Vec<usize> {
+    (0..num_cpus::get()).collect()
 }

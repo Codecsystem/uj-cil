@@ -23,6 +23,7 @@ fn test_windows_sandbox_echo() {
         limits: Limits::new(2000, 256 * 1024 * 1024),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let cancel = CancelToken::new();
@@ -42,8 +43,8 @@ fn test_windows_appcontainer_user_binary() {
         Err(_) => return, // Skip if AppContainer cannot be created (e.g. non-admin CI)
     };
 
-    let work_dir = std::path::PathBuf::from(r"C:\ProgramData\uj_sandbox_test");
-    let _ = std::fs::create_dir_all(&work_dir);
+    let work_dir = uj_sandbox::create_isolated_box_dir(std::path::Path::new("."))
+        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
     let exe = work_dir.join("test_prog.exe");
     if !exe.exists() {
         let rs_path = work_dir.join("test.rs");
@@ -58,9 +59,6 @@ fn test_windows_appcontainer_user_binary() {
         if !compile_ok {
             return;
         }
-        let _ = uj_sandbox::windows::security::AppContainerProfile::grant_all_application_packages(
-            &work_dir,
-        );
     }
 
     let spec = RunSpec {
@@ -75,6 +73,7 @@ fn test_windows_appcontainer_user_binary() {
         limits: Limits::new(5000, 256 * 1024 * 1024),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let cancel = CancelToken::new();
@@ -89,6 +88,56 @@ fn test_windows_appcontainer_user_binary() {
     let text = String::from_utf8_lossy(&stdout_captured.bytes);
     assert!(text.contains("HELLO_FROM_AC"));
 }
+
+#[test]
+fn test_windows_appcontainer_stack_overflow() {
+    let sandbox = match create_sandbox("full", false) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let work_dir = uj_sandbox::create_isolated_box_dir(std::path::Path::new("."))
+        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
+    let cpp_path = work_dir.join("so.cpp");
+    let exe = work_dir.join("prog.exe");
+    std::fs::write(&cpp_path, b"int f(int n){volatile char b[4096]; b[0]=n; return f(n+1)+b[0];} int main(){return f(0);}").unwrap();
+    let compiled = std::process::Command::new("g++")
+        .args(["-O2", "-Wl,--stack,268435456", "-o"])
+        .arg(&exe)
+        .arg(&cpp_path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !compiled {
+        return;
+    }
+    uj_sandbox::prewarm_binary(&exe);
+
+    let spec = RunSpec {
+        argv: vec![exe.into_os_string()],
+        env: vec![],
+        work_dir,
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(5000, 256 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+
+    let cancel = CancelToken::new();
+    let start = std::time::Instant::now();
+    let res = sandbox.run(&spec, &cancel).expect("sandbox run failed");
+    let elapsed = start.elapsed();
+    println!(
+        "SO AppContainer run result: status={:?}, killed_by={:?}, wall_ms={}, elapsed={:?}",
+        res.status, res.killed_by, res.wall_time_us / 1000, elapsed
+    );
+}
+
 
 #[test]
 fn test_windows_sandbox_wall_time_limit() {
@@ -115,6 +164,7 @@ fn test_windows_sandbox_wall_time_limit() {
         limits,
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let cancel = CancelToken::new();
@@ -155,6 +205,7 @@ fn test_windows_sandbox_output_limit() {
         limits,
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let cancel = CancelToken::new();
@@ -193,6 +244,7 @@ fn test_windows_sandbox_cancel_token() {
         limits: Limits::new(10000, 256 * 1024 * 1024),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let cancel = CancelToken::new();
@@ -231,6 +283,7 @@ fn test_windows_run_group_wiring() {
         limits: Limits::new(5000, 256 * 1024 * 1024),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let spec_receiver = RunSpec {
@@ -245,6 +298,7 @@ fn test_windows_run_group_wiring() {
         limits: Limits::new(5000, 256 * 1024 * 1024),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let wiring = Wiring {
@@ -270,3 +324,42 @@ fn test_windows_run_group_wiring() {
         "Expected receiver to receive piped token, got: {text}"
     );
 }
+
+#[test]
+fn test_windows_sandbox_memory_limit() {
+    let sandbox = create_sandbox("degraded", false).expect("failed to create sandbox");
+
+    let work_dir = std::env::temp_dir();
+    let limits = Limits::new(5000, 32 * 1024 * 1024);
+
+    let spec = RunSpec {
+        argv: vec![
+            OsString::from("powershell.exe"),
+            OsString::from("-NoProfile"),
+            OsString::from("-Command"),
+            OsString::from("[byte[]]::new(100*1024*1024)"),
+        ],
+        env: vec![],
+        work_dir,
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits,
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+
+    let cancel = CancelToken::new();
+    let res = sandbox.run(&spec, &cancel).expect("sandbox run failed");
+    println!(
+        "Memory Limit Test: status={:?}, killed_by={:?}, peak_mem_mb={}",
+        res.status,
+        res.killed_by,
+        res.memory_peak_bytes / (1024 * 1024)
+    );
+}
+
+

@@ -45,8 +45,11 @@ impl JobObject {
         }
 
         if memory_limit_bytes > 0 {
-            flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
-            info.JobMemoryLimit = memory_limit_bytes as usize;
+            let hard_limit = (memory_limit_bytes as usize).saturating_add(32 * 1024 * 1024);
+            flags |= JOB_OBJECT_LIMIT_JOB_MEMORY
+                | windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            info.JobMemoryLimit = hard_limit;
+            info.ProcessMemoryLimit = hard_limit;
         }
 
         if let Some(cores) = cpu_affinity
@@ -73,21 +76,25 @@ impl JobObject {
             )?;
         }
 
-        /*
-        let mut ui_restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS::default();
-        // UI restrictions: handles, read/write clipboard, system parameters, display settings, global atoms, exit windows
-        let safe_ui_limits: u32 = 0x02 | 0x04 | 0x10 | 0x80;
-        ui_restrictions.UIRestrictionsClass = unsafe { std::mem::transmute(safe_ui_limits) };
+        let ui_restrictions = windows::Win32::System::JobObjects::JOBOBJECT_BASIC_UI_RESTRICTIONS {
+            UIRestrictionsClass: windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_HANDLES
+                | windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_READCLIPBOARD
+                | windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+                | windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+                | windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+                | windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_GLOBALATOMS
+                | windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_DESKTOP
+                | windows::Win32::System::JobObjects::JOB_OBJECT_UILIMIT_EXITWINDOWS,
+        };
 
         unsafe {
-            SetInformationJobObject(
+            let _ = SetInformationJobObject(
                 self.handle,
-                JobObjectBasicUIRestrictions,
+                windows::Win32::System::JobObjects::JobObjectBasicUIRestrictions,
                 &ui_restrictions as *const _ as *const _,
-                size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
-            )?;
+                size_of::<windows::Win32::System::JobObjects::JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+            );
         }
-        */
 
         Ok(())
     }

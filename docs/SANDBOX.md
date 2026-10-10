@@ -35,7 +35,11 @@
 
 ---
 
-## 3. Linux 沙盒要点
+## 3. Linux 沙盒要点与当前状态
+ 
+> [!NOTE]
+> 当前阶段 Linux 原生 Full 层级（userns + cgroup v2 + seccomp 过滤）正在基于 WSL2/Linux 原生环境深度研发中。
+> 在 Linux 宿主机上，如果显式指定 `--require-tier full`，系统会严格返回 `UnsupportedPlatform` 错误，禁止假冒 Full 层级；开发调试可显式使用 `--sandbox degraded` 或 `--sandbox none`。
 
 ### 3.1 内核版本硬性要求
 - **内核版本必须 ≥ 5.19**（强依赖 `memory.peak`、`cgroup.kill`、`subset=pid` 及 pidfd）。

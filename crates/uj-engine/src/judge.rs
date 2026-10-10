@@ -51,18 +51,56 @@ pub fn judge_single_test(
     cpu_affinity: Option<usize>,
     cancel: &CancelToken,
 ) -> SingleTestResult {
-    let argv = if let Some(cmd) = interpreter_cmd {
-        cmd.iter().map(std::ffi::OsString::from).collect()
-    } else {
-        vec![exe_path.as_os_str().to_os_string()]
-    };
+    let base_dir = test
+        .input_path
+        .parent()
+        .and_then(|p| {
+            if p.file_name().is_some_and(|n| n == "tests") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })
+        .unwrap_or_else(|| Path::new("."));
 
-    let work_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let box_dir = uj_sandbox::create_isolated_box_dir(base_dir)
+        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
+    let run_dir = box_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| box_dir.clone());
+
+    let argv = if let Some(cmd) = interpreter_cmd {
+        let mut modified_cmd = Vec::new();
+        for (i, part) in cmd.iter().enumerate() {
+            if i == 0 {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            } else if Path::new(part).exists() {
+                let script_name = Path::new(part)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
+                let box_script = box_dir.join(script_name);
+                let _ = std::fs::copy(part, &box_script);
+                modified_cmd.push(box_script.into_os_string());
+            } else {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            }
+        }
+        modified_cmd
+    } else {
+        #[cfg(target_os = "windows")]
+        let box_exe = box_dir.join("prog.exe");
+        #[cfg(not(target_os = "windows"))]
+        let box_exe = box_dir.join("prog");
+        let _ = std::fs::copy(exe_path, &box_exe);
+        uj_sandbox::prewarm_binary(&box_exe);
+        vec![box_exe.into_os_string()]
+    };
 
     let spec = RunSpec {
         argv,
         env: vec![],
-        work_dir,
+        work_dir: box_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::File(test.input_path.clone()),
         stdout: Stdio::Pipe,
@@ -71,15 +109,36 @@ pub fn judge_single_test(
         limits: limits.clone(),
         cpu_affinity: cpu_affinity.map(|c| vec![c]),
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let start_instant = Instant::now();
-    let run_res = sandbox.run(&spec, cancel);
-    let duration_ms = start_instant.elapsed().as_millis() as u64;
+    let mut run_res = sandbox.run(&spec, cancel);
+    let mut duration_ms = start_instant.elapsed().as_millis() as u64;
+
+    // Windows Defender mitigation retry:
+    // If killed by WallLimit and CPU time < 10% TL (or < 50ms), re-run once.
+    if let Ok(ref res) = run_res {
+        let cpu_ms = res.cpu_time_us / 1000;
+        let threshold_ms = ((limits.cpu_time_ms / 10).max(50)).min(limits.cpu_time_ms);
+        if res.killed_by == Some(KillReason::WallLimit)
+            && cpu_ms < threshold_ms
+            && !cancel.is_cancelled()
+        {
+            let mut retry_spec = spec.clone();
+            retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(10000);
+            let retry_start = Instant::now();
+            if let Ok(retry_res) = sandbox.run(&retry_spec, cancel) {
+                run_res = Ok(retry_res);
+                duration_ms = retry_start.elapsed().as_millis() as u64;
+            }
+        }
+    }
 
     let res = match run_res {
         Ok(r) => r,
         Err(e) => {
+            let _ = fs::remove_dir_all(&run_dir);
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -125,55 +184,74 @@ pub fn judge_single_test(
     // ------------------------------------------------------------------------
     // Section 5.4 Verdict Order Evaluation
     // ------------------------------------------------------------------------
-    let (mut verdict, score_ratio, checker_msg, diff_summary) = match res.killed_by {
-        Some(KillReason::CpuLimit) => (Verdict::TimeLimitExceeded, 0.0, None, None),
-        Some(KillReason::WallLimit) => (
-            Verdict::TimeLimitExceeded,
-            0.0,
-            if time_ms < limits.cpu_time_ms / 2 {
-                Some("Process idleness detected (waiting on input or sleeping)".to_string())
-            } else {
-                None
-            },
-            None,
-        ),
-        Some(KillReason::MemoryLimit) => (Verdict::MemoryLimitExceeded, 0.0, None, None),
-        Some(KillReason::OutputLimit) => (Verdict::OutputLimitExceeded, 0.0, None, None),
-        Some(KillReason::ProcessLimit) => (
-            Verdict::RuntimeError,
-            0.0,
-            Some("Process limit exceeded".to_string()),
-            None,
-        ),
-        Some(KillReason::Seccomp) => (
-            Verdict::RestrictedFunction,
-            0.0,
-            Some("Restricted syscall blocked by security policy".to_string()),
-            None,
-        ),
-        Some(KillReason::UserCancel) => (
-            Verdict::JudgeFailed,
-            0.0,
-            Some("Cancelled by user".to_string()),
-            None,
-        ),
-        None => {
-            // Check limits even if process exited cleanly
-            if time_ms > limits.cpu_time_ms {
-                (Verdict::TimeLimitExceeded, 0.0, None, None)
-            } else if res.oom_killed || res.memory_peak_bytes > limits.memory_bytes {
-                (Verdict::MemoryLimitExceeded, 0.0, None, None)
-            } else if !res.status.is_success() {
-                let msg = match res.status {
-                    ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
-                    ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
-                    ExitStatus::NtStatus(nt) => {
-                        let name = uj_sandbox::ntstatus::format_ntstatus(nt);
-                        format!("Process crashed: {name} (0x{nt:08X})")
-                    }
-                };
-                (Verdict::RuntimeError, 0.0, Some(msg), None)
-            } else {
+    let is_fatal_crash = match res.status {
+        ExitStatus::NtStatus(nt) => nt >= 0xC0000000,
+        ExitStatus::Signaled(_) => true,
+        _ => false,
+    };
+
+    let (mut verdict, score_ratio, checker_msg, diff_summary) = if is_fatal_crash {
+        let msg = match res.status {
+            ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
+            ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
+            ExitStatus::NtStatus(nt) => {
+                let name = uj_sandbox::ntstatus::format_ntstatus(nt);
+                format!("Process crashed: {name} (0x{nt:08X})")
+            }
+        };
+        (Verdict::RuntimeError, 0.0, Some(msg), None)
+    } else {
+        match res.killed_by {
+            Some(KillReason::CpuLimit) => (Verdict::TimeLimitExceeded, 0.0, None, None),
+            Some(KillReason::WallLimit) => (
+                Verdict::TimeLimitExceeded,
+                0.0,
+                if time_ms < limits.cpu_time_ms / 2 {
+                    Some("Process idleness detected (waiting on input or sleeping)".to_string())
+                } else {
+                    None
+                },
+                None,
+            ),
+            Some(KillReason::MemoryLimit) => (Verdict::MemoryLimitExceeded, 0.0, None, None),
+            Some(KillReason::OutputLimit) => (Verdict::OutputLimitExceeded, 0.0, None, None),
+            Some(KillReason::ProcessLimit) => (
+                Verdict::RuntimeError,
+                0.0,
+                Some("Process limit exceeded".to_string()),
+                None,
+            ),
+            Some(KillReason::Seccomp) => (
+                Verdict::RestrictedFunction,
+                0.0,
+                Some("Restricted syscall blocked by security policy".to_string()),
+                None,
+            ),
+            Some(KillReason::UserCancel) => (
+                Verdict::JudgeFailed,
+                0.0,
+                Some("Cancelled by user".to_string()),
+                None,
+            ),
+            None => {
+                // Check limits even if process exited cleanly
+                if time_ms > limits.cpu_time_ms {
+                    (Verdict::TimeLimitExceeded, 0.0, None, None)
+                } else if res.oom_killed {
+                    (Verdict::MemoryLimitExceeded, 0.0, None, None)
+                } else if !res.status.is_success() {
+                    let msg = match res.status {
+                        ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
+                        ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
+                        ExitStatus::NtStatus(nt) => {
+                            let name = uj_sandbox::ntstatus::format_ntstatus(nt);
+                            format!("Process crashed: {name} (0x{nt:08X})")
+                        }
+                    };
+                    (Verdict::RuntimeError, 0.0, Some(msg), None)
+                } else if res.memory_peak_bytes > limits.memory_bytes {
+                    (Verdict::MemoryLimitExceeded, 0.0, None, None)
+                } else {
                 // Program exited cleanly (Exit code 0), run checker
                 let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
                 match checker {
@@ -202,8 +280,7 @@ pub fn judge_single_test(
                         )
                     }
                     ResolvedChecker::Testlib(chk_exe) => {
-                        let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
-                        let out_file = scratch_dir.join(format!(
+                        let out_file = run_dir.join(format!(
                             "uj_out_{}_{}_{}.txt",
                             std::process::id(),
                             test.name,
@@ -237,8 +314,7 @@ pub fn judge_single_test(
                         path: chk_exe,
                         full_score,
                     } => {
-                        let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
-                        let out_file = scratch_dir.join(format!(
+                        let out_file = run_dir.join(format!(
                             "uj_out_{}_{}_{}.txt",
                             std::process::id(),
                             test.name,
@@ -271,6 +347,7 @@ pub fn judge_single_test(
                 }
             }
         }
+    }
     };
 
     if pe_as_wa && verdict == Verdict::PresentationError {
@@ -278,6 +355,9 @@ pub fn judge_single_test(
     }
 
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
+
+    // Clean up isolated run directory and all files inside it
+    let _ = fs::remove_dir_all(&run_dir);
 
     SingleTestResult {
         id: test.name.clone(),
@@ -322,13 +402,14 @@ pub fn aggregate_submission_report(
     }
 
     let mut subtask_results = Vec::new();
-    let mut total_score = 0.0;
+    let mut total_score_fixed: i64 = 0;
     let mut worst_verdict = Verdict::Accepted;
 
-    // Evaluate subtasks defined in config
+    // Evaluate subtasks defined in config using fixed-point integer math (scale 10_000)
     for st_cfg in &config.subtasks {
         let tests = subtask_map.remove(&st_cfg.id).unwrap_or_default();
         let test_ids: Vec<String> = tests.iter().map(|t| t.id.clone()).collect();
+        let st_max_fixed = (st_cfg.score * 10000.0).round() as i64;
 
         // Check dependencies
         let mut dep_failed = false;
@@ -343,17 +424,17 @@ pub fn aggregate_submission_report(
             }
         }
 
-        let (st_verdict, st_score) = if dep_failed {
-            (Verdict::Skipped, 0.0)
+        let (st_verdict, st_score_fixed) = if dep_failed {
+            (Verdict::Skipped, 0i64)
         } else if tests.is_empty() {
-            (Verdict::Accepted, st_cfg.score)
+            (Verdict::Accepted, st_max_fixed)
         } else {
             let mut worst = Verdict::Accepted;
             for t in &tests {
                 worst = worst.merge(t.verdict);
             }
 
-            let st_score = match st_cfg.scoring {
+            let score_fixed = match st_cfg.scoring {
                 ScoringType::Min => {
                     let min_ratio = tests
                         .iter()
@@ -365,24 +446,28 @@ pub fn aggregate_submission_report(
                             }
                         })
                         .fold(1.0f64, f64::min);
-                    st_cfg.score * min_ratio
+                    ((st_max_fixed as f64) * min_ratio).round() as i64
                 }
-                ScoringType::Sum => tests.iter().map(|t| t.score).sum(),
+                ScoringType::Sum => tests
+                    .iter()
+                    .map(|t| (t.score * 10000.0).round() as i64)
+                    .sum(),
             };
 
-            let final_verdict = if (st_score - st_cfg.score).abs() < 1e-6 {
+            let final_verdict = if score_fixed >= st_max_fixed {
                 worst
-            } else if st_score > 0.0 {
+            } else if score_fixed > 0 {
                 Verdict::PartiallyCorrect
             } else {
                 worst
             };
 
-            (final_verdict, st_score)
+            (final_verdict, score_fixed)
         };
 
+        let st_score = st_score_fixed as f64 / 10000.0;
         worst_verdict = worst_verdict.merge(st_verdict);
-        total_score += st_score;
+        total_score_fixed += st_score_fixed;
 
         subtask_results.push(SubtaskResult {
             id: st_cfg.id,
@@ -397,9 +482,11 @@ pub fn aggregate_submission_report(
     if !unassigned_tests.is_empty() {
         for t in &unassigned_tests {
             worst_verdict = worst_verdict.merge(t.verdict);
-            total_score += t.score;
+            total_score_fixed += (t.score * 10000.0).round() as i64;
         }
     }
+
+    let total_score = total_score_fixed as f64 / 10000.0;
 
     let max_possible_score: f64 = if !config.subtasks.is_empty() {
         config.subtasks.iter().map(|s| s.score).sum()
@@ -445,26 +532,65 @@ pub fn judge_interactive_test(
     pe_as_wa: bool,
     cancel: &CancelToken,
 ) -> SingleTestResult {
+    let base_dir = test
+        .input_path
+        .parent()
+        .and_then(|p| {
+            if p.file_name().is_some_and(|n| n == "tests") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })
+        .unwrap_or_else(|| Path::new("."));
+
+    let box_dir = uj_sandbox::create_isolated_box_dir(base_dir)
+        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
+    let run_dir = box_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| box_dir.clone());
+
     let argv_sol = if let Some(cmd) = interpreter_cmd {
-        cmd.iter().map(std::ffi::OsString::from).collect()
+        let mut modified_cmd = Vec::new();
+        for (i, part) in cmd.iter().enumerate() {
+            if i == 0 {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            } else if Path::new(part).exists() {
+                let script_name = Path::new(part)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
+                let box_script = box_dir.join(script_name);
+                let _ = std::fs::copy(part, &box_script);
+                modified_cmd.push(box_script.into_os_string());
+            } else {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            }
+        }
+        modified_cmd
     } else {
-        vec![exe_path.as_os_str().to_os_string()]
+        #[cfg(target_os = "windows")]
+        let box_exe = box_dir.join("prog.exe");
+        #[cfg(not(target_os = "windows"))]
+        let box_exe = box_dir.join("prog");
+        let _ = std::fs::copy(exe_path, &box_exe);
+        uj_sandbox::prewarm_binary(&box_exe);
+        vec![box_exe.into_os_string()]
     };
 
-    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
     let pid = std::process::id();
     let time_now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    let tout_file = scratch_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
-    let result_file = scratch_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
+    let tout_file = run_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
+    let result_file = run_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
 
     let spec_sol = RunSpec {
         argv: argv_sol,
         env: vec![],
-        work_dir: scratch_dir.clone(),
+        work_dir: box_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::Pipe,
         stdout: Stdio::Pipe,
@@ -473,6 +599,7 @@ pub fn judge_interactive_test(
         limits: limits.clone(),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let mut argv_int = vec![
@@ -494,7 +621,7 @@ pub fn judge_interactive_test(
     let spec_int = RunSpec {
         argv: argv_int,
         env: vec![],
-        work_dir: scratch_dir.clone(),
+        work_dir: run_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::Pipe,
         stdout: Stdio::Pipe,
@@ -503,6 +630,7 @@ pub fn judge_interactive_test(
         limits: int_limits,
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: true,
     };
 
     let wiring = Wiring {
@@ -525,8 +653,7 @@ pub fn judge_interactive_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) => {
-            let _ = fs::remove_file(&tout_file);
-            let _ = fs::remove_file(&result_file);
+            let _ = fs::remove_dir_all(&run_dir);
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -542,8 +669,7 @@ pub fn judge_interactive_test(
             };
         }
         Err(e) => {
-            let _ = fs::remove_file(&tout_file);
-            let _ = fs::remove_file(&result_file);
+            let _ = fs::remove_dir_all(&run_dir);
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -725,7 +851,7 @@ pub fn judge_interactive_test(
         }
     };
 
-    let _ = fs::remove_file(&tout_file);
+    let _ = fs::remove_dir_all(&run_dir);
 
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
 
@@ -907,12 +1033,50 @@ pub fn judge_communication_test(
     limits: &Limits,
     cancel: &CancelToken,
 ) -> SingleTestResult {
-    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let base_dir = test
+        .input_path
+        .parent()
+        .and_then(|p| {
+            if p.file_name().is_some_and(|n| n == "tests") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })
+        .unwrap_or_else(|| Path::new("."));
+
+    let box_dir = uj_sandbox::create_isolated_box_dir(base_dir)
+        .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
+    let run_dir = box_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| box_dir.clone());
 
     let argv_sol = if let Some(cmd) = interpreter_cmd {
-        cmd.iter().map(std::ffi::OsString::from).collect()
+        let mut modified_cmd = Vec::new();
+        for (i, part) in cmd.iter().enumerate() {
+            if i == 0 {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            } else if Path::new(part).exists() {
+                let script_name = Path::new(part)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
+                let box_script = box_dir.join(script_name);
+                let _ = std::fs::copy(part, &box_script);
+                modified_cmd.push(box_script.into_os_string());
+            } else {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            }
+        }
+        modified_cmd
     } else {
-        vec![participant_exe.as_os_str().to_os_string()]
+        #[cfg(target_os = "windows")]
+        let box_exe = box_dir.join("prog.exe");
+        #[cfg(not(target_os = "windows"))]
+        let box_exe = box_dir.join("prog");
+        let _ = std::fs::copy(participant_exe, &box_exe);
+        uj_sandbox::prewarm_binary(&box_exe);
+        vec![box_exe.into_os_string()]
     };
 
     let mut mgr_limits = Limits::new(limits.cpu_time_ms * 2 + 5000, 1024 * 1024 * 1024);
@@ -924,7 +1088,7 @@ pub fn judge_communication_test(
             test.input_path.as_os_str().to_os_string(),
         ],
         env: vec![],
-        work_dir: scratch_dir.clone(),
+        work_dir: run_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::Inherit,
         stdout: Stdio::Pipe,
@@ -933,12 +1097,13 @@ pub fn judge_communication_test(
         limits: mgr_limits,
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: true,
     };
 
     let spec_sol = RunSpec {
         argv: argv_sol,
         env: vec![],
-        work_dir: scratch_dir,
+        work_dir: box_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::Pipe,
         stdout: Stdio::Pipe,
@@ -947,6 +1112,7 @@ pub fn judge_communication_test(
         limits: limits.clone(),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
+        trusted: false,
     };
 
     let wiring = Wiring {
@@ -969,6 +1135,7 @@ pub fn judge_communication_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) | Err(_) => {
+            let _ = fs::remove_dir_all(&run_dir);
             return SingleTestResult {
                 id: test.name.clone(),
                 subtask: test.subtask_id,
@@ -1021,6 +1188,10 @@ pub fn judge_communication_test(
     };
 
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
+
+    // Clean up isolated run directory
+    let _ = fs::remove_dir_all(&run_dir);
+
     SingleTestResult {
         id: test.name.clone(),
         subtask: test.subtask_id,

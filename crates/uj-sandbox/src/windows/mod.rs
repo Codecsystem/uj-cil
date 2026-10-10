@@ -14,7 +14,6 @@ use std::sync::Arc;
 pub struct WindowsSandbox {
     tier: Tier,
     app_container: Option<Arc<AppContainerProfile>>,
-    allow_fallback: bool,
 }
 
 impl WindowsSandbox {
@@ -26,13 +25,11 @@ impl WindowsSandbox {
             Tier::Degraded => Ok(Self {
                 tier: Tier::Degraded,
                 app_container: None,
-                allow_fallback: false,
             }),
             Tier::Full => match AppContainerProfile::get_shared() {
                 Ok(profile) => Ok(Self {
                     tier: Tier::Full,
                     app_container: Some(profile),
-                    allow_fallback,
                 }),
                 Err(err) => {
                     if !allow_fallback {
@@ -47,7 +44,6 @@ impl WindowsSandbox {
                     Ok(Self {
                         tier: Tier::Degraded,
                         app_container: None,
-                        allow_fallback: false,
                     })
                 }
             },
@@ -73,18 +69,23 @@ impl Sandbox for WindowsSandbox {
         )
         .map_err(|e| SandboxError::Internal(format!("Failed to set Job limits: {e}")))?;
 
-        // 3. Execute process with strict handle inheritance
-        let ac = self.app_container.as_deref();
-        match process::execute_in_job(spec, &job, ac, cancel, self.tier) {
-            Ok(result) => Ok(result),
-            Err(e) if self.allow_fallback && ac.is_some() => {
-                tracing::debug!(
-                    "AppContainer execution failed ({e}); falling back to Job Object (Degraded tier)"
+        if self.tier == Tier::Degraded {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "WARNING: Running in Degraded sandbox tier (Job Object only). Network and filesystem isolation are disabled."
                 );
-                process::execute_in_job(spec, &job, None, cancel, Tier::Degraded)
             }
-            Err(e) => Err(e),
         }
+
+        // 3. Execute process with strict handle inheritance
+        let ac = if spec.trusted {
+            None
+        } else {
+            self.app_container.as_deref()
+        };
+        process::execute_in_job(spec, &job, ac, cancel, self.tier)
     }
 
     fn run_group(
@@ -94,16 +95,7 @@ impl Sandbox for WindowsSandbox {
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
         let ac = self.app_container.as_deref();
-        match process::execute_group_in_jobs(specs, wiring, ac, cancel, self.tier) {
-            Ok(results) => Ok(results),
-            Err(e) if self.allow_fallback && ac.is_some() => {
-                tracing::debug!(
-                    "AppContainer run_group failed ({e}); falling back to Job Object (Degraded tier)"
-                );
-                process::execute_group_in_jobs(specs, wiring, None, cancel, Tier::Degraded)
-            }
-            Err(e) => Err(e),
-        }
+        process::execute_group_in_jobs(specs, wiring, ac, cancel, self.tier)
     }
 
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError> {

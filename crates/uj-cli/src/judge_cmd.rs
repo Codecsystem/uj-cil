@@ -136,8 +136,36 @@ pub fn run_judge(
 
     let scheduler = Scheduler::new(judge_options);
     let mut overall_exit = ExitCode::from(EXIT_SUCCESS);
+    let mut json_reports: Vec<serde_json::Value> = Vec::new();
 
-    for source in sources {
+    let mut expanded_sources = Vec::new();
+    for s in sources {
+        let s_str = s.to_string_lossy();
+        if s_str.contains('*') || s_str.contains('?') {
+            let parent = s.parent().unwrap_or_else(|| Path::new("."));
+            let pattern = s.file_name().unwrap_or_default().to_string_lossy();
+            if let Ok(entries) = fs::read_dir(parent) {
+                let mut matched = Vec::new();
+                let glob = globset::Glob::new(&pattern).ok().map(|g| g.compile_matcher());
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(ref matcher) = glob
+                        && matcher.is_match(entry.file_name())
+                    {
+                        matched.push(path);
+                    }
+                }
+                matched.sort();
+                if !matched.is_empty() {
+                    expanded_sources.extend(matched);
+                    continue;
+                }
+            }
+        }
+        expanded_sources.push(s.clone());
+    }
+
+    for source in &expanded_sources {
         if cancel.is_cancelled() {
             return ExitCode::from(EXIT_INTERRUPTED);
         }
@@ -291,30 +319,34 @@ pub fn run_judge(
                     });
                 }
 
+                let err_msg = match &e {
+                    CompileError::Failed(msg) => msg.clone(),
+                    other => other.to_string(),
+                };
+                let ce_report = serde_json::json!({
+                    "schema_version": 1,
+                    "problem": problem_config.name,
+                    "submission": source.file_name().unwrap_or_default().to_string_lossy(),
+                    "verdict": "CE",
+                    "score": 0.0,
+                    "max_time_ms": 0,
+                    "max_memory_kb": 0,
+                    "subtasks": [],
+                    "tests": [],
+                    "compile_error": err_msg
+                });
+
                 if format == OutputFormat::Json {
-                    let err_msg = match &e {
-                        CompileError::Failed(msg) => msg.clone(),
-                        other => other.to_string(),
-                    };
-                    let ce_report = serde_json::json!({
-                        "schema_version": 1,
-                        "problem": problem_config.name,
-                        "submission": source.file_name().unwrap_or_default().to_string_lossy(),
-                        "verdict": "CE",
-                        "score": 0.0,
-                        "max_time_ms": 0,
-                        "max_memory_kb": 0,
-                        "subtasks": [],
-                        "tests": [],
-                        "compile_error": err_msg
-                    });
-                    println!("{}", serde_json::to_string_pretty(&ce_report).unwrap());
+                    json_reports.push(ce_report);
                 } else if format == OutputFormat::Human {
                     eprintln!("=== Compilation Error: {} ===", source.display());
                     eprintln!("{e}");
                 }
 
-                return ExitCode::from(EXIT_COMPILE_ERROR);
+                if overall_exit == ExitCode::from(EXIT_SUCCESS) {
+                    overall_exit = ExitCode::from(EXIT_COMPILE_ERROR);
+                }
+                continue;
             }
         };
 
@@ -344,7 +376,7 @@ pub fn run_judge(
 
                 match format {
                     OutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                        json_reports.push(serde_json::to_value(&report).unwrap());
                     }
                     OutputFormat::Human => {
                         println!("{}", format_human_report(&report));
@@ -366,20 +398,37 @@ pub fn run_judge(
                 }
             }
             Err(e) => {
+                let err_obj = serde_json::json!({
+                    "schema_version": 1,
+                    "problem": problem_config.name,
+                    "submission": source.file_name().unwrap_or_default().to_string_lossy(),
+                    "verdict": "SE",
+                    "score": 0.0,
+                    "max_time_ms": 0,
+                    "max_memory_kb": 0,
+                    "subtasks": [],
+                    "tests": [],
+                    "judge_failed_error": e.to_string()
+                });
+
                 if format == OutputFormat::Json {
-                    let err_obj = serde_json::json!({
-                        "ok": false,
-                        "error": {
-                            "kind": "JudgeFailed",
-                            "message": e.to_string(),
-                        }
-                    });
-                    println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
+                    json_reports.push(err_obj);
                 } else {
                     eprintln!("Judging failed: {e}");
                 }
-                return ExitCode::from(EXIT_JUDGE_FAILED);
+                overall_exit = ExitCode::from(EXIT_JUDGE_FAILED);
             }
+        }
+    }
+
+    if format == OutputFormat::Json {
+        if json_reports.len() == 1 {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json_reports[0]).unwrap()
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&json_reports).unwrap());
         }
     }
 

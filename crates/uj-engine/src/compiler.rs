@@ -2,8 +2,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const DEFAULT_LANGUAGES_TOML: &str = include_str!("../../../assets/languages.toml");
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
@@ -33,6 +35,7 @@ pub enum Language {
     C,
     Rust,
     Python,
+    Java,
 }
 
 impl Language {
@@ -48,6 +51,7 @@ impl Language {
             "c" => Ok(Self::C),
             "rs" => Ok(Self::Rust),
             "py" => Ok(Self::Python),
+            "java" => Ok(Self::Java),
             other => Err(CompileError::UnsupportedExtension(other.to_string())),
         }
     }
@@ -58,6 +62,7 @@ impl Language {
             Self::C => "c",
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::Java => "java",
         }
     }
 }
@@ -77,13 +82,53 @@ impl Compiler {
         include_dirs: &[PathBuf],
         no_cache: bool,
     ) -> Result<CompileResult, CompileError> {
-        let lang = Language::from_path(source_path)?;
+        let start = Instant::now();
         let source_bytes = fs::read(source_path)?;
 
-        let start = Instant::now();
+        let problem_dir = source_path
+            .ancestors()
+            .find(|p| p.join("problem.toml").exists() || p.join(".uj").exists());
 
-        if lang == Language::Python {
-            // Python is interpreted, verify syntax with py_compile
+        // 1. Load and merge languages.toml
+        let mut lang_configs =
+            uj_core::config::LanguagesConfig::from_toml_str(DEFAULT_LANGUAGES_TOML, None)
+                .unwrap_or_default();
+
+        if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+            let global_cfg_path = Path::new(&home)
+                .join(".config")
+                .join("uj")
+                .join("languages.toml");
+            if global_cfg_path.is_file()
+                && let Ok(content) = fs::read_to_string(&global_cfg_path)
+                && let Ok(c) =
+                    uj_core::config::LanguagesConfig::from_toml_str(&content, Some(&global_cfg_path))
+            {
+                lang_configs.merge_overlay(c);
+            }
+        }
+
+        if let Some(prob_dir) = problem_dir {
+            let prob_cfg_path = prob_dir.join("languages.toml");
+            if prob_cfg_path.is_file()
+                && let Ok(content) = fs::read_to_string(&prob_cfg_path)
+                && let Ok(c) =
+                    uj_core::config::LanguagesConfig::from_toml_str(&content, Some(&prob_cfg_path))
+            {
+                lang_configs.merge_overlay(c);
+            }
+        }
+
+        let ext = source_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        let (lang_id, lang_cfg) = lang_configs
+            .find_by_extension(ext)
+            .ok_or_else(|| CompileError::UnsupportedExtension(ext.to_string()))?;
+
+        // 2. Handle interpreted languages (e.g. Python)
+        if ext.eq_ignore_ascii_case("py") {
             let python_bin = which::which("python3")
                 .or_else(|_| which::which("python"))
                 .map_err(|_| CompileError::CompilerNotFound("python3/python".to_string()))?;
@@ -112,38 +157,14 @@ impl Compiler {
             });
         }
 
-        // Determine compiler and default flags
-        let (compiler_name, default_args) = match lang {
-            Language::Cpp => (
-                "g++",
-                vec![
-                    "-O3",
-                    "-std=c++17",
-                    "-Wall",
-                    "-Wextra",
-                    #[cfg(windows)]
-                    "-Wl,--stack,268435456",
-                    #[cfg(windows)]
-                    "-static",
-                ],
-            ),
-            Language::C => (
-                "gcc",
-                vec![
-                    "-O3",
-                    "-Wall",
-                    #[cfg(windows)]
-                    "-Wl,--stack,268435456",
-                    #[cfg(windows)]
-                    "-static",
-                ],
-            ),
-            Language::Rust => ("rustc", vec!["-O"]),
-            Language::Python => unreachable!(),
-        };
+        // 3. Resolve compile command template from lang_cfg
+        let compile_template = lang_cfg.compile.as_ref().ok_or_else(|| {
+            CompileError::Failed(format!("Language '{lang_id}' has no compile command defined"))
+        })?;
 
-        let compiler_bin = which::which(compiler_name)
-            .map_err(|_| CompileError::CompilerNotFound(compiler_name.to_string()))?;
+        let compiler_cmd_name = &compile_template[0];
+        let compiler_bin = which::which(compiler_cmd_name)
+            .map_err(|_| CompileError::CompilerNotFound(compiler_cmd_name.to_string()))?;
 
         // Query compiler version for cache key uniqueness
         let version_output = Command::new(&compiler_bin)
@@ -153,12 +174,19 @@ impl Compiler {
             .unwrap_or_default();
         let version_line = version_output.lines().next().unwrap_or("unknown");
 
-        // Compute Blake3 cache key
+        // 4. Compute Blake3 cache key (including source, flags, version, and headers)
         let mut hasher = blake3::Hasher::new();
-        hasher.update(lang.id().as_bytes());
+        hasher.update(lang_id.as_bytes());
         hasher.update(version_line.as_bytes());
-        for arg in &default_args {
-            hasher.update(arg.as_bytes());
+        for t in compile_template {
+            hasher.update(t.as_bytes());
+        }
+        if cfg!(windows)
+            && let Some(ref win_extra) = lang_cfg.compile_windows_extra
+        {
+            for arg in win_extra {
+                hasher.update(arg.as_bytes());
+            }
         }
         hasher.update(&source_bytes);
         for extra in extra_sources {
@@ -167,12 +195,46 @@ impl Compiler {
                 hasher.update(&b);
             }
         }
+
+        // Include headers in include dirs and problem dir
         for inc in include_dirs {
             hasher.update(inc.to_string_lossy().as_bytes());
+            if inc.is_dir()
+                && let Ok(entries) = fs::read_dir(inc)
+            {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "h" || e == "hpp")
+                        && let Ok(bytes) = fs::read(&path)
+                    {
+                        hasher.update(path.to_string_lossy().as_bytes());
+                        hasher.update(&bytes);
+                    }
+                }
+            }
         }
+
+        if let Some(src_parent) = source_path.parent()
+            && src_parent.is_dir()
+            && let Ok(entries) = fs::read_dir(src_parent)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "h" || e == "hpp")
+                    && let Ok(bytes) = fs::read(&path)
+                {
+                    hasher.update(path.to_string_lossy().as_bytes());
+                    hasher.update(&bytes);
+                }
+            }
+        }
+
         let cache_hash = hasher.finalize().to_hex().to_string();
 
-        let cache_dir = PathBuf::from(".uj/cache/bin").join(&cache_hash);
+        let base_cache_dir = problem_dir
+            .map(|p| p.join(".uj").join("cache").join("bin"))
+            .unwrap_or_else(|| PathBuf::from(".uj/cache/bin"));
+        let cache_dir = base_cache_dir.join(&cache_hash);
         let exe_ext = if cfg!(windows) { ".exe" } else { "" };
         let cached_bin = cache_dir.join(format!("prog{exe_ext}"));
 
@@ -187,25 +249,76 @@ impl Compiler {
             });
         }
 
-        // Perform compilation
         fs::create_dir_all(&cache_dir)?;
 
-        let mut cmd = Command::new(&compiler_bin);
-        for arg in &default_args {
-            cmd.arg(arg);
+        // 5. Construct compiler command arguments
+        let mut final_args = Vec::new();
+        for arg in &compile_template[1..] {
+            match arg.as_str() {
+                "{exe}" => final_args.push(cached_bin.to_string_lossy().to_string()),
+                "{src}" => final_args.push(source_path.to_string_lossy().to_string()),
+                "{dir}" => final_args.push(cache_dir.to_string_lossy().to_string()),
+                "{extra_srcs}" => {
+                    for extra in extra_sources {
+                        final_args.push(extra.to_string_lossy().to_string());
+                    }
+                }
+                "{stack_bytes}" => final_args.push("268435456".to_string()),
+                "{stack_mb}" => final_args.push("256".to_string()),
+                "{memory_mb}" => final_args.push("256".to_string()),
+                other => final_args.push(other.to_string()),
+            }
         }
-        for inc in include_dirs {
-            cmd.arg("-I");
-            cmd.arg(inc);
-        }
-        cmd.arg(source_path);
-        for extra in extra_sources {
-            cmd.arg(extra);
-        }
-        cmd.arg("-o");
-        cmd.arg(&cached_bin);
 
-        let output = cmd.output()?;
+        // Add include dirs
+        for inc in include_dirs {
+            final_args.push("-I".to_string());
+            final_args.push(inc.to_string_lossy().to_string());
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(ref win_extra) = lang_cfg.compile_windows_extra {
+                for extra in win_extra {
+                    let replaced = extra
+                        .replace("{stack_bytes}", "268435456")
+                        .replace("{stack_mb}", "256");
+                    final_args.push(replaced);
+                }
+            }
+        }
+
+        // 6. Spawn compiler process with 30s timeout
+        let mut cmd = Command::new(&compiler_bin);
+        cmd.args(&final_args);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+        let timeout = Duration::from_secs(30);
+        let mut timed_out = false;
+
+        loop {
+            match child.try_wait()? {
+                Some(_) => break,
+                None => {
+                    if start.elapsed() > timeout {
+                        timed_out = true;
+                        let _ = child.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        if timed_out {
+            return Err(CompileError::Failed(
+                "Compilation timed out (30s limit exceeded)".to_string(),
+            ));
+        }
+
+        let output = child.wait_with_output()?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let combined_output = format!(
@@ -218,6 +331,9 @@ impl Compiler {
             let truncated = truncate_10k(&combined_output);
             return Err(CompileError::Failed(truncated));
         }
+
+        // 7. Prewarm binary on Windows to eliminate cold Defender latency on 1st run
+        uj_sandbox::prewarm_binary(&cached_bin);
 
         Ok(CompileResult {
             binary_path: cached_bin,
@@ -233,7 +349,11 @@ impl Compiler {
 fn truncate_10k(s: &str) -> String {
     const LIMIT: usize = 10 * 1024;
     if s.len() > LIMIT {
-        format!("{}\n... [Output truncated to 10 KiB]", &s[..LIMIT])
+        let mut end = LIMIT;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n... [Output truncated to 10 KiB]", &s[..end])
     } else {
         s.to_string()
     }
@@ -261,6 +381,10 @@ mod tests {
             Language::from_path(Path::new("sol.py")).unwrap(),
             Language::Python
         );
+        assert_eq!(
+            Language::from_path(Path::new("sol.java")).unwrap(),
+            Language::Java
+        );
         assert!(Language::from_path(Path::new("sol.xyz")).is_err());
     }
 
@@ -272,6 +396,13 @@ mod tests {
         let long = "a".repeat(20000);
         let truncated = truncate_10k(&long);
         assert!(truncated.len() <= 10240 + 100);
+        assert!(truncated.contains("Output truncated to 10 KiB"));
+    }
+
+    #[test]
+    fn test_truncate_10k_multibyte() {
+        let s = "你好世界！".repeat(2000);
+        let truncated = truncate_10k(&s);
         assert!(truncated.contains("Output truncated to 10 KiB"));
     }
 }

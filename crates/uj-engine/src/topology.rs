@@ -22,13 +22,17 @@ impl Topology {
     /// - slots minimum is always 1.
     pub fn detect(memory_limit_bytes: u64, user_jobs: Option<usize>) -> Self {
         let logical_cores = num_cpus::get();
-        let physical_cores = num_cpus::get_physical().max(1);
+        let p_cores = uj_sandbox::detect_p_core_primary_cpus();
+        let physical_p_cores = p_cores.len().max(1);
 
-        let default_slots = if physical_cores > 1 {
-            physical_cores - 1
+        // Reserve p_cores[0] for uj, allocate worker cores from p_cores[1..]
+        let available_worker_cores = if p_cores.len() > 1 {
+            p_cores[1..].to_vec()
         } else {
-            1
+            p_cores.clone()
         };
+
+        let default_slots = available_worker_cores.len().max(1);
 
         // Determine available memory constraint
         let memory_constrained_slots = if memory_limit_bytes > 0 {
@@ -47,17 +51,12 @@ impl Topology {
 
         let mut slots = Vec::with_capacity(final_count);
         for id in 0..final_count {
-            // Reserve core 0 for uj, bind workers to core 1, 2, ...
-            let cpu_core = if physical_cores > 1 {
-                Some((id % (physical_cores - 1)) + 1)
-            } else {
-                Some(0)
-            };
+            let cpu_core = Some(available_worker_cores[id % available_worker_cores.len()]);
             slots.push(Slot { id, cpu_core });
         }
 
         Self {
-            physical_cores,
+            physical_cores: physical_p_cores,
             logical_cores,
             slots,
         }
@@ -71,6 +70,7 @@ mod tests {
     #[test]
     fn test_topology_detection() {
         let topo = Topology::detect(256 * 1024 * 1024, None);
+        println!("Topology: p_cores={}, logical={}, slots={:?}", topo.physical_cores, topo.logical_cores, topo.slots);
         assert!(topo.physical_cores >= 1);
         assert!(topo.logical_cores >= 1);
         assert!(!topo.slots.is_empty());

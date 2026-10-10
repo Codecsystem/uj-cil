@@ -28,6 +28,7 @@ crossbeam-channel.workspace = true
 blake3.workspace = true
 regex.workspace = true
 indicatif.workspace = true
+globset.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

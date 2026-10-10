@@ -1,0 +1,11 @@
+schema = 1
+name = "evil"
+type = "traditional"
+[limits]
+time = "1s"
+memory = "256MiB"
+[io]
+mode = "stdio"
+[checker]
+type = "builtin"
+name = "wcmp"

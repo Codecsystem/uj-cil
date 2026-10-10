@@ -21,7 +21,7 @@ use crate::judge::{
     ResolvedChecker, aggregate_submission_report, judge_communication_test, judge_interactive_test,
     judge_output_only_test, judge_single_test,
 };
-use crate::topology::{Slot, Topology};
+use crate::topology::Topology;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -59,14 +59,6 @@ impl Scheduler {
             .to_limits()
             .map_err(|e| SchedulerError::Config(e.to_string()))?;
         let topology = Topology::detect(limits.memory_bytes, user_jobs);
-
-        #[cfg(windows)]
-        {
-            let _ =
-                uj_sandbox::windows::security::AppContainerProfile::grant_all_application_packages(
-                    problem_dir,
-                );
-        }
 
         let pe_as_wa = problem_config.checker.pe_as_wa;
 
@@ -229,14 +221,15 @@ impl Scheduler {
         let failed_subtasks: Arc<Mutex<std::collections::HashSet<u32>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
 
-        let (task_tx, task_rx) = unbounded::<(Slot, TestCase)>();
+        let (task_tx, task_rx) = unbounded::<TestCase>();
         let (result_tx, result_rx) = bounded::<SingleTestResult>(total_tests.max(1));
 
         let slot_count = topology.slots.len();
         let mut worker_handles = Vec::with_capacity(slot_count);
 
         // Spawn workers
-        for _ in 0..slot_count {
+        for worker_id in 0..slot_count {
+            let slot = topology.slots[worker_id].clone();
             let task_rx_clone = task_rx.clone();
             let result_tx_clone = result_tx.clone();
             let cancel_clone = cancel.clone();
@@ -259,7 +252,7 @@ impl Scheduler {
                     Err(_) => return,
                 };
 
-                while let Ok((s, test)) = task_rx_clone.recv() {
+                while let Ok(test) = task_rx_clone.recv() {
                     if cancel_clone.is_cancelled() {
                         break;
                     }
@@ -338,7 +331,7 @@ impl Scheduler {
                                     &limits_clone,
                                     &checker_clone,
                                     pe_as_wa,
-                                    s.cpu_core,
+                                    slot.cpu_core,
                                     &cancel_clone,
                                 )
                             }
@@ -351,7 +344,7 @@ impl Scheduler {
                             &limits_clone,
                             &checker_clone,
                             pe_as_wa,
-                            s.cpu_core,
+                            slot.cpu_core,
                             &cancel_clone,
                         ),
                     };
@@ -377,10 +370,8 @@ impl Scheduler {
         drop(result_tx); // Close original sender so result_rx terminates
 
         // Push tasks
-        let slots = &topology.slots;
-        for (i, test) in sorted_tests.into_iter().enumerate() {
-            let slot = slots[i % slot_count].clone();
-            let _ = task_tx.send((slot, test));
+        for test in sorted_tests {
+            let _ = task_tx.send(test);
         }
         drop(task_tx); // Close task sender so workers complete
 
@@ -467,7 +458,7 @@ impl Scheduler {
                                 &limits,
                                 &resolved_checker,
                                 pe_as_wa,
-                                Some(1),
+                                topology.slots.first().and_then(|s| s.cpu_core),
                                 cancel,
                             ),
                         };

@@ -606,6 +606,7 @@ fn dispatch_tool_call(
                     limits: Limits::new(5000, 512 * 1024 * 1024),
                     cpu_affinity: None,
                     seccomp_profile: Default::default(),
+                    trusted: true,
                 };
                 let gen_res = sandbox.run(&gen_spec, cancel)?;
                 let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
@@ -627,6 +628,7 @@ fn dispatch_tool_call(
                     limits: Limits::new(2000, 256 * 1024 * 1024),
                     cpu_affinity: None,
                     seccomp_profile: Default::default(),
+                    trusted: false,
                 };
                 let sol_res = sandbox.run(&sol_spec, cancel)?;
                 let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
@@ -644,6 +646,7 @@ fn dispatch_tool_call(
                     limits: Limits::new(5000, 256 * 1024 * 1024),
                     cpu_affinity: None,
                     seccomp_profile: Default::default(),
+                    trusted: false,
                 };
                 let brute_res = sandbox.run(&brute_spec, cancel)?;
                 let brute_bytes = brute_res.stdout.map(|o| o.bytes).unwrap_or_default();

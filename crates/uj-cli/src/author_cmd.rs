@@ -448,6 +448,7 @@ pub fn run_gen(
                 limits,
                 cpu_affinity: None,
                 seccomp_profile: Default::default(),
+                trusted: true,
             };
 
             let res = match sandbox.run(&spec, cancel) {
@@ -562,6 +563,7 @@ pub fn run_validate(problem_dir: &Path, format: OutputFormat, cancel: &CancelTok
             limits,
             cpu_affinity: None,
             seccomp_profile: Default::default(),
+            trusted: true,
         };
 
         let res = match sandbox.run(&spec, cancel) {
@@ -709,6 +711,7 @@ pub fn run_ans(
             limits,
             cpu_affinity: None,
             seccomp_profile: Default::default(),
+            trusted: false,
         };
 
         let res = match sandbox.run(&spec, cancel) {
@@ -1215,6 +1218,7 @@ pub fn run_stress(
             limits: limits.clone(),
             cpu_affinity: None,
             seccomp_profile: Default::default(),
+            trusted: true,
         };
 
         let gen_res = match sandbox.run(&spec_gen, cancel) {
@@ -1245,6 +1249,7 @@ pub fn run_stress(
             limits: limits.clone(),
             cpu_affinity: None,
             seccomp_profile: Default::default(),
+            trusted: false,
         };
 
         let sol_res = match sandbox.run(&spec_sol, cancel) {
@@ -1269,6 +1274,7 @@ pub fn run_stress(
             limits,
             cpu_affinity: None,
             seccomp_profile: Default::default(),
+            trusted: false,
         };
 
         let brute_res = match sandbox.run(&spec_brute, cancel) {

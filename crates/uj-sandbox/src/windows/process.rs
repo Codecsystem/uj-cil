@@ -143,6 +143,14 @@ pub(crate) unsafe fn spawn_suspended_process(
     let app_name_utf16: Vec<u16> = exe_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let pcwstr_app_name = PCWSTR(app_name_utf16.as_ptr());
 
+    unsafe {
+        windows::Win32::System::Diagnostics::Debug::SetErrorMode(
+            windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
+                | windows::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX
+                | windows::Win32::System::Diagnostics::Debug::SEM_NOOPENFILEERRORBOX,
+        );
+    }
+
     let spawn_res = unsafe {
         CreateProcessW(
             pcwstr_app_name,
@@ -243,7 +251,6 @@ pub fn execute_in_job(
 
     // Monitoring loop
     let mut killed_by: Option<KillReason> = None;
-    let poll_interval = Duration::from_millis(5);
 
     loop {
         // 1. Cancellation check
@@ -277,7 +284,13 @@ pub fn execute_in_job(
             break;
         }
 
-        // 5. Memory check
+        // 5. Check if process terminated
+        let wait_res = unsafe { WaitForSingleObject(pi.hProcess, 5) };
+        if wait_res == WAIT_OBJECT_0 {
+            break;
+        }
+
+        // 6. Memory check
         if let Ok(peak_mem) = job.query_peak_memory_bytes()
             && peak_mem > spec.limits.memory_bytes
         {
@@ -285,14 +298,6 @@ pub fn execute_in_job(
             let _ = job.terminate(3);
             break;
         }
-
-        // 6. Check if process terminated
-        let wait_res = unsafe { WaitForSingleObject(pi.hProcess, 5) };
-        if wait_res == WAIT_OBJECT_0 {
-            break;
-        }
-
-        thread::sleep(poll_interval);
     }
 
     let wall_time_us = start_time.elapsed().as_micros() as u64;
@@ -446,7 +451,7 @@ pub fn execute_group_in_jobs(
         )
         .map_err(|e| SandboxError::Internal(format!("Failed to set limits for proc {i}: {e}")))?;
 
-        let ac = if i == 0 { app_container } else { None };
+        let ac = if specs[i].trusted { None } else { app_container };
         let pi = unsafe {
             spawn_suspended_process(
                 &specs[i],
@@ -592,18 +597,6 @@ pub fn execute_group_in_jobs(
                 continue;
             }
 
-            // Memory check
-            if let Ok(mem) = jobs[i].query_peak_memory_bytes()
-                && mem > specs[i].limits.memory_bytes
-            {
-                killed_by[i] = Some(KillReason::MemoryLimit);
-                let _ = jobs[i].terminate(3);
-                finished[i] = true;
-                exit_order[i] = Some(order_counter);
-                order_counter += 1;
-                continue;
-            }
-
             // Process exit check
             let wait_res = unsafe { WaitForSingleObject(proc_infos[i].hProcess, 0) };
             if wait_res == WAIT_OBJECT_0 {
@@ -623,6 +616,19 @@ pub fn execute_group_in_jobs(
                 final_cpu_us[i] = jobs[i].query_cpu_time_us().unwrap_or(0);
                 final_peak_mem[i] = jobs[i].query_peak_memory_bytes().unwrap_or(0);
                 final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+                continue;
+            }
+
+            // Memory check
+            if let Ok(mem) = jobs[i].query_peak_memory_bytes()
+                && mem > specs[i].limits.memory_bytes
+            {
+                killed_by[i] = Some(KillReason::MemoryLimit);
+                let _ = jobs[i].terminate(3);
+                finished[i] = true;
+                exit_order[i] = Some(order_counter);
+                order_counter += 1;
+                continue;
             }
         }
 
@@ -932,4 +938,113 @@ fn build_environment_block(
     // Double null termination
     block.push(0);
     block
+}
+
+/// Pre-warm newly compiled binary to trigger Windows Defender scan ahead of timed execution.
+/// Creates the process suspended, waits 50ms for Defender filter driver to attach, then terminates.
+pub fn prewarm_binary(exe_path: &Path) {
+    let app_name_utf16: Vec<u16> = exe_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let pcwstr_app_name = PCWSTR(app_name_utf16.as_ptr());
+
+    let si = windows::Win32::System::Threading::STARTUPINFOW {
+        cb: size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+
+    unsafe {
+        let res = CreateProcessW(
+            pcwstr_app_name,
+            windows_core::PWSTR::null(),
+            None,
+            None,
+            false,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            None,
+            None,
+            &si,
+            &mut pi,
+        );
+        if res.is_ok() {
+            thread::sleep(Duration::from_millis(50));
+            let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 0);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+    }
+}
+
+/// Detect primary logical CPU IDs for physical P-cores on Windows.
+/// Uses `GetLogicalProcessorInformationEx` with `RelationProcessorCore`,
+/// filters to maximum `EfficiencyClass` (P-cores only on hybrid Intel),
+/// and selects the primary CPU for each core using `mask.trailing_zeros()`
+/// (skipping hyperthreading siblings).
+pub fn detect_p_core_primary_cpus() -> Vec<usize> {
+    use windows::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+
+    let mut len: u32 = 0;
+    unsafe {
+        let _ = GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut len);
+    }
+    if len == 0 {
+        return (0..num_cpus::get()).collect();
+    }
+
+    let mut buffer = vec![0u8; len as usize];
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            Some(buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX),
+            &mut len,
+        )
+    };
+    if ok.is_err() {
+        return (0..num_cpus::get()).collect();
+    }
+
+    struct CoreInfo {
+        efficiency_class: u8,
+        primary_cpu: usize,
+    }
+
+    let mut cores: Vec<CoreInfo> = Vec::new();
+    let mut offset = 0;
+    while offset + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= len as usize {
+        let ptr = unsafe {
+            buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+        };
+        let record = unsafe { &*ptr };
+        if record.Relationship == RelationProcessorCore {
+            let core = unsafe { record.Anonymous.Processor };
+            let mask = core.GroupMask[0].Mask;
+            let efficiency_class = core.EfficiencyClass;
+            let primary_cpu = mask.trailing_zeros() as usize;
+            cores.push(CoreInfo {
+                efficiency_class,
+                primary_cpu,
+            });
+        }
+        offset += record.Size as usize;
+    }
+
+    if cores.is_empty() {
+        return (0..num_cpus::get()).collect();
+    }
+
+    let max_class = cores.iter().map(|c| c.efficiency_class).max().unwrap_or(0);
+    let mut p_cores: Vec<usize> = cores
+        .into_iter()
+        .filter(|c| c.efficiency_class == max_class)
+        .map(|c| c.primary_cpu)
+        .collect();
+    p_cores.sort_unstable();
+    p_cores.dedup();
+    if p_cores.is_empty() {
+        (0..num_cpus::get()).collect()
+    } else {
+        p_cores
+    }
 }

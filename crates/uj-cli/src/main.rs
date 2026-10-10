@@ -142,6 +142,7 @@ fn main() -> ExitCode {
                 limits: uj_core::run::Limits::new(5000, 512 * 1024 * 1024),
                 cpu_affinity: None,
                 seccomp_profile: Default::default(),
+                trusted: false,
             };
 
             match sandbox.run(&spec, &cancel) {
