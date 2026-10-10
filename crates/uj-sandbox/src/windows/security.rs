@@ -1,7 +1,7 @@
 //! AppContainer and token isolation for Windows sandbox.
 
 use windows::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{FreeSid, PSID};
 use windows_core::PCWSTR;
@@ -9,6 +9,7 @@ use windows_core::PCWSTR;
 pub struct AppContainerProfile {
     sid: PSID,
     name: String,
+    is_transient: bool,
 }
 
 // SAFETY: PSID points to an OS-allocated immutable SID structure that is safe to read across threads.
@@ -16,17 +17,26 @@ unsafe impl Send for AppContainerProfile {}
 // SAFETY: PSID points to an OS-allocated immutable SID structure that is safe to read across threads.
 unsafe impl Sync for AppContainerProfile {}
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 static SHARED_PROFILE: OnceLock<Result<Arc<AppContainerProfile>, String>> = OnceLock::new();
+static PROFILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl AppContainerProfile {
     pub const DEFAULT_NAME: &'static str = "uj.sandbox";
 
+    /// Create an isolated profile unique to this sandbox instance / worker slot.
+    pub fn create_isolated() -> Result<Self, std::io::Error> {
+        let count = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("uj.sandbox.{}.{}", std::process::id(), count);
+        Self::create_internal(&name, true)
+    }
+
     /// Get or initialize the shared AppContainer profile.
     pub fn get_shared() -> Result<Arc<Self>, std::io::Error> {
         let cached = SHARED_PROFILE.get_or_init(|| {
-            Self::get_or_create(None)
+            Self::create_internal(Self::DEFAULT_NAME, false)
                 .map(Arc::new)
                 .map_err(|e| e.to_string())
         });
@@ -40,6 +50,10 @@ impl AppContainerProfile {
     /// Initialize or derive AppContainer SID.
     pub fn get_or_create(name: Option<&str>) -> Result<Self, std::io::Error> {
         let name_str = name.unwrap_or(Self::DEFAULT_NAME);
+        Self::create_internal(name_str, false)
+    }
+
+    fn create_internal(name_str: &str, is_transient: bool) -> Result<Self, std::io::Error> {
         let name_utf16: Vec<u16> = name_str.encode_utf16().chain(Some(0)).collect();
         let pcwstr = PCWSTR(name_utf16.as_ptr());
 
@@ -62,6 +76,7 @@ impl AppContainerProfile {
             Ok(sid) => Ok(Self {
                 sid,
                 name: name_str.to_string(),
+                is_transient,
             }),
             Err(e) => {
                 // If profile already exists (HRESULT: 0x800700B7 or ERROR_ALREADY_EXISTS), derive existing SID
@@ -72,6 +87,7 @@ impl AppContainerProfile {
                     return Ok(Self {
                         sid,
                         name: name_str.to_string(),
+                        is_transient,
                     });
                 }
                 Err(std::io::Error::from_raw_os_error(e.code().0))
@@ -136,6 +152,13 @@ impl Drop for AppContainerProfile {
         if !self.sid.is_invalid() {
             unsafe {
                 let _ = FreeSid(self.sid);
+            }
+        }
+        if self.is_transient {
+            let name_utf16: Vec<u16> = self.name.encode_utf16().chain(Some(0)).collect();
+            let pcwstr = PCWSTR(name_utf16.as_ptr());
+            unsafe {
+                let _ = DeleteAppContainerProfile(pcwstr);
             }
         }
     }

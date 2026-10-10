@@ -109,15 +109,19 @@ pub fn judge_single_test(
     };
 
     let start_instant = Instant::now();
+    #[allow(unused_mut)]
     let mut run_res = sandbox.run(&spec, cancel);
+    #[allow(unused_mut)]
     let mut duration_ms = start_instant.elapsed().as_millis() as u64;
 
     // Windows Defender mitigation retry:
     // Only allowed on the FIRST execution of a binary to avoid 10s stalls on real blocking/sleep tests.
+    #[cfg(windows)]
     static RETRIED_BINARIES: std::sync::LazyLock<
         parking_lot::Mutex<std::collections::HashSet<PathBuf>>,
     > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
+    #[cfg(windows)]
     if let Ok(ref res) = run_res {
         let cpu_ms = res.cpu_time_us / 1000;
         let threshold_ms = ((limits.cpu_time_ms / 10).max(50)).min(limits.cpu_time_ms);
@@ -162,6 +166,7 @@ pub fn judge_single_test(
                     confidence: "low".to_string(),
                     samples_ms: vec![],
                 },
+                sandbox_tier: Some(sandbox.tier()),
             };
         }
     };
@@ -396,6 +401,7 @@ pub fn judge_single_test(
             },
             samples_ms: vec![time_ms],
         },
+        sandbox_tier: Some(res.sandbox_tier),
     }
 }
 
@@ -406,6 +412,11 @@ pub fn aggregate_submission_report(
     config: &ProblemConfig,
     test_results: Vec<SingleTestResult>,
 ) -> SubmissionJudgeReport {
+    assert!(
+        !test_results.is_empty(),
+        "aggregate_submission_report called with empty test_results: tests must not be empty"
+    );
+
     let mut subtask_map: std::collections::BTreeMap<u32, Vec<&SingleTestResult>> =
         std::collections::BTreeMap::new();
     let mut unassigned_tests: Vec<&SingleTestResult> = Vec::new();
@@ -444,7 +455,7 @@ pub fn aggregate_submission_report(
         let (st_verdict, st_score_fixed) = if dep_failed {
             (Verdict::Skipped, 0i64)
         } else if tests.is_empty() {
-            (Verdict::Accepted, st_max_fixed)
+            (Verdict::JudgeFailed, 0i64)
         } else {
             let mut worst = Verdict::Accepted;
             for t in &tests {
@@ -511,14 +522,15 @@ pub fn aggregate_submission_report(
         100.0
     };
 
-    let final_submission_verdict =
-        if (total_score - max_possible_score).abs() < 1e-6 && max_possible_score > 0.0 {
-            worst_verdict
-        } else if total_score > 0.0 && worst_verdict == Verdict::WrongAnswer {
-            Verdict::PartiallyCorrect
-        } else {
-            worst_verdict
-        };
+    let final_submission_verdict = if test_results.is_empty() {
+        Verdict::JudgeFailed
+    } else if (total_score - max_possible_score).abs() < 1e-6 && max_possible_score > 0.0 {
+        worst_verdict
+    } else if total_score > 0.0 && worst_verdict == Verdict::WrongAnswer {
+        Verdict::PartiallyCorrect
+    } else {
+        worst_verdict
+    };
 
     let max_time_ms = test_results.iter().map(|t| t.time_ms).max().unwrap_or(0);
     let max_memory_kb = test_results.iter().map(|t| t.memory_kb).max().unwrap_or(0);
@@ -680,6 +692,7 @@ pub fn judge_interactive_test(
                 checker: None,
                 diff: None,
                 timing: Default::default(),
+                sandbox_tier: Some(sandbox.tier()),
             };
         }
         Err(e) => {
@@ -697,6 +710,7 @@ pub fn judge_interactive_test(
                 checker: None,
                 diff: None,
                 timing: Default::default(),
+                sandbox_tier: Some(sandbox.tier()),
             };
         }
     };
@@ -914,6 +928,7 @@ pub fn judge_interactive_test(
             },
             samples_ms: vec![time_ms],
         },
+        sandbox_tier: Some(sol_res.sandbox_tier),
     }
 }
 
@@ -955,6 +970,7 @@ pub fn judge_output_only_test(
                 confidence: "high".to_string(),
                 samples_ms: vec![0],
             },
+            sandbox_tier: Some(Tier::None),
         };
     };
 
@@ -1043,6 +1059,7 @@ pub fn judge_output_only_test(
             confidence: "high".to_string(),
             samples_ms: vec![0],
         },
+        sandbox_tier: Some(Tier::None),
     }
 }
 
@@ -1168,6 +1185,7 @@ pub fn judge_communication_test(
                 checker: None,
                 diff: None,
                 timing: Default::default(),
+                sandbox_tier: Some(sandbox.tier()),
             };
         }
     };
@@ -1229,5 +1247,6 @@ pub fn judge_communication_test(
         }),
         diff: None,
         timing: Default::default(),
+        sandbox_tier: Some(sol_res.sandbox_tier),
     }
 }

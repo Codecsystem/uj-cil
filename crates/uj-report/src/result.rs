@@ -43,6 +43,8 @@ pub struct SingleTestResult {
     pub checker: Option<String>,
     pub diff: Option<DiffSummary>,
     pub timing: TimingInfo,
+    #[serde(default)]
+    pub sandbox_tier: Option<uj_core::run::Tier>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

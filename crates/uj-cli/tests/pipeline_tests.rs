@@ -515,3 +515,31 @@ fn test_judge_pipeline_output_only_wa() {
     assert_eq!(report["verdict"], "PC");
     assert_eq!(report["score"], 50.0);
 }
+
+#[test]
+fn test_judge_require_tier_mismatch_fails() {
+    let _guard = lock_test();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/aplusb/solutions/ac.cpp")
+        .arg("-p")
+        .arg("tests/problems/aplusb")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--require-tier")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "Expected non-zero exit code when --require-tier cannot be satisfied"
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
+        assert_ne!(val["verdict"], "AC", "Must never report AC on failed require-tier");
+    }
+}

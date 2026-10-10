@@ -707,6 +707,7 @@ mod tests {
                 checker: Some("ok answer matches".to_string()),
                 diff: None,
                 timing: Default::default(),
+                sandbox_tier: None,
             }],
         };
 

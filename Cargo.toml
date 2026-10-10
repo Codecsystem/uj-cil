@@ -64,6 +64,7 @@ indicatif = "0.17"
 # System & Topology
 num_cpus = "1.16"
 sysinfo = "0.33"
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

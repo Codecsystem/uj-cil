@@ -15,26 +15,23 @@ use uj_core::run::{CapturedOutput, ExitStatus, KillReason, RunResult, RunSpec, S
 use crate::ntstatus::is_ntstatus_exception;
 use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
 
+#[cfg(unix)]
+use std::os::unix::io::{FromRawFd, RawFd};
+
 pub struct NoneSandbox;
 
 impl NoneSandbox {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl Default for NoneSandbox {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Sandbox for NoneSandbox {
-    fn tier(&self) -> Tier {
-        Tier::None
-    }
-
-    fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
+    fn run_impl(
+        &self,
+        spec: &RunSpec,
+        cancel: &CancelToken,
+        #[cfg(unix)] custom_stdin: Option<RawFd>,
+        #[cfg(unix)] custom_stdout: Option<RawFd>,
+    ) -> Result<RunResult, SandboxError> {
         if spec.argv.is_empty() {
             return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
         }
@@ -55,6 +52,27 @@ impl Sandbox for NoneSandbox {
         }
 
         // Stdio setup
+        #[cfg(unix)]
+        if let Some(fd) = custom_stdin {
+            cmd.stdin(unsafe { StdProcessStdio::from(File::from_raw_fd(fd)) });
+        } else {
+            match &spec.stdin {
+                Stdio::Null => {
+                    cmd.stdin(StdProcessStdio::null());
+                }
+                Stdio::File(path) => {
+                    let file = File::open(path)?;
+                    cmd.stdin(StdProcessStdio::from(file));
+                }
+                Stdio::Pipe => {
+                    cmd.stdin(StdProcessStdio::piped());
+                }
+                Stdio::Inherit => {
+                    cmd.stdin(StdProcessStdio::inherit());
+                }
+            }
+        }
+        #[cfg(not(unix))]
         match &spec.stdin {
             Stdio::Null => {
                 cmd.stdin(StdProcessStdio::null());
@@ -71,7 +89,32 @@ impl Sandbox for NoneSandbox {
             }
         }
 
+        #[cfg(unix)]
+        let capture_stdout = custom_stdout.is_none() && matches!(&spec.stdout, Stdio::Pipe);
+        #[cfg(not(unix))]
         let capture_stdout = matches!(&spec.stdout, Stdio::Pipe);
+
+        #[cfg(unix)]
+        if let Some(fd) = custom_stdout {
+            cmd.stdout(unsafe { StdProcessStdio::from(File::from_raw_fd(fd)) });
+        } else {
+            match &spec.stdout {
+                Stdio::Null => {
+                    cmd.stdout(StdProcessStdio::null());
+                }
+                Stdio::File(path) => {
+                    let file = File::create(path)?;
+                    cmd.stdout(StdProcessStdio::from(file));
+                }
+                Stdio::Pipe => {
+                    cmd.stdout(StdProcessStdio::piped());
+                }
+                Stdio::Inherit => {
+                    cmd.stdout(StdProcessStdio::inherit());
+                }
+            }
+        }
+        #[cfg(not(unix))]
         match &spec.stdout {
             Stdio::Null => {
                 cmd.stdout(StdProcessStdio::null());
@@ -246,10 +289,87 @@ impl Sandbox for NoneSandbox {
         })
     }
 
+    #[cfg(unix)]
+    fn execute_group_unix(
+        &self,
+        specs: &[RunSpec],
+        wiring: &Wiring,
+        cancel: &CancelToken,
+    ) -> Result<Vec<RunResult>, SandboxError> {
+        let n = specs.len();
+        let mut wired_stdins: Vec<Option<RawFd>> = vec![None; n];
+        let mut wired_stdouts: Vec<Option<RawFd>> = vec![None; n];
+
+        for conn in &wiring.connections {
+            if conn.from_proc >= n || conn.to_proc >= n {
+                return Err(SandboxError::Internal(format!(
+                    "Invalid wiring connection from {} to {} (total procs: {})",
+                    conn.from_proc, conn.to_proc, n
+                )));
+            }
+            let mut fds = [0i32; 2];
+            let res = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if res != 0 {
+                return Err(SandboxError::Io(std::io::Error::last_os_error()));
+            }
+            wired_stdouts[conn.from_proc] = Some(fds[1]);
+            wired_stdins[conn.to_proc] = Some(fds[0]);
+        }
+
+        // Run specs concurrently in worker threads
+        thread::scope(|s| {
+            let mut handles = Vec::new();
+            for (i, spec) in specs.iter().enumerate() {
+                let in_fd = wired_stdins[i];
+                let out_fd = wired_stdouts[i];
+                handles.push(s.spawn(move || {
+                    self.run_impl(spec, cancel, in_fd, out_fd)
+                }));
+            }
+
+            let mut res = Vec::new();
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(run_res)) => res.push(run_res),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(SandboxError::Internal(
+                            "Thread panicked in execute_group_unix".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(res)
+        })
+    }
+}
+
+impl Default for NoneSandbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sandbox for NoneSandbox {
+    fn tier(&self) -> Tier {
+        Tier::None
+    }
+
+    fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
+        #[cfg(unix)]
+        {
+            self.run_impl(spec, cancel, None, None)
+        }
+        #[cfg(not(unix))]
+        {
+            self.run_impl(spec, cancel)
+        }
+    }
+
     fn run_group(
         &self,
         specs: &[RunSpec],
-        _wiring: &Wiring,
+        wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
         if specs.is_empty() {
@@ -257,15 +377,13 @@ impl Sandbox for NoneSandbox {
         }
         #[cfg(windows)]
         {
-            crate::windows::process::execute_group_in_jobs(specs, _wiring, None, cancel, Tier::None)
+            crate::windows::process::execute_group_in_jobs(specs, wiring, None, cancel, Tier::None)
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            let cgroup_base = crate::linux::cgroup::CgroupV2::find_base_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("/sys/fs/cgroup"));
-            crate::linux::runner::execute_group_in_sandbox(specs, _wiring, &cgroup_base, cancel, Tier::None)
+            self.execute_group_unix(specs, wiring, cancel)
         }
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, unix)))]
         {
             let mut results = Vec::with_capacity(specs.len());
             for spec in specs {

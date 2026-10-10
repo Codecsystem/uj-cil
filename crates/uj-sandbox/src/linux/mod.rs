@@ -2,6 +2,7 @@
 
 pub mod cgroup;
 pub mod runner;
+pub mod seccomp;
 
 use std::path::PathBuf;
 use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
@@ -39,10 +40,13 @@ impl LinuxSandbox {
                 tier: Tier::None,
                 cgroup_base: None,
             }),
-            Tier::Degraded => Ok(Self {
-                tier: Tier::Degraded,
-                cgroup_base: None,
-            }),
+            Tier::Degraded => {
+                let base = CgroupV2::find_base_dir().ok();
+                Ok(Self {
+                    tier: Tier::Degraded,
+                    cgroup_base: base,
+                })
+            }
             Tier::Full => {
                 match CgroupV2::find_base_dir() {
                     Ok(base) => Ok(Self {
@@ -76,7 +80,7 @@ impl Sandbox for LinuxSandbox {
     }
 
     fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
-        if self.tier == Tier::Full && let Some(ref base) = self.cgroup_base {
+        if let Some(ref base) = self.cgroup_base {
             runner::execute_in_sandbox(spec, base, cancel, self.tier)
         } else {
             let fallback = crate::none::NoneSandbox::new();
@@ -92,7 +96,7 @@ impl Sandbox for LinuxSandbox {
         wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
-        if self.tier == Tier::Full && let Some(ref base) = self.cgroup_base {
+        if let Some(ref base) = self.cgroup_base {
             runner::execute_group_in_sandbox(specs, wiring, base, cancel, self.tier)
         } else {
             let fallback = crate::none::NoneSandbox::new();
@@ -105,6 +109,17 @@ impl Sandbox for LinuxSandbox {
     }
 
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError> {
+        if let Some(ref base) = self.cgroup_base {
+            let _ = std::fs::remove_dir_all(base);
+        }
         Ok(CleanupReport::default())
+    }
+}
+
+impl Drop for LinuxSandbox {
+    fn drop(&mut self) {
+        if let Some(ref base) = self.cgroup_base {
+            let _ = std::fs::remove_dir_all(base);
+        }
     }
 }

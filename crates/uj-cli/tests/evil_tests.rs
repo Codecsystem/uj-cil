@@ -184,3 +184,50 @@ fn test_evil_batch_all_seeds() {
     let hacked_path = get_workspace_root().join("tests/evil/tests/HACKED.txt");
     assert!(!hacked_path.exists(), "HACKED.txt must NOT exist after batch evaluation");
 }
+
+#[test]
+fn test_evil_linux_lx_all() {
+    let _guard = lock_test();
+
+    #[cfg(target_os = "linux")]
+    {
+        let rep = judge_evil_sol("lx_all.cpp");
+        assert_eq!(rep["verdict"], "WA");
+
+        let test0 = &rep["tests"][0];
+        let found = test0["diff"]["found"]
+            .as_str()
+            .expect("diff.found should be present");
+
+        // Parse key-value tokens from probe string (e.g., A=-1,B=-1,C=0,D=1,E=0,F=1,G=0,pid=1,ppid=0,pd=)
+        let mut map = std::collections::HashMap::new();
+        for part in found.split(',') {
+            if let Some((k, v)) = part.split_once('=') {
+                map.insert(k.trim(), v.trim());
+            }
+        }
+
+        let c: i32 = map.get("C").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let e: i32 = map.get("E").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let g: i32 = map.get("G").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let f: i32 = map.get("F").and_then(|v| v.parse().ok()).unwrap_or(-99);
+
+        assert_eq!(c, 0, "C == 0: Writing to problem directory / rootfs must fail");
+        assert_eq!(e, 0, "E == 0: Writing to /home must fail");
+        assert_eq!(g, 0, "G == 0: Reading sensitive host files must fail");
+        assert!(f <= 3, "F <= 3: Visible /proc numeric entries must not exceed 3, got {f}");
+
+        if test0["sandbox_tier"] == "full" {
+            let pid: i32 = map.get("pid").and_then(|v| v.parse().ok()).unwrap_or(-99);
+            assert_eq!(pid, 1, "Child must be PID 1 in new PID namespace");
+        }
+
+        // Assert no escape files were created on the host
+        let root = get_workspace_root();
+        assert!(!root.join("tests/evil/PWNED_lx.txt").exists());
+        assert!(!root.join("PWNED_lx.txt").exists());
+        assert!(!std::path::Path::new("/tmp/uj_pwned_lx.txt").exists());
+        assert!(!std::path::Path::new("/tmp/uj_lx_report.txt").exists());
+    }
+}
+

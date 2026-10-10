@@ -1015,11 +1015,23 @@ pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
     drop(c2);
     drop(c3);
 
+    let job = JobObject::create(None).ok();
+    if let Some(ref j) = job {
+        let _ = j.set_limits(spec.limits.memory_bytes, 1, spec.cpu_affinity.as_deref());
+    }
+
     if let Ok(pi) = pi {
+        if let Some(ref j) = job {
+            let _ = j.assign_process(pi.hProcess);
+        }
         unsafe {
             let _ = ResumeThread(pi.hThread);
-            let _ = WaitForSingleObject(pi.hProcess, 100);
-            let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 0);
+            let _ = WaitForSingleObject(pi.hProcess, 50);
+            if let Some(ref j) = job {
+                let _ = j.terminate(0);
+            } else {
+                let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 0);
+            }
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
         }

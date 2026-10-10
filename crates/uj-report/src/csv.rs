@@ -73,6 +73,7 @@ mod tests {
                     checker: None,
                     diff: None,
                     timing: Default::default(),
+                    sandbox_tier: None,
                 },
                 crate::result::SingleTestResult {
                     id: "2".to_string(),
@@ -87,6 +88,7 @@ mod tests {
                     checker: None,
                     diff: None,
                     timing: Default::default(),
+                    sandbox_tier: None,
                 },
             ],
         };

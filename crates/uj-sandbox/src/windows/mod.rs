@@ -26,10 +26,10 @@ impl WindowsSandbox {
                 tier: Tier::Degraded,
                 app_container: None,
             }),
-            Tier::Full => match AppContainerProfile::get_shared() {
+            Tier::Full => match AppContainerProfile::create_isolated() {
                 Ok(profile) => Ok(Self {
                     tier: Tier::Full,
-                    app_container: Some(profile),
+                    app_container: Some(Arc::new(profile)),
                 }),
                 Err(err) => {
                     if !allow_fallback {

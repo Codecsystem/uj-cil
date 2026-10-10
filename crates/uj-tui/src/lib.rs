@@ -663,6 +663,7 @@ mod tests {
             checker: None,
             diff: None,
             timing: Default::default(),
+            sandbox_tier: None,
         };
         app.handle_event(JudgeEvent::TestDone(res1));
         assert!(app.slots[0].active_test.is_none());

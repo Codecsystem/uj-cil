@@ -55,6 +55,10 @@ impl Scheduler {
         event_sender: Option<Sender<JudgeEvent>>,
         cancel: &CancelToken,
     ) -> Result<SubmissionJudgeReport, SchedulerError> {
+        // Pre-validate sandbox initialization and required tier
+        let _ = create_sandbox(&self.options.sandbox_mode, self.options.require_tier)
+            .map_err(|e| SchedulerError::Sandbox(format!("Failed to initialize sandbox: {e}")))?;
+
         let limits = problem_config
             .to_limits()
             .map_err(|e| SchedulerError::Config(e.to_string()))?;
@@ -249,7 +253,10 @@ impl Scheduler {
             let handle = thread::spawn(move || {
                 let sandbox = match create_sandbox(&sandbox_mode, require_tier) {
                     Ok(sb) => sb,
-                    Err(_) => return,
+                    Err(e) => {
+                        eprintln!("Worker failed to initialize sandbox: {e}");
+                        return;
+                    }
                 };
 
                 while let Ok(test) = task_rx_clone.recv() {
@@ -275,6 +282,7 @@ impl Scheduler {
                             checker: None,
                             diff: None,
                             timing: Default::default(),
+                            sandbox_tier: Some(sandbox.tier()),
                         };
                         let _ = result_tx_clone.send(skipped_result);
                         continue;
@@ -385,6 +393,12 @@ impl Scheduler {
         // Wait for workers
         for h in worker_handles {
             let _ = h.join();
+        }
+
+        if test_results.is_empty() && total_tests > 0 {
+            return Err(SchedulerError::Sandbox(
+                "No test results collected: all sandbox executions failed".to_string(),
+            ));
         }
 
         // Sort results by natural test ID order

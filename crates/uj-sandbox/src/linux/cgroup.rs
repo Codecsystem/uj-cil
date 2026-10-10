@@ -53,17 +53,19 @@ fn enable_subtree_controllers(dir: &Path) {
     let _ = fs::write(dir.join("cgroup.subtree_control"), &control_str);
 }
 
-static CACHED_BASE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static CACHED_BASE_DIR: parking_lot::Mutex<Option<Result<PathBuf, String>>> =
+    parking_lot::Mutex::new(None);
 
 impl CgroupV2 {
     /// Detects the writable base cgroup v2 directory (supports systemd user delegation or root).
     pub fn find_base_dir() -> Result<PathBuf, SandboxError> {
-        if let Some(path) = CACHED_BASE_DIR.get() {
-            return Ok(path.clone());
+        let mut guard = CACHED_BASE_DIR.lock();
+        if let Some(ref res) = *guard {
+            return res.clone().map_err(SandboxError::Internal);
         }
-        let base = Self::find_base_dir_uncached()?;
-        let _ = CACHED_BASE_DIR.set(base.clone());
-        Ok(base)
+        let res = Self::find_base_dir_uncached();
+        *guard = Some(res.as_ref().map(|p| p.clone()).map_err(|e| e.to_string()));
+        res
     }
 
     fn find_base_dir_uncached() -> Result<PathBuf, SandboxError> {
@@ -74,6 +76,17 @@ impl CgroupV2 {
             ));
         }
 
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cnt = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let test_name = format!(
+            ".uj_test_{}_{}_{cnt}_{ts}",
+            std::process::id(),
+            rustix::thread::gettid().as_raw_nonzero()
+        );
+
         // 1. Check current process's cgroup from /proc/self/cgroup
         if let Ok(content) = fs::read_to_string("/proc/self/cgroup") {
             for line in content.lines() {
@@ -81,7 +94,7 @@ impl CgroupV2 {
                 if let Some(rel) = line.strip_prefix("0::") {
                     let rel_clean = rel.trim_start_matches('/');
                     let mut candidate = cgroup_mount.join(rel_clean);
-                    // If candidate is inside runner or uj, ascend to parent scope
+                    // If candidate is inside runner or uj, ascend to its scope
                     while candidate.file_name() == Some(std::ffi::OsStr::new("runner"))
                         || candidate.file_name() == Some(std::ffi::OsStr::new("uj"))
                     {
@@ -91,62 +104,36 @@ impl CgroupV2 {
                             break;
                         }
                     }
-                    while candidate.starts_with(cgroup_mount) {
-                        if candidate.is_dir() {
-                            // Check if candidate is writable
-                            let test_dir = candidate.join(format!(".uj_test_{}", std::process::id()));
-                            if fs::create_dir(&test_dir).is_ok() {
-                                let _ = fs::remove_dir(&test_dir);
-                                enable_subtree_controllers(&candidate);
-                                let uj_base = candidate.join("uj");
-                                let _ = fs::create_dir_all(&uj_base);
-                                enable_subtree_controllers(&uj_base);
-                                return Ok(uj_base);
-                            }
-                        }
-                        if let Some(parent) = candidate.parent() {
-                            candidate = parent.to_path_buf();
-                        } else {
-                            break;
+                    if candidate.is_dir() {
+                        let test_dir = candidate.join(&test_name);
+                        if fs::create_dir(&test_dir).is_ok() {
+                            let _ = fs::remove_dir(&test_dir);
+                            enable_subtree_controllers(&candidate);
+                            let uj_base = candidate.join("uj");
+                            let _ = fs::create_dir_all(&uj_base);
+                            enable_subtree_controllers(&uj_base);
+                            return Ok(uj_base);
                         }
                     }
                 }
             }
         }
 
-        // 2. Check standard systemd user delegation path: /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/app.slice
-        let uid = unsafe { libc::getuid() };
-        let user_slice_app = cgroup_mount
-            .join("user.slice")
-            .join(format!("user-{uid}.slice"))
-            .join(format!("user@{uid}.service"))
-            .join("app.slice");
-
-        if user_slice_app.is_dir() {
-            enable_subtree_controllers(&user_slice_app);
-            let uj_base = user_slice_app.join("uj");
-            let _ = fs::create_dir_all(&uj_base);
-            enable_subtree_controllers(&uj_base);
-            let test_dir = uj_base.join(format!(".uj_test_{}", std::process::id()));
+        // 2. Fallback to /sys/fs/cgroup/uj (if running as root)
+        if unsafe { libc::getuid() } == 0 {
+            let root_uj = cgroup_mount.join("uj");
+            let _ = fs::create_dir_all(&root_uj);
+            enable_subtree_controllers(cgroup_mount);
+            enable_subtree_controllers(&root_uj);
+            let test_dir = root_uj.join(&test_name);
             if fs::create_dir(&test_dir).is_ok() {
                 let _ = fs::remove_dir(&test_dir);
-                return Ok(uj_base);
+                return Ok(root_uj);
             }
         }
 
-        // 3. Fallback to /sys/fs/cgroup/uj (if running as root)
-        let root_uj = cgroup_mount.join("uj");
-        let _ = fs::create_dir_all(&root_uj);
-        enable_subtree_controllers(cgroup_mount);
-        enable_subtree_controllers(&root_uj);
-        let test_dir = root_uj.join(format!(".uj_test_{}", std::process::id()));
-        if fs::create_dir(&test_dir).is_ok() {
-            let _ = fs::remove_dir(&test_dir);
-            return Ok(root_uj);
-        }
-
         Err(SandboxError::Internal(
-            "No writable cgroup v2 directory found. Ensure systemd user delegation or root access is available.".to_string(),
+            "No writable cgroup v2 directory found in current scope. Ensure running within a systemd delegated scope (e.g. systemd-run --user --scope -p Delegate=yes) or as root.".to_string(),
         ))
     }
 
@@ -256,6 +243,17 @@ impl CgroupV2 {
     pub fn kill(&self) {
         let kill_file = self.path.join("cgroup.kill");
         let _ = fs::write(kill_file, "1");
+
+        let procs_file = self.path.join("cgroup.procs");
+        if let Ok(content) = fs::read_to_string(&procs_file) {
+            for line in content.lines() {
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
     }
 
     /// Clean up and remove this cgroup directory.
