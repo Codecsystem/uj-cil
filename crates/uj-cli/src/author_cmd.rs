@@ -830,14 +830,6 @@ pub fn run_ans_with_session(
         }
     };
 
-    let sandbox = match create_sandbox("auto", false) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Sandbox error: {e}");
-            return ExitCode::from(EXIT_JUDGE_FAILED);
-        }
-    };
-
     let hash_file_streaming = |path: &Path| -> std::io::Result<String> {
         use std::io::Read;
         let mut file = fs::File::open(path)?;
@@ -867,8 +859,37 @@ pub fn run_ans_with_session(
         .to_limits()
         .unwrap_or_else(|_| Limits::new(1000, 256 * 1024 * 1024));
 
-    let mut generated_count = 0;
-    for test in &tests {
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+        .min(tests.len().max(1));
+
+    struct AnsJob {
+        idx: usize,
+        name: String,
+        input_path: PathBuf,
+        ans_path: PathBuf,
+        cache_meta: PathBuf,
+    }
+
+    enum AnsResult {
+        Generated,
+        Failed {
+            idx: usize,
+            name: String,
+            reason: String,
+        },
+        Error {
+            err: String,
+        },
+    }
+
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<AnsJob>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<AnsResult>();
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    for (idx, test) in tests.iter().enumerate() {
         if cancel.is_cancelled() {
             return ExitCode::from(EXIT_INTERRUPTED);
         }
@@ -896,43 +917,148 @@ pub fn run_ans_with_session(
             continue;
         }
 
-        let spec = RunSpec {
-            argv: vec![compiled.binary_path.as_os_str().to_os_string()],
-            env: vec![],
-            work_dir: problem_dir.to_path_buf(),
-            ro_binds: vec![],
-            stdin: Stdio::File(test.input_path.clone()),
-            stdout: Stdio::Pipe,
-            stderr: Stdio::Pipe,
-            extra_fds: vec![],
-            limits: limits.clone(),
-            cpu_affinity: None,
-            seccomp_profile: Default::default(),
-            trusted: false,
-        };
+        let _ = job_tx.send(AnsJob {
+            idx,
+            name: test.name.clone(),
+            input_path: test.input_path.clone(),
+            ans_path,
+            cache_meta,
+        });
+    }
+    drop(job_tx);
 
-        let res = match sandbox.run(&spec, cancel) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Execution error: {e}");
-                return ExitCode::from(EXIT_JUDGE_FAILED);
+    let sol_binary = compiled.binary_path.clone();
+    let prob_dir = problem_dir.to_path_buf();
+    let run_limits = limits.clone();
+
+    let mut handles = Vec::new();
+    for _ in 0..num_workers {
+        let job_rx = job_rx.clone();
+        let res_tx = res_tx.clone();
+        let stop = stop_flag.clone();
+        let cancel = cancel.clone();
+        let sol_bin = sol_binary.clone();
+        let p_dir = prob_dir.clone();
+        let limits = run_limits.clone();
+
+        let handle = std::thread::spawn(move || {
+            let sandbox = match create_sandbox("auto", false) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = res_tx.send(AnsResult::Error {
+                        err: format!("Sandbox error: {e}"),
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            while let Ok(job) = job_rx.recv() {
+                if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                    break;
+                }
+
+                let spec = RunSpec {
+                    argv: vec![sol_bin.as_os_str().to_os_string()],
+                    env: vec![],
+                    work_dir: p_dir.clone(),
+                    ro_binds: vec![],
+                    stdin: Stdio::File(job.input_path.clone()),
+                    stdout: Stdio::Pipe,
+                    stderr: Stdio::Pipe,
+                    extra_fds: vec![],
+                    limits: limits.clone(),
+                    cpu_affinity: None,
+                    seccomp_profile: Default::default(),
+                    trusted: false,
+                };
+
+                let res = match sandbox.run(&spec, &cancel) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = res_tx.send(AnsResult::Error {
+                            err: format!("Execution error: {e}"),
+                        });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                if !res.status.is_success() || res.killed_by.is_some() {
+                    let reason = res
+                        .killed_by
+                        .map(|k| format!("{k:?}"))
+                        .unwrap_or_else(|| format!("{:?}", res.status));
+                    let _ = res_tx.send(AnsResult::Failed {
+                        idx: job.idx,
+                        name: job.name,
+                        reason,
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
+                if let Err(e) = fs::write(&job.ans_path, &stdout_bytes) {
+                    let _ = res_tx.send(AnsResult::Error {
+                        err: format!("Failed to write ans file {}: {e}", job.ans_path.display()),
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if let Some(parent) = job.cache_meta.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&job.cache_meta, &stdout_bytes);
+                let _ = res_tx.send(AnsResult::Generated);
             }
-        };
+        });
+        handles.push(handle);
+    }
+    drop(res_tx);
 
-        if !res.status.is_success() || res.killed_by.is_some() {
-            let reason = res
-                .killed_by
-                .map(|k| format!("{k:?}"))
-                .unwrap_or_else(|| format!("{:?}", res.status));
-            eprintln!("Main solution failed on test '{}': {reason}", test.name);
-            return ExitCode::from(EXIT_JUDGE_FAILED);
+    let mut generated_count = 0;
+    let mut first_failure: Option<(usize, String, String)> = None;
+    let mut runtime_error: Option<String> = None;
+
+    while let Ok(res) = res_rx.recv() {
+        match res {
+            AnsResult::Generated => {
+                generated_count += 1;
+            }
+            AnsResult::Failed { idx, name, reason } => {
+                if let Some((f_idx, _, _)) = first_failure {
+                    if idx < f_idx {
+                        first_failure = Some((idx, name, reason));
+                    }
+                } else {
+                    first_failure = Some((idx, name, reason));
+                }
+            }
+            AnsResult::Error { err } => {
+                if runtime_error.is_none() {
+                    runtime_error = Some(err);
+                }
+            }
         }
+    }
 
-        let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
-        let _ = fs::write(&ans_path, &stdout_bytes);
-        let _ = fs::create_dir_all(cache_meta.parent().unwrap());
-        let _ = fs::write(&cache_meta, &stdout_bytes);
-        generated_count += 1;
+    for h in handles {
+        let _ = h.join();
+    }
+
+    if cancel.is_cancelled() {
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
+
+    if let Some(err) = runtime_error {
+        eprintln!("{err}");
+        return ExitCode::from(EXIT_JUDGE_FAILED);
+    }
+
+    if let Some((_, name, reason)) = first_failure {
+        eprintln!("Main solution failed on test '{name}': {reason}");
+        return ExitCode::from(EXIT_JUDGE_FAILED);
     }
 
     if format == OutputFormat::Json {
