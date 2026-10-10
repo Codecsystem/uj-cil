@@ -79,6 +79,9 @@ pub trait Sandbox: Send + Sync {
         wiring: &Wiring,
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError>;
+    fn create_box_dir(&self, base_dir: &std::path::Path) -> Result<std::path::PathBuf, SandboxError> {
+        create_isolated_box_dir(base_dir).map_err(SandboxError::Io)
+    }
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError>;
 }
 
@@ -258,6 +261,10 @@ pub fn get_or_prepare_authorized_binary(
             if let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
                 let _ = profile.grant_access_to_path(&authorized_exe);
             }
+            let _ = windows::security::AppContainerProfile::grant_path_access(
+                &authorized_exe,
+                "S-1-15-2-1",
+            );
             if let Ok(box_dir) = create_isolated_box_dir(base_dir) {
                 prewarm_binary(&authorized_exe, &box_dir);
                 if let Some(run_dir) = box_dir.parent() {

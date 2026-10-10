@@ -98,7 +98,9 @@ pub enum IoMode {
 pub struct IoConfig {
     #[serde(default)]
     pub mode: IoMode,
+    #[serde(alias = "input")]
     pub input_name: Option<String>,
+    #[serde(alias = "output")]
     pub output_name: Option<String>,
 }
 

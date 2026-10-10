@@ -44,10 +44,14 @@ int main() {
     int F = 0;
     if (DIR* d = opendir("/proc")) { while (dirent* e = readdir(d)) if (isdigit((unsigned char)e->d_name[0])) F++; closedir(d); }
     int G = 0; if (FILE* f = fopen("/home/lenovo/.bash_history", "r")) { G = 1; fclose(f); }
-    printf("A=%d B=%d C=%d D=%d E=%d F=%d G=%d pid=%d ppid=%d pd=%s\n", A, B, C, D, E, F, G, (int)getpid(), (int)getppid(), pd.c_str());
-    if (FILE* r = fopen("/tmp/uj_lx_report.txt", "w")) {
-        fprintf(r, "A=%d B=%d C=%d D=%d E=%d F=%d G=%d pid=%d ppid=%d pd=%s\n", A, B, C, D, E, F, G, (int)getpid(), (int)getppid(), pd.c_str());
-        fclose(r);
-    }
+    // H/I: hard-coded host paths (inside a pivot_root jail cwd is /box, so pd may be empty)
+    int H = read_int("/home/lenovo/ujlx4/tests/1.ans");
+    int I = try_write("/home/lenovo/ujlx4/PWNED_lx.txt");
+    int J = 0; if (FILE* f = fopen("/etc/passwd", "r")) { J = 1; fclose(f); }
+    char line[512];
+    snprintf(line, sizeof line, "A=%d,B=%d,C=%d,D=%d,E=%d,F=%d,G=%d,H=%d,I=%d,J=%d,pid=%d,ppid=%d,pd=%s",
+             A, B, C, D, E, F, G, H, I, J, (int)getpid(), (int)getppid(), pd.c_str());
+    printf("%s\n", line);
+    if (FILE* r = fopen("/tmp/uj_lx_report.txt", "w")) { fprintf(r, "%s\n", line); fclose(r); }
     return 0;
 }

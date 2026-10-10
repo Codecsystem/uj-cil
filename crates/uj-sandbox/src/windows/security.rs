@@ -33,6 +33,12 @@ impl AppContainerProfile {
         Self::create_internal(&name, true)
     }
 
+    /// Create an isolated profile unique to this specific worker slot.
+    pub fn create_isolated_for_slot(slot_id: usize) -> Result<Self, std::io::Error> {
+        let name = format!("uj.sandbox.{}.{}", std::process::id(), slot_id);
+        Self::create_internal(&name, true)
+    }
+
     /// Get or initialize the shared AppContainer profile.
     pub fn get_shared() -> Result<Arc<Self>, std::io::Error> {
         let cached = SHARED_PROFILE.get_or_init(|| {
@@ -162,4 +168,126 @@ impl Drop for AppContainerProfile {
             }
         }
     }
+}
+
+/// Enumerates and removes leftover AppContainer profiles belonging to dead uj processes.
+pub fn cleanup_stale_appcontainers() -> usize {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_READ, REG_SZ,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let subkey: Vec<u16> =
+        "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Mappings\0"
+            .encode_utf16()
+            .collect();
+
+    let mut hkey = HKEY::default();
+    let res = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if res.is_err() {
+        return 0;
+    }
+
+    let mut cleaned = 0;
+    let mut index = 0;
+    let mut key_name = [0u16; 256];
+    let mut to_delete = Vec::new();
+
+    loop {
+        let mut key_name_len = key_name.len() as u32;
+        let enum_res = unsafe {
+            RegEnumKeyExW(
+                hkey,
+                index,
+                windows_core::PWSTR(key_name.as_mut_ptr()),
+                &mut key_name_len,
+                None,
+                windows_core::PWSTR::null(),
+                None,
+                None,
+            )
+        };
+        if enum_res.is_err() {
+            break;
+        }
+        index += 1;
+
+        let mut child_key = HKEY::default();
+        let open_child = unsafe {
+            RegOpenKeyExW(
+                hkey,
+                PCWSTR(key_name.as_ptr()),
+                0,
+                KEY_READ,
+                &mut child_key,
+            )
+        };
+        if open_child.is_ok() {
+            let val_name: Vec<u16> = "Moniker\0".encode_utf16().collect();
+            let mut val_data = [0u16; 256];
+            let mut val_data_len = (val_data.len() * 2) as u32;
+            let mut val_type = windows::Win32::System::Registry::REG_VALUE_TYPE::default();
+            let query_res = unsafe {
+                RegQueryValueExW(
+                    child_key,
+                    PCWSTR(val_name.as_ptr()),
+                    None,
+                    Some(&mut val_type),
+                    Some(val_data.as_mut_ptr() as *mut u8),
+                    Some(&mut val_data_len),
+                )
+            };
+            unsafe {
+                let _ = RegCloseKey(child_key);
+            }
+
+            if query_res.is_ok() && val_type == REG_SZ {
+                let moniker = String::from_utf16_lossy(&val_data[..(val_data_len as usize / 2)])
+                    .trim_matches('\0')
+                    .to_string();
+                if moniker.starts_with("uj.sandbox.") {
+                    let parts: Vec<&str> = moniker.split('.').collect();
+                    if parts.len() >= 3 && let Ok(pid) = parts[2].parse::<u32>() {
+                        let is_dead = unsafe {
+                            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                            match handle {
+                                Ok(h) => {
+                                    let _ = CloseHandle(h);
+                                    false
+                                }
+                                Err(_) => true,
+                            }
+                        };
+                        if is_dead {
+                            to_delete.push(moniker);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+
+    for moniker in to_delete {
+        let moniker_u16: Vec<u16> = moniker.encode_utf16().chain(Some(0)).collect();
+        let pcwstr = PCWSTR(moniker_u16.as_ptr());
+        if unsafe { DeleteAppContainerProfile(pcwstr).is_ok() } {
+            cleaned += 1;
+        }
+    }
+
+    cleaned
 }

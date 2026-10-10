@@ -122,6 +122,9 @@ pub fn generate_problem_toml(task: &LemonTask, tests_dir: Option<&str>) -> Strin
     let stdin_check = task.standard_input_check.unwrap_or(true);
     let stdout_check = task.standard_output_check.unwrap_or(true);
 
+    if !stdin_check || !stdout_check {
+        toml.push_str("mode = \"file\"\n");
+    }
     if !stdin_check && let Some(ref inf) = task.input_file_name {
         toml.push_str(&format!("input = \"{inf}\"\n"));
     }

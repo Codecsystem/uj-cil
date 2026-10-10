@@ -43,41 +43,67 @@ fn init_logging(verbose: u8, quiet: bool) {
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     {
-        if unsafe { libc::getuid() } != 0
+        let raw_args: Vec<String> = std::env::args().collect();
+        let is_help_or_version = raw_args
+            .iter()
+            .any(|a| a == "-h" || a == "--help" || a == "-V" || a == "--version");
+        let requires_sandbox_cmd = raw_args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "judge" | "contest" | "stress" | "run" | "pipeline" | "verify" | "tl"
+            )
+        });
+        let explicit_none = raw_args
+            .windows(2)
+            .any(|w| w[0] == "--sandbox" && w[1] == "none")
+            || raw_args.iter().any(|a| a == "--sandbox=none");
+
+        if !is_help_or_version
+            && requires_sandbox_cmd
+            && !explicit_none
+            && unsafe { libc::getuid() } != 0
             && std::env::var_os("UJ_IN_SYSTEMD_SCOPE").is_none()
         {
-            let in_delegated_scope = if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
-                let rel = cgroup
-                    .lines()
-                    .find_map(|l| l.strip_prefix("0::"))
-                    .unwrap_or("")
-                    .trim_start_matches('/');
-                let p = std::path::Path::new("/sys/fs/cgroup").join(rel);
-                p.file_name().map(|n| n.to_string_lossy().contains(".scope")).unwrap_or(false)
-                    && p.join("cgroup.controllers").exists()
-                    && std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(p.join("cgroup.subtree_control"))
-                        .is_ok()
-            } else {
-                false
-            };
+            let bus_available = std::process::Command::new("systemd-run")
+                .args(["--user", "--scope", "--quiet", "true"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
 
-            if !in_delegated_scope && let Ok(exe) = std::env::current_exe() {
-                let mut cmd = std::process::Command::new("systemd-run");
-                cmd.arg("--user")
-                    .arg("--scope")
-                    .arg("--quiet")
-                    .arg("-p")
-                    .arg("Delegate=yes")
-                    .arg("-E")
-                    .arg("UJ_IN_SYSTEMD_SCOPE=1")
-                    .arg("--")
-                    .arg(&exe)
-                    .args(std::env::args_os().skip(1));
-                if let Ok(mut child) = cmd.spawn() {
-                    let status = child.wait().unwrap_or_default();
-                    std::process::exit(status.code().unwrap_or(1));
+            if bus_available {
+                let in_delegated_scope = if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+                    let rel = cgroup
+                        .lines()
+                        .find_map(|l| l.strip_prefix("0::"))
+                        .unwrap_or("")
+                        .trim_start_matches('/');
+                    let p = std::path::Path::new("/sys/fs/cgroup").join(rel);
+                    p.file_name().map(|n| n.to_string_lossy().contains(".scope")).unwrap_or(false)
+                        && p.join("cgroup.controllers").exists()
+                        && std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(p.join("cgroup.subtree_control"))
+                            .is_ok()
+                } else {
+                    false
+                };
+
+                if !in_delegated_scope && let Ok(exe) = std::env::current_exe() {
+                    let mut cmd = std::process::Command::new("systemd-run");
+                    cmd.arg("--user")
+                        .arg("--scope")
+                        .arg("--quiet")
+                        .arg("-p")
+                        .arg("Delegate=yes")
+                        .arg("-E")
+                        .arg("UJ_IN_SYSTEMD_SCOPE=1")
+                        .arg("--")
+                        .arg(&exe)
+                        .args(std::env::args_os().skip(1));
+                    if let Ok(mut child) = cmd.spawn() {
+                        let status = child.wait().unwrap_or_default();
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
                 }
             }
         }

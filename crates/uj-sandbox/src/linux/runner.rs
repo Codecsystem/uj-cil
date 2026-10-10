@@ -269,12 +269,19 @@ pub fn execute_in_sandbox_with_stdio(
                         c_host_exe.as_ptr(),
                         c_target_exe.as_ptr(),
                         std::ptr::null(),
-                        libc::MS_BIND | libc::MS_RDONLY,
+                        libc::MS_BIND,
                         std::ptr::null(),
                     ) != 0
                     {
                         return Err(std::io::Error::last_os_error());
                     }
+                    let _ = libc::mount(
+                        std::ptr::null(),
+                        c_target_exe.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                        std::ptr::null(),
+                    );
                     "/box/__uj_bin".to_string()
                 };
 
@@ -294,7 +301,8 @@ pub fn execute_in_sandbox_with_stdio(
                         if let Ok(c_src) = std::ffi::CString::new(ro_bind.to_string_lossy().as_bytes())
                             && let Ok(c_dst) = std::ffi::CString::new(target.to_string_lossy().as_bytes())
                         {
-                            let _ = libc::mount(c_src.as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_RDONLY, std::ptr::null());
+                            let _ = libc::mount(c_src.as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null());
+                            let _ = libc::mount(std::ptr::null(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, std::ptr::null());
                         }
                     }
                 }
@@ -332,7 +340,8 @@ pub fn execute_in_sandbox_with_stdio(
                     if let Ok(c_dst) = std::ffi::CString::new(dst.to_string_lossy().as_bytes())
                         && let Ok(c_src) = std::ffi::CString::new(format!("/dev/{dev}"))
                     {
-                        let _ = libc::mount(c_src.as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_RDONLY, std::ptr::null());
+                        let _ = libc::mount(c_src.as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null());
+                        let _ = libc::mount(std::ptr::null(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, std::ptr::null());
                     }
                 }
 
@@ -341,7 +350,8 @@ pub fn execute_in_sandbox_with_stdio(
                     let dst_ld = rootfs.join("etc").join("ld.so.cache");
                     let _ = File::create(&dst_ld);
                     if let Ok(c_dst) = std::ffi::CString::new(dst_ld.to_string_lossy().as_bytes()) {
-                        let _ = libc::mount(c"/etc/ld.so.cache".as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_RDONLY, std::ptr::null());
+                        let _ = libc::mount(c"/etc/ld.so.cache".as_ptr(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null());
+                        let _ = libc::mount(std::ptr::null(), c_dst.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, std::ptr::null());
                     }
                 }
                 if Path::new("/etc/alternatives").is_dir() {
@@ -379,62 +389,117 @@ pub fn execute_in_sandbox_with_stdio(
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // 6. Fork intermediate init process so child enters new PID namespace as PID 1
-                let child_pid = libc::fork();
-                if child_pid < 0 {
+                // 6. Fork intermediate process so child enters new PID namespace as PID 1
+                let init_pid = libc::fork();
+                if init_pid < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                if child_pid == 0 {
-                    // Automatically kill child if intermediate process dies
+                if init_pid == 0 {
+                    // Child is now PID 1 in the new PID namespace!
+                    // Automatically kill PID 1 if intermediate host process dies
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
 
-                    // Child process: PID 1 in new PID namespace!
-                    if libc::mount(c"proc".as_ptr(), c"/proc".as_ptr(), c"proc".as_ptr(), 0, c"subset=pid".as_ptr() as *const libc::c_void) != 0 {
-                        let _ = libc::mount(c"proc".as_ptr(), c"/proc".as_ptr(), c"proc".as_ptr(), 0, std::ptr::null());
+                    // Close all fds >= 3 so parent Command::spawn() error pipe reaches EOF
+                    if libc::syscall(libc::SYS_close_range, 3, !0u32, 0) != 0 {
+                        for fd in 3..256 {
+                            libc::close(fd);
+                        }
                     }
 
-                    let rlim = libc::rlimit {
-                        rlim_cur: stack_limit,
-                        rlim_max: stack_limit,
-                    };
-                    libc::setrlimit(libc::RLIMIT_STACK, &rlim);
-
-                    let rlim_zero = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    libc::setrlimit(libc::RLIMIT_CORE, &rlim_zero);
-
-                    if crate::linux::seccomp::apply_seccomp_filter().is_err() {
-                        libc::_exit(125);
+                    if libc::mount(
+                        c"proc".as_ptr(),
+                        c"/proc".as_ptr(),
+                        c"proc".as_ptr(),
+                        0,
+                        c"subset=pid".as_ptr() as *const libc::c_void,
+                    ) != 0
+                    {
+                        let _ = libc::mount(
+                            c"proc".as_ptr(),
+                            c"/proc".as_ptr(),
+                            c"proc".as_ptr(),
+                            0,
+                            std::ptr::null(),
+                        );
                     }
 
-                    let mut jail_argv = Vec::new();
-                    jail_argv.push(jail_exe_path.clone());
-                    for arg in &jail_args {
-                        jail_argv.push(arg.clone());
+                    // Fork contestant process as PID 2 (normal process, standard signal semantics)
+                    let contestant_pid = libc::fork();
+                    if contestant_pid < 0 {
+                        libc::_exit(126);
                     }
-                    let c_argv: Vec<std::ffi::CString> = jail_argv
-                        .iter()
-                        .map(|s| std::ffi::CString::new(s.as_bytes()).unwrap_or_default())
-                        .collect();
-                    let mut c_argv_ptrs: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
-                    c_argv_ptrs.push(std::ptr::null());
 
-                    let mut c_env: Vec<std::ffi::CString> = jail_env
-                        .iter()
-                        .map(|(k, v)| std::ffi::CString::new(format!("{k}={v}").as_bytes()).unwrap_or_default())
-                        .collect();
-                    if !jail_env.iter().any(|(k, _)| k == "PATH") {
-                        c_env.push(std::ffi::CString::new("PATH=/usr/bin:/bin").unwrap());
+                    if contestant_pid == 0 {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+
+                        let rlim = libc::rlimit {
+                            rlim_cur: stack_limit,
+                            rlim_max: stack_limit,
+                        };
+                        libc::setrlimit(libc::RLIMIT_STACK, &rlim);
+
+                        let rlim_zero = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        };
+                        libc::setrlimit(libc::RLIMIT_CORE, &rlim_zero);
+
+                        if crate::linux::seccomp::apply_seccomp_filter().is_err() {
+                            libc::_exit(125);
+                        }
+
+                        let mut jail_argv = Vec::new();
+                        jail_argv.push(jail_exe_path.clone());
+                        for arg in &jail_args {
+                            jail_argv.push(arg.clone());
+                        }
+                        let c_argv: Vec<std::ffi::CString> = jail_argv
+                            .iter()
+                            .map(|s| std::ffi::CString::new(s.as_bytes()).unwrap_or_default())
+                            .collect();
+                        let mut c_argv_ptrs: Vec<*const libc::c_char> =
+                            c_argv.iter().map(|s| s.as_ptr()).collect();
+                        c_argv_ptrs.push(std::ptr::null());
+
+                        let mut c_env: Vec<std::ffi::CString> = jail_env
+                            .iter()
+                            .map(|(k, v)| {
+                                std::ffi::CString::new(format!("{k}={v}").as_bytes())
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        if !jail_env.iter().any(|(k, _)| k == "PATH") {
+                            c_env.push(std::ffi::CString::new("PATH=/usr/bin:/bin").unwrap());
+                        }
+                        let mut c_env_ptrs: Vec<*const libc::c_char> =
+                            c_env.iter().map(|s| s.as_ptr()).collect();
+                        c_env_ptrs.push(std::ptr::null());
+
+                        let c_exe = std::ffi::CString::new(jail_exe_path.as_bytes()).unwrap();
+                        libc::execve(c_exe.as_ptr(), c_argv_ptrs.as_ptr(), c_env_ptrs.as_ptr());
+                        libc::_exit(127);
+                    } else {
+                        // PID 1 init process: wait for contestant PID 2, then reap any zombies
+                        let mut status = 0;
+                        while libc::waitpid(contestant_pid, &mut status, 0) < 0 {
+                            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                                break;
+                            }
+                        }
+                        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
+
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        } else if libc::WIFSIGNALED(status) {
+                            let sig = libc::WTERMSIG(status);
+                            libc::signal(sig, libc::SIG_DFL);
+                            libc::kill(libc::getpid(), sig);
+                            libc::_exit(128 + sig);
+                        } else {
+                            libc::_exit(1);
+                        }
                     }
-                    let mut c_env_ptrs: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
-                    c_env_ptrs.push(std::ptr::null());
-
-                    let c_exe = std::ffi::CString::new(jail_exe_path.as_bytes()).unwrap();
-                    libc::execve(c_exe.as_ptr(), c_argv_ptrs.as_ptr(), c_env_ptrs.as_ptr());
-                    libc::_exit(127);
                 } else {
                     // Close all fds >= 3 (including Rust's internal error reporting socket so parent cmd.spawn() completes)
                     if libc::syscall(libc::SYS_close_range, 3, !0u32, 0) != 0 {
@@ -448,7 +513,7 @@ pub fn execute_in_sandbox_with_stdio(
                     libc::close(2);
 
                     let mut status = 0;
-                    while libc::waitpid(child_pid, &mut status, 0) < 0 {
+                    while libc::waitpid(init_pid, &mut status, 0) < 0 {
                         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                             break;
                         }
@@ -456,7 +521,10 @@ pub fn execute_in_sandbox_with_stdio(
                     if libc::WIFEXITED(status) {
                         libc::_exit(libc::WEXITSTATUS(status));
                     } else if libc::WIFSIGNALED(status) {
-                        libc::_exit(128 + libc::WTERMSIG(status));
+                        let sig = libc::WTERMSIG(status);
+                        libc::signal(sig, libc::SIG_DFL);
+                        libc::kill(libc::getpid(), sig);
+                        libc::_exit(128 + sig);
                     } else {
                         libc::_exit(1);
                     }

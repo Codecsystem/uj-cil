@@ -49,6 +49,7 @@ pub fn judge_single_test(
     checker: &ResolvedChecker,
     pe_as_wa: bool,
     cpu_affinity: Option<usize>,
+    io: Option<&uj_core::config::IoConfig>,
     cancel: &CancelToken,
 ) -> SingleTestResult {
     let base_dir = test
@@ -63,12 +64,23 @@ pub fn judge_single_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = uj_sandbox::create_isolated_box_dir(base_dir)
+    let box_dir = sandbox
+        .create_box_dir(base_dir)
         .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
     let run_dir = box_dir
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| box_dir.clone());
+
+    let is_file_io = io.is_some_and(|i| {
+        i.mode == uj_core::config::IoMode::File || i.input_name.is_some() || i.output_name.is_some()
+    });
+    let in_name = io.and_then(|i| i.input_name.as_deref()).unwrap_or("input.txt");
+    let out_name = io.and_then(|i| i.output_name.as_deref()).unwrap_or("output.txt");
+
+    if is_file_io {
+        let _ = fs::copy(&test.input_path, box_dir.join(in_name));
+    }
 
     let argv = if let Some(cmd) = interpreter_cmd {
         let mut modified_cmd = Vec::new();
@@ -273,7 +285,11 @@ pub fn judge_single_test(
                 (Verdict::RuntimeError, 0.0, Some(msg), None, None)
             } else {
                 // Program exited cleanly (Exit code 0), run checker
-                let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
+                let stdout_bytes = if is_file_io && box_dir.join(out_name).exists() {
+                    fs::read(box_dir.join(out_name)).unwrap_or_default()
+                } else {
+                    res.stdout.map(|o| o.bytes).unwrap_or_default()
+                };
                 match checker {
                     ResolvedChecker::Builtin(b) => {
                         let ans_bytes = test
@@ -412,10 +428,19 @@ pub fn aggregate_submission_report(
     config: &ProblemConfig,
     test_results: Vec<SingleTestResult>,
 ) -> SubmissionJudgeReport {
-    assert!(
-        !test_results.is_empty(),
-        "aggregate_submission_report called with empty test_results: tests must not be empty"
-    );
+    if test_results.is_empty() {
+        return SubmissionJudgeReport {
+            schema_version: 1,
+            problem: problem_name.to_string(),
+            submission: submission_name.to_string(),
+            verdict: Verdict::JudgeFailed,
+            score: 0.0,
+            max_time_ms: 0,
+            max_memory_kb: 0,
+            subtasks: Vec::new(),
+            tests: Vec::new(),
+        };
+    }
 
     let mut subtask_map: std::collections::BTreeMap<u32, Vec<&SingleTestResult>> =
         std::collections::BTreeMap::new();
@@ -573,7 +598,8 @@ pub fn judge_interactive_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = uj_sandbox::create_isolated_box_dir(base_dir)
+    let box_dir = sandbox
+        .create_box_dir(base_dir)
         .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
     let run_dir = box_dir
         .parent()
@@ -1085,7 +1111,8 @@ pub fn judge_communication_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = uj_sandbox::create_isolated_box_dir(base_dir)
+    let box_dir = sandbox
+        .create_box_dir(base_dir)
         .unwrap_or_else(|_| uj_sandbox::get_sandbox_scratch_dir());
     let run_dir = box_dir
         .parent()

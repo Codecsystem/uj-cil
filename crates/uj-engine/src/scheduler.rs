@@ -249,6 +249,7 @@ impl Scheduler {
             let problem_type = problem_config.problem_type;
             let interactor_bin_clone = interactor_bin.clone();
             let manager_bin_clone = manager_bin.clone();
+            let io_config = problem_config.io.clone();
 
             let handle = thread::spawn(move || {
                 let sandbox = match create_sandbox(&sandbox_mode, require_tier) {
@@ -341,6 +342,7 @@ impl Scheduler {
                                     &checker_clone,
                                     pe_as_wa,
                                     slot.cpu_core,
+                                    Some(&io_config),
                                     &cancel_clone,
                                 )
                             }
@@ -354,6 +356,7 @@ impl Scheduler {
                             &checker_clone,
                             pe_as_wa,
                             slot.cpu_core,
+                            Some(&io_config),
                             &cancel_clone,
                         ),
                     };
@@ -474,6 +477,7 @@ impl Scheduler {
                                 &resolved_checker,
                                 pe_as_wa,
                                 topology.slots.first().and_then(|s| s.cpu_core),
+                                Some(&problem_config.io),
                                 cancel,
                             ),
                         };

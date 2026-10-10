@@ -543,3 +543,103 @@ fn test_judge_require_tier_mismatch_fails() {
         assert_ne!(val["verdict"], "AC", "Must never report AC on failed require-tier");
     }
 }
+
+#[test]
+fn test_judge_no_dbus_sandbox_none() {
+    let _guard = lock_test();
+    let mut cmd = uj_cmd();
+    cmd.env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env("XDG_RUNTIME_DIR", "/nonexistent")
+        .arg("judge")
+        .arg("tests/problems/aplusb/solutions/ac.cpp")
+        .arg("-p")
+        .arg("tests/problems/aplusb")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--format")
+        .arg("json");
+
+    let output = cmd.output().expect("Failed to execute uj");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Expected success with --sandbox none without dbus/systemd, got error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "AC");
+    assert_eq!(report["score"], 100.0);
+}
+
+#[test]
+fn test_judge_pipeline_file_io() {
+    let _guard = lock_test();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let pdir = temp.path();
+
+    let problem_toml = r#"schema = 1
+name = "file_io_test"
+type = "traditional"
+
+[limits]
+time = "1s"
+memory = "256MB"
+
+[io]
+mode = "file"
+input = "sum.in"
+output = "sum.out"
+
+[[subtasks]]
+id = 1
+score = 100.0
+scoring = "sum"
+tests = ["1"]
+"#;
+    std::fs::write(pdir.join("problem.toml"), problem_toml).unwrap();
+    std::fs::create_dir_all(pdir.join("tests")).unwrap();
+    std::fs::write(pdir.join("tests").join("1.in"), "12 34\n").unwrap();
+    std::fs::write(pdir.join("tests").join("1.ans"), "46\n").unwrap();
+
+    std::fs::create_dir_all(pdir.join("solutions")).unwrap();
+    let ac_cpp = r#"#include <cstdio>
+int main() {
+    FILE* in = fopen("sum.in", "r");
+    if (!in) return 1;
+    int a = 0, b = 0;
+    if (fscanf(in, "%d %d", &a, &b) != 2) return 1;
+    fclose(in);
+    FILE* out = fopen("sum.out", "w");
+    if (!out) return 1;
+    fprintf(out, "%d\n", a + b);
+    fclose(out);
+    return 0;
+}
+"#;
+    let sol_path = pdir.join("solutions").join("ac.cpp");
+    std::fs::write(&sol_path, ac_cpp).unwrap();
+
+    let output = uj_cmd()
+        .arg("judge")
+        .arg(&sol_path)
+        .arg("-p")
+        .arg(pdir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "File IO judge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(report["verdict"], "AC");
+    assert_eq!(report["score"], 100.0);
+}

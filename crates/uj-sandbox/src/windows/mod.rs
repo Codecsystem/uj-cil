@@ -14,10 +14,16 @@ use std::sync::Arc;
 pub struct WindowsSandbox {
     tier: Tier,
     app_container: Option<Arc<AppContainerProfile>>,
+    slot_id: usize,
+    authorized_slot_dirs: parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 }
+
+static WINDOWS_SLOT_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1);
 
 impl WindowsSandbox {
     pub fn new(requested_tier: Tier, allow_fallback: bool) -> Result<Self, SandboxError> {
+        let slot_id = WINDOWS_SLOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match requested_tier {
             Tier::None => Err(SandboxError::Internal(
                 "Use NoneSandbox for Tier::None".to_string(),
@@ -25,11 +31,15 @@ impl WindowsSandbox {
             Tier::Degraded => Ok(Self {
                 tier: Tier::Degraded,
                 app_container: None,
+                slot_id,
+                authorized_slot_dirs: parking_lot::Mutex::new(std::collections::HashSet::new()),
             }),
-            Tier::Full => match AppContainerProfile::create_isolated() {
+            Tier::Full => match AppContainerProfile::create_isolated_for_slot(slot_id) {
                 Ok(profile) => Ok(Self {
                     tier: Tier::Full,
                     app_container: Some(Arc::new(profile)),
+                    slot_id,
+                    authorized_slot_dirs: parking_lot::Mutex::new(std::collections::HashSet::new()),
                 }),
                 Err(err) => {
                     if !allow_fallback {
@@ -44,6 +54,8 @@ impl WindowsSandbox {
                     Ok(Self {
                         tier: Tier::Degraded,
                         app_container: None,
+                        slot_id,
+                        authorized_slot_dirs: parking_lot::Mutex::new(std::collections::HashSet::new()),
                     })
                 }
             },
@@ -56,7 +68,42 @@ impl Sandbox for WindowsSandbox {
         self.tier
     }
 
+    fn create_box_dir(&self, base_dir: &std::path::Path) -> Result<std::path::PathBuf, SandboxError> {
+        let runs_base = base_dir.join(".uj").join("tmp").join("runs");
+        let slot_dir = runs_base.join(format!("slot-{}", self.slot_id));
+        std::fs::create_dir_all(&slot_dir)?;
+
+        if let Some(ref ac) = self.app_container {
+            let mut set = self.authorized_slot_dirs.lock();
+            if set.insert(slot_dir.clone()) {
+                let _ = ac.grant_access_to_path(&slot_dir);
+            }
+        }
+
+        use std::time::SystemTime;
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let cnt = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let box_dir = slot_dir
+            .join(format!("run-{ts}-{cnt}"))
+            .join("box");
+        std::fs::create_dir_all(&box_dir)?;
+
+        Ok(box_dir)
+    }
+
     fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
+        // Ensure this slot's AppContainer profile has access to the work_dir
+        if let Some(ref ac) = self.app_container {
+            let mut set = self.authorized_slot_dirs.lock();
+            if set.insert(spec.work_dir.clone()) {
+                let _ = ac.grant_access_to_path(&spec.work_dir);
+            }
+        }
+
         // 1. Create a dedicated Job Object for this single run
         let job = JobObject::create(None)
             .map_err(|e| SandboxError::Internal(format!("Failed to create Job Object: {e}")))?;
@@ -99,7 +146,10 @@ impl Sandbox for WindowsSandbox {
     }
 
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError> {
-        // Windows Job Objects automatically terminate with KILL_ON_JOB_CLOSE when process dies.
-        Ok(CleanupReport::default())
+        let cleaned = security::cleanup_stale_appcontainers();
+        Ok(CleanupReport {
+            cleaned_processes: cleaned,
+            cleaned_directories: 0,
+        })
     }
 }

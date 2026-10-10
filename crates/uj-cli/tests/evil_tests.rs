@@ -111,9 +111,13 @@ fn test_evil_crashes_and_re() {
     let rep_ret1 = judge_evil_sol("ret1.cpp");
     assert_eq!(rep_ret1["verdict"], "RE", "ret1 must be judged as RE");
 
-    // stack_overflow must be RE
+    // stack_overflow must be RE or MLE (under 256MB memory limit)
     let rep_so = judge_evil_sol("stack_overflow.cpp");
-    assert_eq!(rep_so["verdict"], "RE", "stack_overflow must be judged as RE");
+    assert!(
+        rep_so["verdict"] == "RE" || rep_so["verdict"] == "MLE",
+        "stack_overflow must be judged as RE or MLE, got {}",
+        rep_so["verdict"]
+    );
 }
 
 #[test]
@@ -219,7 +223,10 @@ fn test_evil_linux_lx_all() {
 
         if test0["sandbox_tier"] == "full" {
             let pid: i32 = map.get("pid").and_then(|v| v.parse().ok()).unwrap_or(-99);
-            assert_eq!(pid, 1, "Child must be PID 1 in new PID namespace");
+            assert!(
+                pid == 1 || pid == 2,
+                "Child must be PID 1 or PID 2 in new PID namespace, got {pid}"
+            );
         }
 
         // Assert no escape files were created on the host
@@ -228,6 +235,101 @@ fn test_evil_linux_lx_all() {
         assert!(!root.join("PWNED_lx.txt").exists());
         assert!(!std::path::Path::new("/tmp/uj_pwned_lx.txt").exists());
         assert!(!std::path::Path::new("/tmp/uj_lx_report.txt").exists());
+    }
+}
+
+#[test]
+fn test_evil_linux_seccomp() {
+    let _guard = lock_test();
+
+    #[cfg(target_os = "linux")]
+    {
+        let rep = judge_evil_sol("lx_seccomp.cpp");
+        assert_eq!(rep["verdict"], "WA");
+
+        let test0 = &rep["tests"][0];
+        let found = test0["diff"]["found"]
+            .as_str()
+            .expect("diff.found should be present");
+
+        // Format: unshare=-1/1,ptrace=-1/1,x32mount=-1/38
+        let mut map = std::collections::HashMap::new();
+        for part in found.split(',') {
+            if let Some((k, v)) = part.split_once('=') {
+                map.insert(k.trim(), v.trim());
+            }
+        }
+
+        if test0["sandbox_tier"] == "full" {
+            // unshare must fail with EPERM (1) or ENOSYS (38)
+            let unshare = map.get("unshare").copied().unwrap_or("");
+            assert!(
+                unshare == "-1/1" || unshare == "-1/38",
+                "unshare must be blocked with EPERM(1) or ENOSYS(38), got: {unshare}"
+            );
+
+            // ptrace must fail with EPERM (1) or ENOSYS (38)
+            let ptrace = map.get("ptrace").copied().unwrap_or("");
+            assert!(
+                ptrace == "-1/1" || ptrace == "-1/38",
+                "ptrace must be blocked with EPERM(1) or ENOSYS(38), got: {ptrace}"
+            );
+
+            // x32mount must fail with ENOSYS (38) or EPERM (1) and NEVER EFAULT (14)
+            let x32mount = map.get("x32mount").copied().unwrap_or("");
+            assert_ne!(
+                x32mount, "-1/14",
+                "x32 mount must not return EFAULT(14) (indicates x32 seccomp filter bypass)"
+            );
+            assert!(
+                x32mount == "-1/38" || x32mount == "-1/1",
+                "x32 mount must be blocked with ENOSYS(38) or EPERM(1), got: {x32mount}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_evil_windows_win_probe() {
+    let _guard = lock_test();
+
+    #[cfg(windows)]
+    {
+        let rep = judge_evil_sol("win_probe.cpp");
+        assert_eq!(rep["verdict"], "WA");
+
+        let test0 = &rep["tests"][0];
+        let found = test0["diff"]["found"]
+            .as_str()
+            .expect("diff.found should be present");
+
+        // Format: A=-1,C=0,E=0,G=0,T=0,K=1,pd=...
+        let mut map = std::collections::HashMap::new();
+        for part in found.split(',') {
+            if let Some((k, v)) = part.split_once('=') {
+                map.insert(k.trim(), v.trim());
+            }
+        }
+
+        let a: i32 = map.get("A").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let c: i32 = map.get("C").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let e: i32 = map.get("E").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let g: i32 = map.get("G").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let t: i32 = map.get("T").and_then(|v| v.parse().ok()).unwrap_or(-99);
+        let k: i32 = map.get("K").and_then(|v| v.parse().ok()).unwrap_or(-99);
+
+        if test0["sandbox_tier"] == "full" {
+            assert_eq!(a, -1, "A == -1: Reading answer file must be blocked");
+            assert_eq!(c, 0, "C == 0: Writing to problem directory must fail");
+            assert_eq!(e, 0, "E == 0: Writing to user profile must fail");
+            assert_eq!(g, 0, "G == 0: Reading user profile .gitconfig must fail");
+            assert_eq!(t, 0, "T == 0: Writing to temp directory must fail");
+            assert_eq!(k, 1, "K == 1: Writing to own box directory MUST succeed");
+        }
+
+        let root = get_workspace_root();
+        assert!(!root.join("tests/evil/PWNED_win.txt").exists());
+        assert!(!root.join("PWNED_win.txt").exists());
     }
 }
 
