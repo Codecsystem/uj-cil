@@ -130,6 +130,32 @@ fn bench_checker_hcmp() {
     );
 }
 
+fn bench_checker_ncmp() {
+    let mut data = Vec::with_capacity(2 * 1024 * 1024);
+    for i in 0..100_000 {
+        data.extend_from_slice(format!("-{} ", i * 17).as_bytes());
+    }
+
+    // Warmup
+    let _ = uj_checker::builtin::check_ncmp(&data, &data);
+
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        let res = uj_checker::builtin::check_ncmp(&data, &data);
+        times.push(start.elapsed().as_micros());
+        assert_eq!(res.verdict, uj_core::verdict::Verdict::Accepted);
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    println!(
+        "[Checker ncmp 100k Ints] Median: {} µs ({} ms), Raw: {:?} µs",
+        median,
+        median as f64 / 1000.0,
+        times
+    );
+}
+
 fn get_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -339,6 +365,7 @@ fn main() {
     bench_subtask_pattern_matching();
     bench_checker_fcmp();
     bench_checker_hcmp();
+    bench_checker_ncmp();
     let count = std::env::var("UJ_BENCH_TESTS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

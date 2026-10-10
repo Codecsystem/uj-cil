@@ -384,6 +384,44 @@ pub fn check_lcmp(output: &[u8], answer: &[u8]) -> CheckResult {
     CheckResult::accepted()
 }
 
+#[inline]
+pub fn fast_parse_i64(slice: &[u8]) -> Option<i64> {
+    if slice.is_empty() {
+        return None;
+    }
+    let (is_negative, digits) = match slice[0] {
+        b'-' => (true, &slice[1..]),
+        b'+' => (false, &slice[1..]),
+        _ => (false, slice),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        let d = (b - b'0') as u64;
+        val = val.checked_mul(10)?.checked_add(d)?;
+    }
+    if is_negative {
+        if val > (i64::MAX as u64 + 1) {
+            return None;
+        }
+        if val == (i64::MAX as u64 + 1) {
+            Some(i64::MIN)
+        } else {
+            Some(-(val as i64))
+        }
+    } else {
+        if val > i64::MAX as u64 {
+            return None;
+        }
+        Some(val as i64)
+    }
+}
+
 /// 64-bit signed integer comparison (ncmp).
 pub fn check_ncmp(output: &[u8], answer: &[u8]) -> CheckResult {
     let mut out_iter = TokenIterator::new(output);
@@ -392,9 +430,9 @@ pub fn check_ncmp(output: &[u8], answer: &[u8]) -> CheckResult {
     loop {
         match (out_iter.next(), ans_iter.next()) {
             (Some(out_tok), Some(ans_tok)) => {
-                let ans_val = match ans_tok.as_str().parse::<i64>() {
-                    Ok(v) => v,
-                    Err(_) => {
+                let ans_val = match fast_parse_i64(ans_tok.slice) {
+                    Some(v) => v,
+                    None => {
                         return CheckResult::wrong_answer(
                             format!(
                                 "Answer contains invalid integer token '{}'",
@@ -405,9 +443,9 @@ pub fn check_ncmp(output: &[u8], answer: &[u8]) -> CheckResult {
                     }
                 };
 
-                let out_val = match out_tok.as_str().parse::<i64>() {
-                    Ok(v) => v,
-                    Err(_) => {
+                let out_val = match fast_parse_i64(out_tok.slice) {
+                    Some(v) => v,
+                    None => {
                         return CheckResult::wrong_answer(
                             format!(
                                 "Output token #{} '{}' is not a valid 64-bit integer",
@@ -940,5 +978,33 @@ mod tests {
             check_yesno(b"yes yes", b"yes").verdict,
             uj_core::verdict::Verdict::WrongAnswer
         );
+    }
+
+    #[test]
+    fn test_fast_parse_i64() {
+        assert_eq!(super::fast_parse_i64(b"0"), Some(0));
+        assert_eq!(super::fast_parse_i64(b"+0"), Some(0));
+        assert_eq!(super::fast_parse_i64(b"-0"), Some(0));
+        assert_eq!(super::fast_parse_i64(b"42"), Some(42));
+        assert_eq!(super::fast_parse_i64(b"+42"), Some(42));
+        assert_eq!(super::fast_parse_i64(b"-42"), Some(-42));
+        assert_eq!(
+            super::fast_parse_i64(b"9223372036854775807"),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            super::fast_parse_i64(b"-9223372036854775808"),
+            Some(i64::MIN)
+        );
+        // Overflow
+        assert_eq!(super::fast_parse_i64(b"9223372036854775808"), None);
+        assert_eq!(super::fast_parse_i64(b"-9223372036854775809"), None);
+        assert_eq!(super::fast_parse_i64(b"100000000000000000000"), None);
+        // Invalid formats
+        assert_eq!(super::fast_parse_i64(b""), None);
+        assert_eq!(super::fast_parse_i64(b"+"), None);
+        assert_eq!(super::fast_parse_i64(b"-"), None);
+        assert_eq!(super::fast_parse_i64(b"12a34"), None);
+        assert_eq!(super::fast_parse_i64(b" 42"), None);
     }
 }
