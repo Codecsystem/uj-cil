@@ -156,6 +156,9 @@ uj report --html report.html --csv results.csv
 }
 ```
 
+> 🤖 **面向 AI 编程助手的完整使用手册**：
+> 请直接参阅 [**docs/AGENT_GUIDE.md**](file:///e:/Data/Work/uj-cil/docs/AGENT_GUIDE.md)（含自动化解题循环、命题流水线 Recipe、JSON 字段解析与 Token 优化策略）与 [**AGENTS.md**](file:///e:/Data/Work/uj-cil/AGENTS.md)（系统硬性约束与底层架构地图）。
+
 ---
 
 ## ⚙️ 配置文件示例 (`problem.toml`)
