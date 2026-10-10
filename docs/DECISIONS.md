@@ -11,3 +11,5 @@
 | 5 | 异步运行时选型 | **禁止引入 tokio**，全采用 std 线程 + crossbeam-channel | 子进程监控是阻塞式的系统调用，线程池模型更可控、更低开销、不污染调用栈，无 async cancel 安全隐患。 |
 | 6 | Linux 最低内核版本 | **严格要求 ≥ 5.19** | 强依赖 `memory.peak` (5.19)、`cgroup.kill` (5.14)、`subset=pid` (5.8) 及 pidfd。拒绝维护繁琐脆弱的旧内核兼容分支。 |
 | 7 | 输出流重定向策略 | 必须通过 pipe 异步并发读取 stdout/stderr | 若直接重定向至 tmpfs/文件，文件页缓存 (page cache) 会全额计入内存 cgroup 导致内存虚高；同时避免单向缓冲区写满死锁。 |
+| 8 | Windows AppContainer 单例生命周期 | `AppContainerProfile::get_shared()` 配合 `OnceLock` 跨线程安全共享 | 避免并发测试或多评测槽位时由于局部 drop 提前 `FreeSid` 导致其他线程在 `CreateProcessW` 时踩中 use-after-free / `0x80070002` 错误。 |
+| 9 | Windows 沙盒 Auto 模式优雅降级 | Full 层级优先，对系统管理工具 (如 cmd/powershell) 降级至 Job Object (Degraded) | Windows 系统策略禁止 AppContainer 启动未打包的控制台管理外壳，而在 Auto 模式下平滑降级到 Job Object 能保障任意命令都能受控执行，显式 `--require-tier` 则严格阻断。 |
