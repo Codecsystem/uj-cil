@@ -117,6 +117,8 @@ impl AppContainerProfile {
             .arg("/T")
             .arg("/C")
             .arg("/Q")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         Ok(())
     }
@@ -129,6 +131,8 @@ impl AppContainerProfile {
             .arg("/T")
             .arg("/C")
             .arg("/Q")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         Ok(())
     }

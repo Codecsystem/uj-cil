@@ -1,6 +1,5 @@
-//! Test case execution, verdict evaluation, and subtask aggregation.
-
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use uj_checker::builtin::BuiltinCheckerType;
@@ -12,6 +11,13 @@ use uj_report::result::{
     DiffSummary, ExitInfo, SingleTestResult, SubmissionJudgeReport, SubtaskResult, TimingInfo,
 };
 use uj_sandbox::{CancelToken, Sandbox};
+
+#[derive(Debug, Clone)]
+pub enum ResolvedChecker {
+    Builtin(BuiltinCheckerType),
+    Testlib(PathBuf),
+    Lemon { path: PathBuf, full_score: f64 },
+}
 
 #[derive(Debug, Clone)]
 pub struct JudgeOptions {
@@ -40,7 +46,7 @@ pub fn judge_single_test(
     interpreter_cmd: Option<&[String]>,
     test: &TestCase,
     limits: &Limits,
-    checker_type: BuiltinCheckerType,
+    checker: &ResolvedChecker,
     pe_as_wa: bool,
     cpu_affinity: Option<usize>,
     cancel: &CancelToken,
@@ -51,7 +57,7 @@ pub fn judge_single_test(
         vec![exe_path.as_os_str().to_os_string()]
     };
 
-    let work_dir = std::env::temp_dir();
+    let work_dir = uj_sandbox::get_sandbox_scratch_dir();
 
     let spec = RunSpec {
         argv,
@@ -170,28 +176,99 @@ pub fn judge_single_test(
             } else {
                 // Program exited cleanly (Exit code 0), run checker
                 let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
-                let ans_bytes = test
-                    .answer_path
-                    .as_ref()
-                    .and_then(|p| uj_checker::read_file_bytes(p).ok())
-                    .unwrap_or_default();
+                match checker {
+                    ResolvedChecker::Builtin(b) => {
+                        let ans_bytes = test
+                            .answer_path
+                            .as_ref()
+                            .and_then(|p| uj_checker::read_file_bytes(p).ok())
+                            .unwrap_or_default();
 
-                let check_res = checker_type.check(&stdout_bytes, &ans_bytes);
-                let diff = check_res.diff.map(|d| DiffSummary {
-                    line: d.line,
-                    column: d.column,
-                    token_index: d.token_index,
-                    expected: d.expected,
-                    found: d.actual,
-                    truncated: false,
-                });
+                        let check_res = b.check(&stdout_bytes, &ans_bytes);
+                        let diff = check_res.diff.map(|d| DiffSummary {
+                            line: d.line,
+                            column: d.column,
+                            token_index: d.token_index,
+                            expected: d.expected,
+                            found: d.actual,
+                            truncated: false,
+                        });
 
-                (
-                    check_res.verdict,
-                    check_res.score_ratio,
-                    check_res.message,
-                    diff,
-                )
+                        (
+                            check_res.verdict,
+                            check_res.score_ratio,
+                            check_res.message,
+                            diff,
+                        )
+                    }
+                    ResolvedChecker::Testlib(chk_exe) => {
+                        let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+                        let out_file = scratch_dir.join(format!(
+                            "uj_out_{}_{}_{}.txt",
+                            std::process::id(),
+                            test.name,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0)
+                        ));
+                        let _ = fs::write(&out_file, &stdout_bytes);
+                        let empty_path = PathBuf::new();
+                        let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
+
+                        let check_res = uj_checker::testlib::run_testlib_checker(
+                            sandbox,
+                            chk_exe,
+                            &test.input_path,
+                            &out_file,
+                            ans_file,
+                            pe_as_wa,
+                            cancel,
+                        );
+                        let _ = fs::remove_file(&out_file);
+                        (
+                            check_res.verdict,
+                            check_res.score_ratio,
+                            check_res.message,
+                            None,
+                        )
+                    }
+                    ResolvedChecker::Lemon {
+                        path: chk_exe,
+                        full_score,
+                    } => {
+                        let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+                        let out_file = scratch_dir.join(format!(
+                            "uj_out_{}_{}_{}.txt",
+                            std::process::id(),
+                            test.name,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0)
+                        ));
+                        let _ = fs::write(&out_file, &stdout_bytes);
+                        let empty_path = PathBuf::new();
+                        let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
+
+                        let check_res = uj_checker::lemon::run_lemon_checker(
+                            sandbox,
+                            chk_exe,
+                            &test.input_path,
+                            &out_file,
+                            ans_file,
+                            *full_score,
+                            cancel,
+                        );
+                        let _ = fs::remove_file(&out_file);
+                        (
+                            check_res.verdict,
+                            check_res.score_ratio,
+                            check_res.message,
+                            None,
+                        )
+                    }
+                }
             }
         }
     };
@@ -272,28 +349,36 @@ pub fn aggregate_submission_report(
             (Verdict::Accepted, st_cfg.score)
         } else {
             let mut worst = Verdict::Accepted;
-            let mut min_ratio = 1.0f64;
-            let mut ratio_sum = 0.0f64;
-
             for t in &tests {
                 worst = worst.merge(t.verdict);
-                let ratio = if t.score > 0.0 && t.verdict.is_accepted() {
-                    1.0
-                } else {
-                    0.0
-                };
-                if ratio < min_ratio {
-                    min_ratio = ratio;
-                }
-                ratio_sum += ratio;
             }
 
-            let final_ratio = match st_cfg.scoring {
-                ScoringType::Min => min_ratio,
-                ScoringType::Sum => ratio_sum / tests.len() as f64,
+            let st_score = match st_cfg.scoring {
+                ScoringType::Min => {
+                    let min_ratio = tests
+                        .iter()
+                        .map(|t| {
+                            if st_cfg.score > 0.0 {
+                                (t.score / st_cfg.score).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        })
+                        .fold(1.0f64, f64::min);
+                    st_cfg.score * min_ratio
+                }
+                ScoringType::Sum => tests.iter().map(|t| t.score).sum(),
             };
 
-            (worst, st_cfg.score * final_ratio)
+            let final_verdict = if (st_score - st_cfg.score).abs() < 1e-6 {
+                worst
+            } else if st_score > 0.0 {
+                Verdict::PartiallyCorrect
+            } else {
+                worst
+            };
+
+            (final_verdict, st_score)
         };
 
         worst_verdict = worst_verdict.merge(st_verdict);
@@ -316,6 +401,21 @@ pub fn aggregate_submission_report(
         }
     }
 
+    let max_possible_score: f64 = if !config.subtasks.is_empty() {
+        config.subtasks.iter().map(|s| s.score).sum()
+    } else {
+        100.0
+    };
+
+    let final_submission_verdict =
+        if (total_score - max_possible_score).abs() < 1e-6 && max_possible_score > 0.0 {
+            worst_verdict
+        } else if total_score > 0.0 && worst_verdict == Verdict::WrongAnswer {
+            Verdict::PartiallyCorrect
+        } else {
+            worst_verdict
+        };
+
     let max_time_ms = test_results.iter().map(|t| t.time_ms).max().unwrap_or(0);
     let max_memory_kb = test_results.iter().map(|t| t.memory_kb).max().unwrap_or(0);
 
@@ -323,7 +423,7 @@ pub fn aggregate_submission_report(
         schema_version: 1,
         problem: problem_name.to_string(),
         submission: submission_name.to_string(),
-        verdict: worst_verdict,
+        verdict: final_submission_verdict,
         score: total_score,
         max_time_ms,
         max_memory_kb,

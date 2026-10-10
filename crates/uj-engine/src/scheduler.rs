@@ -9,14 +9,14 @@ use crossbeam_channel::{Sender, bounded, unbounded};
 use parking_lot::Mutex;
 
 use uj_checker::builtin::BuiltinCheckerType;
-use uj_core::config::ProblemConfig;
+use uj_core::config::{CheckerType, ProblemConfig};
 use uj_core::tests::TestCase;
 use uj_core::verdict::Verdict;
 use uj_report::result::{JudgeEvent, SingleTestResult, SubmissionJudgeReport};
 use uj_sandbox::{CancelToken, create_sandbox};
 
-use crate::compiler::CompileResult;
-use crate::judge::{JudgeOptions, aggregate_submission_report, judge_single_test};
+use crate::compiler::{CompileResult, Compiler};
+use crate::judge::{JudgeOptions, ResolvedChecker, aggregate_submission_report, judge_single_test};
 use crate::topology::{Slot, Topology};
 
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +42,7 @@ impl Scheduler {
     #[allow(clippy::too_many_arguments)]
     pub fn judge_submission(
         &self,
-        _problem_dir: &Path,
+        problem_dir: &Path,
         problem_config: &ProblemConfig,
         compiled: &CompileResult,
         tests: Vec<TestCase>,
@@ -55,13 +55,91 @@ impl Scheduler {
             .map_err(|e| SchedulerError::Config(e.to_string()))?;
         let topology = Topology::detect(limits.memory_bytes, user_jobs);
 
-        let checker_name = problem_config.checker.name.as_deref().unwrap_or("wcmp");
-        let checker_type =
-            BuiltinCheckerType::parse(checker_name).unwrap_or(BuiltinCheckerType::Wcmp);
+        #[cfg(windows)]
+        {
+            let _ =
+                uj_sandbox::windows::security::AppContainerProfile::grant_all_application_packages(
+                    problem_dir,
+                );
+        }
+
         let pe_as_wa = problem_config.checker.pe_as_wa;
 
+        let resolved_checker = match problem_config.checker.checker_type {
+            CheckerType::Builtin => {
+                let checker_name = problem_config.checker.name.as_deref().unwrap_or("wcmp");
+                let b = BuiltinCheckerType::parse(checker_name).unwrap_or(BuiltinCheckerType::Wcmp);
+                ResolvedChecker::Builtin(b)
+            }
+            CheckerType::Testlib => {
+                let chk_path = problem_config
+                    .checker
+                    .path
+                    .as_ref()
+                    .map(|p| {
+                        if p.is_absolute() {
+                            p.clone()
+                        } else {
+                            problem_dir.join(p)
+                        }
+                    })
+                    .ok_or_else(|| {
+                        SchedulerError::Config(
+                            "testlib checker path not specified in problem.toml".to_string(),
+                        )
+                    })?;
+
+                let bin_path = if chk_path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                {
+                    chk_path
+                } else {
+                    let compiled_chk = Compiler::compile(&chk_path, false).map_err(|e| {
+                        SchedulerError::Config(format!("Failed to compile testlib checker: {e}"))
+                    })?;
+                    compiled_chk.binary_path
+                };
+                ResolvedChecker::Testlib(bin_path)
+            }
+            CheckerType::Lemon => {
+                let chk_path = problem_config
+                    .checker
+                    .path
+                    .as_ref()
+                    .map(|p| {
+                        if p.is_absolute() {
+                            p.clone()
+                        } else {
+                            problem_dir.join(p)
+                        }
+                    })
+                    .ok_or_else(|| {
+                        SchedulerError::Config(
+                            "Lemon SPJ path not specified in problem.toml".to_string(),
+                        )
+                    })?;
+
+                let bin_path = if chk_path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                {
+                    chk_path
+                } else {
+                    let compiled_chk = Compiler::compile(&chk_path, false).map_err(|e| {
+                        SchedulerError::Config(format!("Failed to compile Lemon SPJ: {e}"))
+                    })?;
+                    compiled_chk.binary_path
+                };
+                ResolvedChecker::Lemon {
+                    path: bin_path,
+                    full_score: 100.0,
+                }
+            }
+        };
+
         // Sort tests by input file size descending (LPT heuristic)
-        let mut sorted_tests = tests;
+        let mut sorted_tests = tests.clone();
         sorted_tests.sort_by(|a, b| {
             let size_a = fs::metadata(&a.input_path).map(|m| m.len()).unwrap_or(0);
             let size_b = fs::metadata(&b.input_path).map(|m| m.len()).unwrap_or(0);
@@ -101,6 +179,7 @@ impl Scheduler {
             let sandbox_mode = self.options.sandbox_mode.clone();
             let require_tier = self.options.require_tier;
             let fail_fast = self.options.fail_fast;
+            let checker_clone = resolved_checker.clone();
 
             let handle = thread::spawn(move || {
                 let sandbox = match create_sandbox(&sandbox_mode, require_tier) {
@@ -148,7 +227,7 @@ impl Scheduler {
                         interpreter_cmd.as_deref(),
                         &test,
                         &limits_clone,
-                        checker_type,
+                        &checker_clone,
                         pe_as_wa,
                         s.cpu_core,
                         &cancel_clone,
@@ -195,6 +274,82 @@ impl Scheduler {
 
         // Sort results by natural test ID order
         test_results.sort_by(|a, b| uj_core::tests::natural_cmp(&a.id, &b.id));
+
+        // --------------------------------------------------------------------
+        // Section 6.3 Precise Rejudging for Edge Cases (--precise)
+        // --------------------------------------------------------------------
+        if self.options.precise && !cancel.is_cancelled() {
+            let tl_ms = limits.cpu_time_ms;
+            let lower_bound = (tl_ms as f64 * 0.9) as u64;
+            let upper_bound = (tl_ms as f64 * 1.5) as u64;
+
+            let mut candidate_indices = Vec::new();
+            for (idx, tr) in test_results.iter().enumerate() {
+                let is_borderline = tr.time_ms >= lower_bound && tr.time_ms <= upper_bound;
+                let is_borderline_tle =
+                    tr.verdict == Verdict::TimeLimitExceeded && tr.time_ms < upper_bound;
+                if is_borderline || is_borderline_tle {
+                    candidate_indices.push(idx);
+                }
+            }
+
+            if !candidate_indices.is_empty()
+                && let Ok(exclusive_sandbox) =
+                    create_sandbox(&self.options.sandbox_mode, self.options.require_tier)
+            {
+                for &idx in &candidate_indices {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+
+                    let target_test_id = test_results[idx].id.clone();
+                    let Some(orig_test) = tests.iter().find(|t| t.name == target_test_id) else {
+                        continue;
+                    };
+
+                    let mut samples = vec![test_results[idx].time_ms];
+                    let mut best_result = test_results[idx].clone();
+
+                    // Rejudge up to 2 times in exclusive mode
+                    for _ in 0..2 {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let rerun = judge_single_test(
+                            exclusive_sandbox.as_ref(),
+                            &compiled.binary_path,
+                            compiled.interpreter_cmd.as_deref(),
+                            orig_test,
+                            &limits,
+                            &resolved_checker,
+                            pe_as_wa,
+                            Some(1),
+                            cancel,
+                        );
+                        samples.push(rerun.time_ms);
+                        if rerun.time_ms < best_result.time_ms {
+                            best_result = rerun;
+                        }
+                    }
+
+                    let min_sample = samples.iter().copied().min().unwrap_or(1).max(1);
+                    let max_sample = samples.iter().copied().max().unwrap_or(1);
+                    let variance = (max_sample - min_sample) as f64 / min_sample as f64;
+
+                    let confidence = if variance > 0.10 {
+                        "low".to_string()
+                    } else {
+                        "medium".to_string()
+                    };
+
+                    best_result.timing.rejudged = true;
+                    best_result.timing.confidence = confidence;
+                    best_result.timing.samples_ms = samples;
+
+                    test_results[idx] = best_result;
+                }
+            }
+        }
 
         let report = aggregate_submission_report(
             &problem_config.name,

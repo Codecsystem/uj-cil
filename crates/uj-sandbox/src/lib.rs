@@ -168,3 +168,31 @@ pub fn create_sandbox(
         ))),
     }
 }
+
+/// Returns a scratch/temporary directory suitable for sandboxed runs.
+/// On Windows with AppContainer, ensures permissions (ALL APPLICATION PACKAGES) are granted.
+pub fn get_sandbox_scratch_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let p = std::path::PathBuf::from(r"C:\ProgramData\uj\tmp");
+        if std::fs::create_dir_all(&p).is_ok() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let _ = windows::security::AppContainerProfile::grant_all_application_packages(&p);
+            });
+            p
+        } else {
+            let fallback = std::env::temp_dir().join("uj_tmp");
+            let _ = std::fs::create_dir_all(&fallback);
+            let _ =
+                windows::security::AppContainerProfile::grant_all_application_packages(&fallback);
+            fallback
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let p = std::env::temp_dir().join("uj_tmp");
+        let _ = std::fs::create_dir_all(&p);
+        p
+    }
+}

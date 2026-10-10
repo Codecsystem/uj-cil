@@ -235,3 +235,118 @@ fn test_parallel_consistency() {
         rep_j4["tests"].as_array().unwrap().len()
     );
 }
+
+#[test]
+fn test_judge_pipeline_testlib_checker() {
+    let _guard = TEST_LOCK.lock().unwrap();
+
+    // 1. Test AC on testlib problem
+    let ac_out = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/aplusb/solutions/ac.cpp")
+        .arg("-p")
+        .arg("tests/problems/testlib_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+    assert_eq!(ac_out.status.code(), Some(0));
+    let ac_rep: serde_json::Value = serde_json::from_slice(&ac_out.stdout).unwrap();
+    assert_eq!(ac_rep["verdict"], "AC");
+    assert_eq!(ac_rep["score"], 100.0);
+    assert!(
+        ac_rep["tests"][0]["checker"]
+            .as_str()
+            .unwrap()
+            .contains("correct sum")
+    );
+
+    // 2. Test WA on testlib problem
+    let wa_out = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/aplusb/solutions/wa.cpp")
+        .arg("-p")
+        .arg("tests/problems/testlib_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+    assert_eq!(wa_out.status.code(), Some(1));
+    let wa_rep: serde_json::Value = serde_json::from_slice(&wa_out.stdout).unwrap();
+    assert_eq!(wa_rep["verdict"], "WA");
+    assert_eq!(wa_rep["score"], 0.0);
+    assert!(
+        wa_rep["tests"][0]["checker"]
+            .as_str()
+            .unwrap()
+            .contains("expected")
+    );
+}
+
+#[test]
+fn test_judge_pipeline_lemon_checker() {
+    let _guard = TEST_LOCK.lock().unwrap();
+
+    // 1. Test AC on Lemon SPJ problem
+    let ac_out = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/aplusb/solutions/ac.cpp")
+        .arg("-p")
+        .arg("tests/problems/lemon_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+    assert_eq!(ac_out.status.code(), Some(0));
+    let ac_rep: serde_json::Value = serde_json::from_slice(&ac_out.stdout).unwrap();
+    assert_eq!(ac_rep["verdict"], "AC");
+    assert_eq!(ac_rep["score"], 100.0);
+    assert_eq!(ac_rep["tests"][0]["checker"], "Perfect match");
+
+    // 2. Test Partial Score on Lemon SPJ problem
+    let pc_out = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/lemon_problem/solutions/partial.cpp")
+        .arg("-p")
+        .arg("tests/problems/lemon_problem")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+    assert_eq!(pc_out.status.code(), Some(1));
+    let pc_rep: serde_json::Value = serde_json::from_slice(&pc_out.stdout).unwrap();
+    assert_eq!(pc_rep["verdict"], "PC");
+    assert_eq!(pc_rep["score"], 40.0);
+    assert!(
+        pc_rep["tests"][0]["checker"]
+            .as_str()
+            .unwrap()
+            .contains("Close answer")
+    );
+}
+
+#[test]
+fn test_judge_pipeline_fail_fast() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let output = uj_cmd()
+        .arg("judge")
+        .arg("tests/problems/aplusb/solutions/wa.cpp")
+        .arg("-p")
+        .arg("tests/problems/aplusb")
+        .arg("--fail-fast")
+        .arg("-j")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj");
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+
+    // Verify subtask dependency skipping or fail-fast behavior
+    assert_eq!(report["verdict"], "WA");
+    let tests = report["tests"].as_array().unwrap();
+    // At least one test in subtask 1 was evaluated as WA
+    assert!(tests.iter().any(|t| t["verdict"] == "WA"));
+}

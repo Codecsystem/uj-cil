@@ -67,7 +67,14 @@ pub fn discover_tests(
     problem_dir: &Path,
     config: &ProblemConfig,
 ) -> Result<Vec<TestCase>, std::io::Error> {
-    let tests_dir = problem_dir.join(&config.tests.dir);
+    let abs_problem_dir = if problem_dir.is_absolute() {
+        problem_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(problem_dir)
+    };
+    let tests_dir = abs_problem_dir.join(&config.tests.dir);
     if !tests_dir.exists() {
         return Ok(Vec::new());
     }

@@ -1227,6 +1227,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "uj-core",
+ "uj-sandbox",
 ]
 
 [[package]]

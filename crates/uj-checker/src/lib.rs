@@ -5,6 +5,8 @@ use std::path::Path;
 use uj_core::verdict::Verdict;
 
 pub mod builtin;
+pub mod lemon;
+pub mod testlib;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckerError {
