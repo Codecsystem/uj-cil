@@ -565,73 +565,196 @@ pub fn run_validate_with_session(
         }
     };
 
-    let sandbox = match create_sandbox("auto", false) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Sandbox error: {e}");
-            return ExitCode::from(EXIT_JUDGE_FAILED);
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+        .min(tests.len().max(1));
+
+    if tests.is_empty() {
+        if format == OutputFormat::Json {
+            let res = serde_json::json!({ "ok": true, "validated": 0 });
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        } else {
+            println!("No test cases to validate");
         }
-    };
+        return ExitCode::from(EXIT_SUCCESS);
+    }
 
-    for test in &tests {
-        if cancel.is_cancelled() {
-            return ExitCode::from(EXIT_INTERRUPTED);
-        }
+    struct ValJob {
+        idx: usize,
+        name: String,
+        input_path: PathBuf,
+        subtask_id: Option<u32>,
+    }
 
-        let mut argv = vec![compiled_val.binary_path.as_os_str().to_os_string()];
-        if let Some(st_id) = test.subtask_id {
-            argv.push(std::ffi::OsString::from("--group"));
-            argv.push(std::ffi::OsString::from(format!("{st_id}")));
-        }
+    enum ValResult {
+        Ok,
+        Failed {
+            idx: usize,
+            name: String,
+            msg: String,
+        },
+        Error {
+            err: String,
+        },
+    }
 
-        let limits = Limits::new(5000, 512 * 1024 * 1024);
-        let spec = RunSpec {
-            argv,
-            env: vec![],
-            work_dir: problem_dir.to_path_buf(),
-            ro_binds: vec![],
-            stdin: Stdio::File(test.input_path.clone()),
-            stdout: Stdio::Pipe,
-            stderr: Stdio::Pipe,
-            extra_fds: vec![],
-            limits,
-            cpu_affinity: None,
-            seccomp_profile: Default::default(),
-            trusted: true,
-        };
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<ValJob>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<ValResult>();
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let res = match sandbox.run(&spec, cancel) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Validator runtime error: {e}");
-                return ExitCode::from(EXIT_JUDGE_FAILED);
-            }
-        };
+    for (idx, test) in tests.iter().enumerate() {
+        let _ = job_tx.send(ValJob {
+            idx,
+            name: test.name.clone(),
+            input_path: test.input_path.clone(),
+            subtask_id: test.subtask_id,
+        });
+    }
+    drop(job_tx);
 
-        if !res.status.is_success() {
-            let msg = String::from_utf8_lossy(&res.stderr_tail).trim().to_string();
-            if format == OutputFormat::Json {
-                let err = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "kind": "ValidationError",
-                        "test": test.name,
-                        "message": msg
+    let val_binary = compiled_val.binary_path.clone();
+    let prob_dir = problem_dir.to_path_buf();
+
+    let mut handles = Vec::new();
+    for _ in 0..num_workers {
+        let job_rx = job_rx.clone();
+        let res_tx = res_tx.clone();
+        let stop = stop_flag.clone();
+        let cancel = cancel.clone();
+        let val_bin = val_binary.clone();
+        let p_dir = prob_dir.clone();
+
+        let handle = std::thread::spawn(move || {
+            let sandbox = match create_sandbox("auto", false) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = res_tx.send(ValResult::Error {
+                        err: format!("Sandbox error: {e}"),
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            while let Ok(job) = job_rx.recv() {
+                if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                    break;
+                }
+
+                let mut argv = vec![val_bin.as_os_str().to_os_string()];
+                if let Some(st_id) = job.subtask_id {
+                    argv.push(std::ffi::OsString::from("--group"));
+                    argv.push(std::ffi::OsString::from(format!("{st_id}")));
+                }
+
+                let limits = Limits::new(5000, 512 * 1024 * 1024);
+                let spec = RunSpec {
+                    argv,
+                    env: vec![],
+                    work_dir: p_dir.clone(),
+                    ro_binds: vec![],
+                    stdin: Stdio::File(job.input_path.clone()),
+                    stdout: Stdio::Pipe,
+                    stderr: Stdio::Pipe,
+                    extra_fds: vec![],
+                    limits,
+                    cpu_affinity: None,
+                    seccomp_profile: Default::default(),
+                    trusted: true,
+                };
+
+                let res = match sandbox.run(&spec, &cancel) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = res_tx.send(ValResult::Error {
+                            err: format!("Validator runtime error: {e}"),
+                        });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
                     }
-                });
-                println!("{}", serde_json::to_string_pretty(&err).unwrap());
-            } else {
-                eprintln!("Validator failed on test '{}': {msg}", test.name);
+                };
+
+                if !res.status.is_success() {
+                    let msg = String::from_utf8_lossy(&res.stderr_tail).trim().to_string();
+                    let _ = res_tx.send(ValResult::Failed {
+                        idx: job.idx,
+                        name: job.name,
+                        msg,
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                } else {
+                    let _ = res_tx.send(ValResult::Ok);
+                }
             }
-            return ExitCode::from(EXIT_JUDGE_FAILED);
+        });
+        handles.push(handle);
+    }
+    drop(res_tx);
+
+    let mut first_failure: Option<(usize, String, String)> = None;
+    let mut runtime_error: Option<String> = None;
+    let mut success_count = 0;
+
+    while let Ok(res) = res_rx.recv() {
+        match res {
+            ValResult::Ok => {
+                success_count += 1;
+            }
+            ValResult::Failed { idx, name, msg } => {
+                if let Some((f_idx, _, _)) = first_failure {
+                    if idx < f_idx {
+                        first_failure = Some((idx, name, msg));
+                    }
+                } else {
+                    first_failure = Some((idx, name, msg));
+                }
+            }
+            ValResult::Error { err } => {
+                if runtime_error.is_none() {
+                    runtime_error = Some(err);
+                }
+            }
         }
     }
 
+    for h in handles {
+        let _ = h.join();
+    }
+
+    if cancel.is_cancelled() {
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
+
+    if let Some(err) = runtime_error {
+        eprintln!("{err}");
+        return ExitCode::from(EXIT_JUDGE_FAILED);
+    }
+
+    if let Some((_, name, msg)) = first_failure {
+        if format == OutputFormat::Json {
+            let err = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "kind": "ValidationError",
+                    "test": name,
+                    "message": msg
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&err).unwrap());
+        } else {
+            eprintln!("Validator failed on test '{name}': {msg}");
+        }
+        return ExitCode::from(EXIT_JUDGE_FAILED);
+    }
+
     if format == OutputFormat::Json {
-        let res = serde_json::json!({ "ok": true, "validated": tests.len() });
+        let res = serde_json::json!({ "ok": true, "validated": success_count });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
     } else {
-        println!("All {} test case(s) successfully validated", tests.len());
+        println!("All {} test case(s) successfully validated", success_count);
     }
 
     ExitCode::from(EXIT_SUCCESS)
