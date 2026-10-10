@@ -10,6 +10,7 @@
 | **Round 3** | 出题流水线标程答案多线程并发生成 (Concurrent uj ans) | crossbeam 工作池并发调用标程，前置缓存比对短路零开销，确定性最小索引回显 | **已完成** | [Round 3 报告](ROUND_3_CONCURRENT_ANS.md) |
 | **Round 4** | 出题流水线测试数据生成器多线程并发 (Concurrent uj gen) | 确定性预分配用例编号避免命名竞态，并发执行 generator，Blake3 缓存快速短路 | **已完成** | [Round 4 报告](ROUND_4_CONCURRENT_GEN.md) |
 | **Round 5** | 内置比较器 SWAR 64 位分词器加速 (wcmp / lcmp / ncmp) | 8 字节连续空格与可见 ASCII 字符 SWAR 无分支跳过，100k 单词比对仅 2.1ms (47M 单词/秒) | **已完成** | [Round 5 报告](ROUND_5_SWAR_TOKENIZER.md) |
+| **Round 6** | 沙盒 Slot 隔离目录池化复用 (Worker Box Pooling) | 槽位独占目录跨用例复用，微秒级残留擦除，彻底消除重复建删目录的 NTFS 元数据锁争抢 | **已完成** | [Round 6 报告](ROUND_6_SLOT_BOX_POOLING.md) |
 
 
 

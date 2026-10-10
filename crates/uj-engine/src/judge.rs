@@ -52,6 +52,7 @@ pub fn judge_single_test(
     cpu_affinity: Option<usize>,
     io: Option<&uj_core::config::IoConfig>,
     cancel: &CancelToken,
+    custom_box: Option<&Path>,
 ) -> SingleTestResult {
     let base_dir = test
         .input_path
@@ -65,27 +66,33 @@ pub fn judge_single_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = match sandbox.create_box_dir(base_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: 0,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some(format!("Failed to create sandbox box directory: {e}")),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(sandbox.tier()),
-            };
-        }
+    let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
+        uj_sandbox::clean_box_dir_contents(cb);
+        (cb.to_path_buf(), None, true)
+    } else {
+        let bd = match sandbox.create_box_dir(base_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                return SingleTestResult {
+                    id: test.name.clone(),
+                    subtask: test.subtask_id,
+                    verdict: Verdict::JudgeFailed,
+                    score: 0.0,
+                    time_ms: 0,
+                    wall_ms: 0,
+                    memory_kb: 0,
+                    exit: ExitInfo::default(),
+                    message: Some(format!("Failed to create sandbox box directory: {e}")),
+                    checker: None,
+                    diff: None,
+                    timing: Default::default(),
+                    sandbox_tier: Some(sandbox.tier()),
+                };
+            }
+        };
+        let rd = bd.parent().map(|p| p.to_path_buf());
+        (bd, rd, false)
     };
-    let run_dir = box_dir.parent().map(|p| p.to_path_buf());
 
     let is_file_io = io.is_some_and(|i| {
         i.mode == uj_core::config::IoMode::File || i.input_name.is_some() || i.output_name.is_some()
@@ -181,7 +188,9 @@ pub fn judge_single_test(
     let res = match run_res {
         Ok(r) => r,
         Err(e) => {
-            if let Some(ref rd) = run_dir {
+            if is_reused_box {
+                uj_sandbox::clean_box_dir_contents(&box_dir);
+            } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
             return SingleTestResult {
@@ -417,7 +426,9 @@ pub fn judge_single_test(
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
 
     // Clean up isolated run directory and all files inside it
-    if let Some(ref rd) = run_dir {
+    if is_reused_box {
+        uj_sandbox::clean_box_dir_contents(&box_dir);
+    } else if let Some(ref rd) = run_dir {
         let _ = fs::remove_dir_all(rd);
     }
 
@@ -611,6 +622,7 @@ pub fn judge_interactive_test(
     checker: Option<&ResolvedChecker>,
     pe_as_wa: bool,
     cancel: &CancelToken,
+    custom_box: Option<&Path>,
 ) -> SingleTestResult {
     let base_dir = test
         .input_path
@@ -624,27 +636,33 @@ pub fn judge_interactive_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = match sandbox.create_box_dir(base_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: 0,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some(format!("Failed to create sandbox box directory: {e}")),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(sandbox.tier()),
-            };
-        }
+    let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
+        uj_sandbox::clean_box_dir_contents(cb);
+        (cb.to_path_buf(), None, true)
+    } else {
+        let bd = match sandbox.create_box_dir(base_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                return SingleTestResult {
+                    id: test.name.clone(),
+                    subtask: test.subtask_id,
+                    verdict: Verdict::JudgeFailed,
+                    score: 0.0,
+                    time_ms: 0,
+                    wall_ms: 0,
+                    memory_kb: 0,
+                    exit: ExitInfo::default(),
+                    message: Some(format!("Failed to create sandbox box directory: {e}")),
+                    checker: None,
+                    diff: None,
+                    timing: Default::default(),
+                    sandbox_tier: Some(sandbox.tier()),
+                };
+            }
+        };
+        let rd = bd.parent().map(|p| p.to_path_buf());
+        (bd, rd, false)
     };
-    let run_dir = box_dir.parent().map(|p| p.to_path_buf());
 
     let argv_sol = if let Some(cmd) = interpreter_cmd {
         let mut modified_cmd = Vec::new();
@@ -746,7 +764,9 @@ pub fn judge_interactive_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) => {
-            if let Some(ref rd) = run_dir {
+            if is_reused_box {
+                uj_sandbox::clean_box_dir_contents(&box_dir);
+            } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
             return SingleTestResult {
@@ -766,7 +786,9 @@ pub fn judge_interactive_test(
             };
         }
         Err(e) => {
-            if let Some(ref rd) = run_dir {
+            if is_reused_box {
+                uj_sandbox::clean_box_dir_contents(&box_dir);
+            } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
             return SingleTestResult {
@@ -953,7 +975,9 @@ pub fn judge_interactive_test(
         }
     };
 
-    if let Some(ref rd) = run_dir {
+    if is_reused_box {
+        uj_sandbox::clean_box_dir_contents(&box_dir);
+    } else if let Some(ref rd) = run_dir {
         let _ = fs::remove_dir_all(rd);
     }
 
@@ -1150,6 +1174,7 @@ pub fn judge_communication_test(
     test: &TestCase,
     limits: &Limits,
     cancel: &CancelToken,
+    custom_box: Option<&Path>,
 ) -> SingleTestResult {
     let base_dir = test
         .input_path
@@ -1163,27 +1188,33 @@ pub fn judge_communication_test(
         })
         .unwrap_or_else(|| Path::new("."));
 
-    let box_dir = match sandbox.create_box_dir(base_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: 0,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some(format!("Failed to create sandbox box directory: {e}")),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(sandbox.tier()),
-            };
-        }
+    let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
+        uj_sandbox::clean_box_dir_contents(cb);
+        (cb.to_path_buf(), None, true)
+    } else {
+        let bd = match sandbox.create_box_dir(base_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                return SingleTestResult {
+                    id: test.name.clone(),
+                    subtask: test.subtask_id,
+                    verdict: Verdict::JudgeFailed,
+                    score: 0.0,
+                    time_ms: 0,
+                    wall_ms: 0,
+                    memory_kb: 0,
+                    exit: ExitInfo::default(),
+                    message: Some(format!("Failed to create sandbox box directory: {e}")),
+                    checker: None,
+                    diff: None,
+                    timing: Default::default(),
+                    sandbox_tier: Some(sandbox.tier()),
+                };
+            }
+        };
+        let rd = bd.parent().map(|p| p.to_path_buf());
+        (bd, rd, false)
     };
-    let run_dir = box_dir.parent().map(|p| p.to_path_buf());
 
     let argv_sol = if let Some(cmd) = interpreter_cmd {
         let mut modified_cmd = Vec::new();
@@ -1267,7 +1298,9 @@ pub fn judge_communication_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) | Err(_) => {
-            if let Some(ref rd) = run_dir {
+            if is_reused_box {
+                uj_sandbox::clean_box_dir_contents(&box_dir);
+            } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
             return SingleTestResult {
@@ -1326,7 +1359,9 @@ pub fn judge_communication_test(
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
 
     // Clean up isolated run directory
-    if let Some(ref rd) = run_dir {
+    if is_reused_box {
+        uj_sandbox::clean_box_dir_contents(&box_dir);
+    } else if let Some(ref rd) = run_dir {
         let _ = fs::remove_dir_all(rd);
     }
 

@@ -217,25 +217,27 @@ impl Scheduler {
         };
 
         // Prepare submission binary content once for native submissions
+        let base_dir_path = tests
+            .first()
+            .map(|t| {
+                t.input_path
+                    .parent()
+                    .and_then(|p| {
+                        if p.file_name().is_some_and(|n| n == "tests") {
+                            p.parent()
+                        } else {
+                            Some(p)
+                        }
+                    })
+                    .unwrap_or(problem_dir)
+            })
+            .unwrap_or(problem_dir)
+            .to_path_buf();
+
         let prepared_exe = if compiled.interpreter_cmd.is_none()
             && problem_config.problem_type != ProblemType::OutputOnly
         {
-            let base_dir = tests
-                .first()
-                .map(|t| {
-                    t.input_path
-                        .parent()
-                        .and_then(|p| {
-                            if p.file_name().is_some_and(|n| n == "tests") {
-                                p.parent()
-                            } else {
-                                Some(p)
-                            }
-                        })
-                        .unwrap_or(problem_dir)
-                })
-                .unwrap_or(problem_dir);
-            match uj_sandbox::prepare_binary_content(&compiled.binary_path, base_dir) {
+            match uj_sandbox::prepare_binary_content(&compiled.binary_path, &base_dir_path) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     return Err(SchedulerError::Sandbox(format!(
@@ -299,8 +301,12 @@ impl Scheduler {
             let interactor_bin_clone = interactor_bin.clone();
             let manager_bin_clone = manager_bin.clone();
             let io_config = problem_config.io.clone();
+            let base_dir_for_worker = base_dir_path.clone();
 
             let handle = thread::spawn(move || {
+                let slot_box =
+                    uj_sandbox::create_slot_box_dir(&base_dir_for_worker, worker_id).ok();
+
                 let sandbox_res = match initial_sandbox {
                     Some(sb) => Ok(sb),
                     None => create_sandbox(&sandbox_mode, require_tier),
@@ -401,6 +407,8 @@ impl Scheduler {
                         });
                     }
 
+                    let custom_box_ref = slot_box.as_ref().map(|sb| sb.box_dir.as_path());
+
                     let res = match problem_type {
                         ProblemType::Interactive => {
                             let int_exe = interactor_bin_clone
@@ -417,6 +425,7 @@ impl Scheduler {
                                 Some(&checker_clone),
                                 pe_as_wa,
                                 &cancel_clone,
+                                custom_box_ref,
                             )
                         }
                         ProblemType::OutputOnly => judge_output_only_test(
@@ -438,6 +447,7 @@ impl Scheduler {
                                     &test,
                                     &limits_clone,
                                     &cancel_clone,
+                                    custom_box_ref,
                                 )
                             } else {
                                 judge_single_test(
@@ -452,6 +462,7 @@ impl Scheduler {
                                     slot.cpu_core,
                                     Some(&io_config),
                                     &cancel_clone,
+                                    custom_box_ref,
                                 )
                             }
                         }
@@ -467,6 +478,7 @@ impl Scheduler {
                             slot.cpu_core,
                             Some(&io_config),
                             &cancel_clone,
+                            custom_box_ref,
                         ),
                     };
 
@@ -576,6 +588,9 @@ impl Scheduler {
                     ));
                 }
 
+                let rejudge_slot_box = uj_sandbox::create_slot_box_dir(&base_dir_path, 9999).ok();
+                let rejudge_box = rejudge_slot_box.as_ref().map(|sb| sb.box_dir.as_path());
+
                 for &idx in &candidate_indices {
                     if cancel.is_cancelled() {
                         break;
@@ -610,6 +625,7 @@ impl Scheduler {
                                     Some(&resolved_checker),
                                     pe_as_wa,
                                     cancel,
+                                    rejudge_box,
                                 )
                             }
                             ProblemType::OutputOnly => unreachable!(),
@@ -625,6 +641,7 @@ impl Scheduler {
                                 topology.slots.first().and_then(|s| s.cpu_core),
                                 Some(&problem_config.io),
                                 cancel,
+                                rejudge_box,
                             ),
                         };
                         samples.push(rerun.time_ms);

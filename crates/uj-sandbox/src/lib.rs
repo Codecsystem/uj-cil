@@ -216,6 +216,72 @@ pub fn create_isolated_box_dir(
     Ok(box_dir)
 }
 
+/// Recursively removes all files and subdirectories within a box directory without deleting the box directory itself.
+pub fn clean_box_dir_contents(box_dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(box_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// RAII Guard that manages an isolated slot box directory for a worker thread,
+/// cleaning up the directory tree when the worker drops.
+pub struct SlotBoxGuard {
+    pub box_dir: std::path::PathBuf,
+    pub run_dir: std::path::PathBuf,
+}
+
+impl Drop for SlotBoxGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.run_dir);
+    }
+}
+
+impl SlotBoxGuard {
+    pub fn clean(&self) {
+        clean_box_dir_contents(&self.box_dir);
+    }
+}
+
+/// Create an isolated, reusable slot box directory inside `<base_dir>/.uj/tmp/runs/slot-<pid>-<slot_id>-<ts>/box`.
+/// This eliminates per-test `fs::create_dir_all` and `fs::remove_dir_all` overhead by pooling the box across test cases.
+pub fn create_slot_box_dir(
+    base_dir: &std::path::Path,
+    slot_id: usize,
+) -> Result<SlotBoxGuard, std::io::Error> {
+    let runs_dir = base_dir.join(".uj").join("tmp").join("runs");
+    std::fs::create_dir_all(&runs_dir)?;
+
+    #[cfg(windows)]
+    {
+        let needs_auth = {
+            let mut set = AUTHORIZED_RUNS_DIRS.lock();
+            set.insert(runs_dir.clone())
+        };
+        if needs_auth && let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
+            let _ = profile.grant_access_to_path(&runs_dir);
+        }
+    }
+
+    use std::time::SystemTime;
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let run_dir = runs_dir.join(format!("slot-{pid}-{slot_id}-{ts}"));
+    let box_dir = run_dir.join("box");
+    std::fs::create_dir_all(&box_dir)?;
+
+    Ok(SlotBoxGuard { box_dir, run_dir })
+}
+
 static AUTHORIZED_BINARIES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
