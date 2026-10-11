@@ -233,9 +233,8 @@ impl CompileSession {
             include_dirs.to_vec(),
         );
 
-        if !no_cache && let Ok(meta) = fs::metadata(source_path) {
-            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let size = meta.len();
+        if !no_cache && let Some((mtime, size)) = compute_sources_stamp(source_path, extra_sources)
+        {
             let fast_cache = self.inner.fast_results.lock();
             if let Some((cached_mtime, cached_size, cached_res)) = fast_cache.get(&cache_key)
                 && *cached_mtime == mtime
@@ -387,9 +386,7 @@ impl CompileSession {
                 duration_ms: start.elapsed().as_millis() as u64,
                 cached: true,
             };
-            if let Ok(meta) = fs::metadata(source_path) {
-                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                let size = meta.len();
+            if let Some((mtime, size)) = compute_sources_stamp(source_path, extra_sources) {
                 let mut fast_cache = self.inner.fast_results.lock();
                 fast_cache.insert(cache_key, (mtime, size, res.clone()));
             }
@@ -488,15 +485,37 @@ impl CompileSession {
             cached: false,
         };
 
-        if !no_cache && let Ok(meta) = fs::metadata(source_path) {
-            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let size = meta.len();
+        if !no_cache && let Some((mtime, size)) = compute_sources_stamp(source_path, extra_sources)
+        {
             let mut fast_cache = self.inner.fast_results.lock();
             fast_cache.insert(cache_key, (mtime, size, res.clone()));
         }
 
         Ok(res)
     }
+}
+
+fn compute_sources_stamp(
+    source_path: &Path,
+    extra_sources: &[PathBuf],
+) -> Option<(std::time::SystemTime, u64)> {
+    let meta = fs::metadata(source_path).ok()?;
+    let mut latest_mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mut total_size = meta.len();
+
+    for extra in extra_sources {
+        if let Ok(m) = fs::metadata(extra) {
+            let mt = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if mt > latest_mtime {
+                latest_mtime = mt;
+            }
+            total_size = total_size.wrapping_add(m.len());
+        } else {
+            return None;
+        }
+    }
+
+    Some((latest_mtime, total_size))
 }
 
 pub struct Compiler;
@@ -600,6 +619,26 @@ mod tests {
             assert!(res2.cached);
             assert_eq!(res2.binary_path, res1.binary_path);
         }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_compute_sources_stamp_with_extra_sources() {
+        let tmp_dir = std::env::temp_dir().join(format!("uj_test_stamp_{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let src = tmp_dir.join("sol.cpp");
+        let extra = tmp_dir.join("grader.cpp");
+        fs::write(&src, b"sol").unwrap();
+        fs::write(&extra, b"grader").unwrap();
+
+        let stamp1 = compute_sources_stamp(&src, std::slice::from_ref(&extra)).unwrap();
+
+        // Modifying extra source updates the stamp
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&extra, b"grader updated content").unwrap();
+        let stamp2 = compute_sources_stamp(&src, &[extra]).unwrap();
+        assert_ne!(stamp1, stamp2);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

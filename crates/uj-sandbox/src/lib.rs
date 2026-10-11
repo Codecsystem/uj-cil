@@ -216,15 +216,70 @@ pub fn create_isolated_box_dir(
     Ok(box_dir)
 }
 
+/// Forcibly removes a file, clearing readonly attributes if needed (e.g. on Windows).
+#[allow(clippy::permissions_set_readonly_false)]
+pub fn force_remove_file(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Ok(metadata) = std::fs::symlink_metadata(path) {
+                let mut perms = metadata.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(path, perms);
+                    return std::fs::remove_file(path);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Forcibly removes a directory and all its contents, clearing readonly attributes if needed (e.g. on Windows).
+#[allow(clippy::permissions_set_readonly_false)]
+pub fn force_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            fn make_writable_recursive(dir: &std::path::Path) {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if let Ok(meta) = p.symlink_metadata() {
+                            let mut perms = meta.permissions();
+                            if perms.readonly() {
+                                perms.set_readonly(false);
+                                let _ = std::fs::set_permissions(&p, perms);
+                            }
+                            if meta.is_dir() {
+                                make_writable_recursive(&p);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(meta) = path.symlink_metadata() {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(path, perms);
+                }
+            }
+            make_writable_recursive(path);
+            std::fs::remove_dir_all(path).or(Err(e))
+        }
+    }
+}
+
 /// Recursively removes all files and subdirectories within a box directory without deleting the box directory itself.
 pub fn clean_box_dir_contents(box_dir: &std::path::Path) {
     if let Ok(entries) = std::fs::read_dir(box_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                let _ = std::fs::remove_dir_all(&path);
+                let _ = force_remove_dir_all(&path);
             } else {
-                let _ = std::fs::remove_file(&path);
+                let _ = force_remove_file(&path);
             }
         }
     }
@@ -239,7 +294,7 @@ pub struct SlotBoxGuard {
 
 impl Drop for SlotBoxGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.run_dir);
+        let _ = force_remove_dir_all(&self.run_dir);
     }
 }
 
@@ -327,14 +382,26 @@ pub fn prepare_binary_content(
     let authorized_exe = bin_dir.join(&hash[..16]);
 
     if !authorized_exe.exists() {
-        let temp_exe = bin_dir.join(format!("{}.tmp.{}", &hash[..16], std::process::id()));
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let tmp_cnt = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_exe = bin_dir.join(format!(
+            "{}.tmp.{}.{}",
+            &hash[..16],
+            std::process::id(),
+            tmp_cnt
+        ));
         std::fs::write(&temp_exe, &bytes)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&temp_exe, std::fs::Permissions::from_mode(0o755));
         }
-        let _ = std::fs::rename(&temp_exe, &authorized_exe);
+        if let Err(_rename_err) = std::fs::rename(&temp_exe, &authorized_exe) {
+            let _ = force_remove_file(&temp_exe);
+            if !authorized_exe.exists() {
+                let _ = std::fs::write(&authorized_exe, &bytes);
+            }
+        }
     }
     #[cfg(unix)]
     {
@@ -400,4 +467,59 @@ pub fn prewarm_binary(_exe_path: &std::path::Path, _work_dir: &std::path::Path) 
 #[cfg(not(windows))]
 pub fn detect_p_core_primary_cpus() -> Vec<usize> {
     (0..num_cpus::get()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_force_remove_readonly_file() {
+        let temp_dir = std::env::temp_dir().join(format!("uj_test_ro_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let test_file = temp_dir.join("readonly.txt");
+        std::fs::write(&test_file, b"test content").unwrap();
+
+        let mut perms = std::fs::metadata(&test_file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&test_file, perms).unwrap();
+
+        assert!(force_remove_file(&test_file).is_ok());
+        assert!(!test_file.exists());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_force_remove_readonly_dir_all() {
+        let temp_dir = std::env::temp_dir().join(format!("uj_test_ro_dir_{}", std::process::id()));
+        let sub_dir = temp_dir.join("sub");
+        let _ = std::fs::create_dir_all(&sub_dir);
+        let test_file = sub_dir.join("readonly.txt");
+        std::fs::write(&test_file, b"test content").unwrap();
+
+        let mut perms = std::fs::metadata(&test_file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&test_file, perms).unwrap();
+
+        assert!(force_remove_dir_all(&temp_dir).is_ok());
+        assert!(!temp_dir.exists());
+    }
+
+    #[test]
+    fn test_clean_box_dir_contents_with_readonly() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("uj_test_clean_ro_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let test_file = temp_dir.join("readonly.txt");
+        std::fs::write(&test_file, b"test content").unwrap();
+
+        let mut perms = std::fs::metadata(&test_file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&test_file, perms).unwrap();
+
+        clean_box_dir_contents(&temp_dir);
+        assert!(temp_dir.exists());
+        assert!(!test_file.exists());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

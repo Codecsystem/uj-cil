@@ -771,6 +771,7 @@ pub fn run_validate_with_session(
                     return;
                 }
             };
+            let _ = sandbox.authorize_executable(&val_bin);
 
             while let Ok(job) = job_rx.recv() {
                 if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
@@ -1086,6 +1087,7 @@ pub fn run_ans_with_session(
                     return;
                 }
             };
+            let _ = sandbox.authorize_executable(&sol_bin);
 
             while let Ok(job) = job_rx.recv() {
                 if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
@@ -1674,6 +1676,9 @@ pub fn run_stress(
             return ExitCode::from(EXIT_JUDGE_FAILED);
         }
     };
+    let _ = sandbox.authorize_executable(&compiled_gen.binary_path);
+    let _ = sandbox.authorize_executable(&compiled_sol.binary_path);
+    let _ = sandbox.authorize_executable(&compiled_brute.binary_path);
 
     let wcmp = BuiltinCheckerType::Wcmp;
     let seed_start = seed_opt.unwrap_or(1);
