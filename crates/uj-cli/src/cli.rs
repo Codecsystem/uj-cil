@@ -6,6 +6,8 @@ pub enum OutputFormat {
     Human,
     Json,
     Ndjson,
+    #[value(skip)]
+    Silent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -154,6 +156,12 @@ pub enum Commands {
             help = "Regenerate tests even if cache matches"
         )]
         force: bool,
+        #[arg(
+            long = "append",
+            default_value_t = false,
+            help = "Append new tests after existing tests instead of starting from 1"
+        )]
+        append: bool,
     },
 
     #[command(about = "Validate test inputs with validator")]

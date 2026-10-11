@@ -42,10 +42,10 @@ uj-cil/
 │   │   │   ├── process.rs     # 挂起派生、句柄列表限定 (PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
 │   │   │   └── security.rs    # AppContainer Profile 独占创建、ACL 目录赋权与清理
 │   │   └── src/none.rs        # 无隔离回退实现 (Tier::None)
-│   ├── uj-engine/             # [评测调度] 多核调度器、编译器、大小核绑定、流水线
-│   │   ├── src/compiler.rs    # 多语言编译驱动与 Blake3 源码/二进制哈希缓存
+│   ├── uj-engine/             # [评测调度] 多核调度器、编译器、大小核绑定
+│   │   ├── src/compiler.rs    # 多语言编译驱动与增量缓存
 │   │   ├── src/judge.rs       # 题目评测主循环 (标准题、交互题、通信题、提交答案题)
-│   │   ├── src/pipeline.rs    # 出题自动化流水线调度 (build -> gen -> validate -> ans -> verify)
+│   │   ├── src/scheduler.rs   # DAG 依赖拓扑驱动的线程池评测调度器
 │   │   └── src/topology.rs    # CPU 大小核识别与 P 核物理槽位独占绑定
 │   ├── uj-checker/            # [校验比较] 零拷贝比较器与第三方协议适配
 │   │   ├── src/builtin.rs     # mmap + memchr 内置快速比较器 (exact, wcmp, fcmp 等)
@@ -56,8 +56,10 @@ uj-cil/
 │   │   ├── src/csv.rs         # CSV 格式导出
 │   │   └── src/schema.rs      # JSON Schema 定义与导出
 │   ├── uj-tui/                # [终端交互] Ratatui 实时监控看板
-│   └── uj-cli/                # [命令行界面] 命令分发、MCP Server、Doctor 诊断
+│   └── uj-cli/                # [命令行界面] 命令分发、流水线、MCP Server、Doctor 诊断
 │       ├── src/cli.rs         # Clap 派生参数定义
+│       ├── src/author_cmd.rs  # 出题自动化流水线 (build -> gen -> validate -> ans -> verify -> stress)
+│       ├── src/judge_cmd.rs   # 独立评测与批量评测命令调度
 │       ├── src/mcp_server.rs  # Model Context Protocol stdio 交互服务端
 │       └── src/doctor.rs      # 宿主系统环境健康检查
 ├── tests/
@@ -163,6 +165,7 @@ MCP 服务端对外暴露的工具包含：
 - `pipeline`: 执行完整出题流水线。
 - `judge`: 评测指定源码并回传详细指标。
 - `stress`: 启动自动化对拍找反例。
+- `contest`: 批量运行比赛评测并生成完整排行榜。
 
 > 📖 **进阶使用指南**：更详细的 Agent 实战工作流、解题/出题原子操作、JSON 字段解析范式与 Token 优化建议，请参阅：
 > 👉 [**docs/AGENT_GUIDE.md — uj AI Agent 详细使用与集成指南**](docs/AGENT_GUIDE.md)

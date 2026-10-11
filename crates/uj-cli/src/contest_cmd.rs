@@ -337,28 +337,48 @@ pub fn run_contest(
         }
     }
 
-    // Rank standings: Score descending, total time ascending
+    // Rank standings: Score descending, total time ascending, name ascending
     let mut standings: Vec<ContestantStanding> = standings_map.into_values().collect();
     standings.sort_by(|a, b| {
         b.total_score
             .partial_cmp(&a.total_score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.total_time_ms.cmp(&b.total_time_ms))
+            .then_with(|| a.name.cmp(&b.name))
     });
 
-    for (idx, st) in standings.iter_mut().enumerate() {
-        st.rank = idx + 1;
+    let mut current_rank = 1;
+    for i in 0..standings.len() {
+        if i > 0 {
+            let prev = &standings[i - 1];
+            let curr = &standings[i];
+            let same_score = (curr.total_score - prev.total_score).abs() < 1e-6;
+            let same_time = curr.total_time_ms == prev.total_time_ms;
+            if !(same_score && same_time) {
+                current_rank = i + 1;
+            }
+        }
+        standings[i].rank = current_rank;
     }
 
     // Export HTML and CSV reports
     let html_path = contest_dir.join("contest_report.html");
-    if let Ok(html_content) = uj_report::generate_multi_html(&all_reports, true) {
-        let _ = fs::write(&html_path, html_content);
+    if let Ok(html_content) = uj_report::generate_multi_html(&all_reports, true)
+        && let Err(e) = fs::write(&html_path, html_content)
+    {
+        eprintln!(
+            "Failed to write HTML report to {}: {e}",
+            html_path.display()
+        );
+        return ExitCode::from(crate::error::EXIT_JUDGE_FAILED);
     }
 
     let csv_path = contest_dir.join("contest_report.csv");
     let csv_content = uj_report::generate_multi_csv(&all_reports);
-    let _ = fs::write(&csv_path, csv_content);
+    if let Err(e) = fs::write(&csv_path, csv_content) {
+        eprintln!("Failed to write CSV report to {}: {e}", csv_path.display());
+        return ExitCode::from(crate::error::EXIT_JUDGE_FAILED);
+    }
 
     // Output results
     if format == OutputFormat::Json {

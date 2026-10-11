@@ -22,27 +22,40 @@ use crate::error::{
     EXIT_USAGE_OR_CONFIG, handle_config_error,
 };
 
-/// Save a report to .uj/runs and update .uj/runs/last.json
-fn save_run_report(problem_dir: &Path, report: &SubmissionJudgeReport) {
-    let Ok(json) = serde_json::to_string_pretty(report) else {
-        return;
-    };
+static RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Save a report atomically to .uj/runs and update .uj/runs/last.json
+pub(crate) fn save_run_report(
+    problem_dir: &Path,
+    report: &SubmissionJudgeReport,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let run_filename = format!("run-{ts}.json");
+    let seq = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let run_filename = format!("run-{ts}-{pid}-{seq}.json");
 
     let targets = [
         problem_dir.join(".uj").join("runs"),
         PathBuf::from(".uj").join("runs"),
     ];
     for runs_dir in targets {
-        let _ = fs::create_dir_all(&runs_dir);
-        let _ = fs::write(runs_dir.join(&run_filename), &json);
-        let _ = fs::write(runs_dir.join("last.json"), &json);
+        fs::create_dir_all(&runs_dir)?;
+
+        let tmp_file = runs_dir.join(format!(".tmp-run-{ts}-{pid}-{seq}.json"));
+        fs::write(&tmp_file, &json)?;
+
+        let final_path = runs_dir.join(&run_filename);
+        let _ = fs::copy(&tmp_file, &final_path);
+        let _ = fs::rename(&tmp_file, runs_dir.join("last.json"));
     }
+
+    Ok(())
 }
 
 pub fn run_judge(
@@ -404,7 +417,7 @@ pub fn run_judge(
 
         match judge_res {
             Ok(report) => {
-                save_run_report(problem_dir, &report);
+                let _ = save_run_report(problem_dir, &report);
 
                 match format {
                     OutputFormat::Json => {
@@ -413,8 +426,8 @@ pub fn run_judge(
                     OutputFormat::Human => {
                         println!("{}", format_human_report(&report));
                     }
-                    OutputFormat::Ndjson => {
-                        // NDJSON events were already streamed to stdout
+                    OutputFormat::Ndjson | OutputFormat::Silent => {
+                        // NDJSON events were already streamed to stdout; Silent emits nothing
                     }
                 }
 
@@ -500,6 +513,7 @@ pub fn run_last(problem_dir: &Path, format: OutputFormat) -> ExitCode {
         OutputFormat::Human => {
             println!("{}", format_human_report(&report));
         }
+        OutputFormat::Silent => {}
     }
 
     if report.verdict == Verdict::Accepted {
@@ -556,6 +570,7 @@ pub fn run_show(
                 OutputFormat::Human => {
                     println!("{}", format_test_details(test_res));
                 }
+                OutputFormat::Silent => {}
             }
             if test_res.verdict == Verdict::Accepted {
                 ExitCode::from(EXIT_SUCCESS)
@@ -577,6 +592,7 @@ pub fn run_show(
             OutputFormat::Human => {
                 println!("{}", format_human_report(&report));
             }
+            OutputFormat::Silent => {}
         }
         if report.verdict == Verdict::Accepted {
             ExitCode::from(EXIT_SUCCESS)

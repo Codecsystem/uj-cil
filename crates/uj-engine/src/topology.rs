@@ -35,15 +35,15 @@ impl Topology {
         let default_slots = available_worker_cores.len().max(1);
 
         // Determine available memory constraint
-        let memory_constrained_slots = if memory_limit_bytes > 0 {
+        let memory_constrained_slots = if memory_limit_bytes == 0 {
+            default_slots
+        } else {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let available_mem = sys.available_memory(); // in bytes
             let usable_mem = (available_mem as f64 * 0.8) as u64;
-            let count = usable_mem / memory_limit_bytes;
+            let count = usable_mem.checked_div(memory_limit_bytes).unwrap_or(0);
             (count as usize).max(1)
-        } else {
-            default_slots
         };
 
         let calculated_slots = default_slots.min(memory_constrained_slots);

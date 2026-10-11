@@ -284,6 +284,15 @@ impl ProblemConfig {
         Ok(config)
     }
 
+    /// Calculate the total maximum score for the problem across all subtasks.
+    pub fn max_score(&self) -> f64 {
+        if self.subtasks.is_empty() {
+            100.0
+        } else {
+            self.subtasks.iter().map(|s| s.score).sum()
+        }
+    }
+
     /// Convert limits to core Limits.
     pub fn to_limits(&self) -> Result<Limits, ConfigErrorInfo> {
         let cpu_ms = parse_time_ms(&self.limits.time).map_err(|msg| ConfigErrorInfo {
@@ -353,13 +362,106 @@ impl ProblemConfig {
         Ok(lim)
     }
 
-    /// Validate logical constraints (subtask DAG acyclicity, solution main tag uniqueness).
+    /// Validate logical constraints (subtask DAG acyclicity, solution main tag uniqueness, non-empty names, finite scores).
     pub fn validate(&self, path: Option<&Path>) -> Result<(), ConfigErrorInfo> {
         let path_str = path.map(|p| p.to_string_lossy().to_string());
 
-        // Validate subtasks DAG
+        // Validate problem name
+        if self.name.trim().is_empty() {
+            return Err(ConfigErrorInfo {
+                kind: "ConfigError".to_string(),
+                message: "Problem 'name' must not be empty".to_string(),
+                hint: Some("Specify `name = \"problem_name\"` in problem.toml".to_string()),
+                path: path_str.clone(),
+                line: None,
+                column: None,
+            });
+        }
+
+        // Validate problem type requirements
+        if self.problem_type == ProblemType::Interactive && self.interactor.is_none() {
+            return Err(ConfigErrorInfo {
+                kind: "ConfigError".to_string(),
+                message: "Interactive problem requires an 'interactor' file".to_string(),
+                hint: Some("Specify `interactor = \"interactor.cpp\"` in problem.toml".to_string()),
+                path: path_str.clone(),
+                line: None,
+                column: None,
+            });
+        }
+        if self.problem_type == ProblemType::Grader && self.grader.is_none() {
+            return Err(ConfigErrorInfo {
+                kind: "ConfigError".to_string(),
+                message: "Grader problem requires a [grader] section".to_string(),
+                hint: Some("Specify `[grader]` in problem.toml".to_string()),
+                path: path_str.clone(),
+                line: None,
+                column: None,
+            });
+        }
+        if self.problem_type == ProblemType::Communication && self.manager.is_none() {
+            return Err(ConfigErrorInfo {
+                kind: "ConfigError".to_string(),
+                message: "Communication problem requires a 'manager' file".to_string(),
+                hint: Some("Specify `manager = \"manager.cpp\"` in problem.toml".to_string()),
+                path: path_str.clone(),
+                line: None,
+                column: None,
+            });
+        }
+
+        // Path safety check (prevent escaping problem directory via ..)
+        let check_path_safe = |p: &Path, field: &str| -> Result<(), ConfigErrorInfo> {
+            for comp in p.components() {
+                if let std::path::Component::ParentDir = comp {
+                    return Err(ConfigErrorInfo {
+                        kind: "ConfigError".to_string(),
+                        message: format!(
+                            "Field '{field}' contains forbidden parent reference '..': {}",
+                            p.display()
+                        ),
+                        hint: Some(
+                            "File paths must remain inside the problem directory".to_string(),
+                        ),
+                        path: path_str.clone(),
+                        line: None,
+                        column: None,
+                    });
+                }
+            }
+            Ok(())
+        };
+        if let Some(ref p) = self.interactor {
+            check_path_safe(p, "interactor")?;
+        }
+        if let Some(ref p) = self.manager {
+            check_path_safe(p, "manager")?;
+        }
+        if let Some(ref p) = self.validator {
+            check_path_safe(p, "validator")?;
+        }
+        for sol in &self.solutions {
+            check_path_safe(&sol.path, "solutions.path")?;
+        }
+
+        // Validate subtasks DAG and scores
         let mut subtask_ids = HashSet::new();
         for sub in &self.subtasks {
+            if !sub.score.is_finite() || sub.score < 0.0 {
+                return Err(ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!(
+                        "Subtask {} has invalid score '{}': score must be a non-negative finite number",
+                        sub.id, sub.score
+                    ),
+                    hint: Some(
+                        "Specify a non-negative numeric score, e.g. score = 100.0".to_string(),
+                    ),
+                    path: path_str.clone(),
+                    line: None,
+                    column: None,
+                });
+            }
             if !subtask_ids.insert(sub.id) {
                 return Err(ConfigErrorInfo {
                     kind: "ConfigError".to_string(),
@@ -470,10 +572,8 @@ fn dfs_cycle(
                     stack.push(v);
                     return true;
                 }
-                0 => {
-                    if dfs_cycle(v, adj, visited, stack) {
-                        return true;
-                    }
+                0 if dfs_cycle(v, adj, visited, stack) => {
+                    return true;
                 }
                 _ => {}
             }
@@ -507,8 +607,8 @@ pub fn parse_time_ms(s: &str) -> Result<u64, String> {
             .trim()
             .parse::<f64>()
             .map_err(|e| format!("invalid float seconds: {e}"))?;
-        if secs < 0.0 {
-            return Err("time cannot be negative".to_string());
+        if !secs.is_finite() || secs < 0.0 {
+            return Err("time must be a non-negative finite number".to_string());
         }
         Ok((secs * 1000.0).round() as u64)
     } else {
@@ -545,8 +645,8 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
         .trim()
         .parse::<f64>()
         .map_err(|e| format!("invalid number '{num_str}': {e}"))?;
-    if val < 0.0 {
-        return Err("byte size cannot be negative".to_string());
+    if !val.is_finite() || val < 0.0 {
+        return Err("byte size must be a non-negative finite number".to_string());
     }
     Ok((val * (multiplier as f64)).round() as u64)
 }
@@ -606,10 +706,18 @@ impl LanguagesConfig {
         })
     }
 
-    /// Find language config matching a given file extension.
+    /// Find language config matching a given file extension deterministically.
     pub fn find_by_extension(&self, ext: &str) -> Option<(&str, &LanguageConfig)> {
         let clean_ext = ext.trim_start_matches('.').to_lowercase();
-        for (id, lang) in &self.languages {
+        let mut entries: Vec<(&String, &LanguageConfig)> = self.languages.iter().collect();
+        entries.sort_by(
+            |(id_a, _), (id_b, _)| match (id_a.as_str(), id_b.as_str()) {
+                ("cpp17", _) => std::cmp::Ordering::Less,
+                (_, "cpp17") => std::cmp::Ordering::Greater,
+                _ => id_a.cmp(id_b),
+            },
+        );
+        for (id, lang) in entries {
             if lang.ext.iter().any(|e| e.eq_ignore_ascii_case(&clean_ext)) {
                 return Some((id.as_str(), lang));
             }
@@ -713,5 +821,91 @@ depends = [1]
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(err.message.contains("Cyclic dependency"));
+    }
+
+    #[test]
+    fn test_problem_validation_empty_name() {
+        let sample = r#"
+name = "   "
+[limits]
+time = "1s"
+memory = "256MiB"
+"#;
+        let res = ProblemConfig::from_toml_str(sample, None);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .message
+                .contains("Problem 'name' must not be empty")
+        );
+    }
+
+    #[test]
+    fn test_problem_validation_negative_or_nan_score() {
+        let sample_neg = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[[subtasks]]
+id = 1
+score = -10.0
+"#;
+        let res_neg = ProblemConfig::from_toml_str(sample_neg, None);
+        assert!(res_neg.is_err());
+        assert!(
+            res_neg
+                .unwrap_err()
+                .message
+                .contains("score must be a non-negative finite number")
+        );
+    }
+
+    #[test]
+    fn test_problem_validation_interactive_requires_interactor() {
+        let sample = r#"
+name = "interactive_prob"
+type = "interactive"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#;
+        let res = ProblemConfig::from_toml_str(sample, None);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .message
+                .contains("requires an 'interactor' file")
+        );
+    }
+
+    #[test]
+    fn test_problem_validation_path_traversal() {
+        let sample = r#"
+name = "prob"
+type = "traditional"
+interactor = "../escape.cpp"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#;
+        let res = ProblemConfig::from_toml_str(sample, None);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .message
+                .contains("forbidden parent reference '..'")
+        );
+    }
+
+    #[test]
+    fn test_parse_time_and_bytes_nan() {
+        assert!(parse_time_ms("NaNs").is_err());
+        assert!(parse_time_ms("infs").is_err());
+        assert!(parse_time_ms("-1s").is_err());
+
+        assert!(parse_bytes("NaNMiB").is_err());
+        assert!(parse_bytes("infGiB").is_err());
+        assert!(parse_bytes("-512MiB").is_err());
     }
 }

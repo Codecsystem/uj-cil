@@ -36,6 +36,7 @@ pub enum Language {
     Rust,
     Python,
     Java,
+    Go,
 }
 
 impl Language {
@@ -52,6 +53,7 @@ impl Language {
             "rs" => Ok(Self::Rust),
             "py" => Ok(Self::Python),
             "java" => Ok(Self::Java),
+            "go" => Ok(Self::Go),
             other => Err(CompileError::UnsupportedExtension(other.to_string())),
         }
     }
@@ -63,6 +65,7 @@ impl Language {
             Self::Rust => "rust",
             Self::Python => "python",
             Self::Java => "java",
+            Self::Go => "go",
         }
     }
 }
@@ -74,8 +77,8 @@ pub struct CompileSession {
     inner: std::sync::Arc<CompileSessionInner>,
 }
 
-type FastCompileKey = (PathBuf, Vec<PathBuf>, Vec<PathBuf>);
-type FastCompileValue = (std::time::SystemTime, u64, CompileResult);
+type FastCompileKey = String;
+type FastCompileValue = CompileResult;
 
 #[derive(Default)]
 struct CompileSessionInner {
@@ -227,27 +230,6 @@ impl CompileSession {
         no_cache: bool,
     ) -> Result<CompileResult, CompileError> {
         let start = Instant::now();
-        let cache_key = (
-            source_path.to_path_buf(),
-            extra_sources.to_vec(),
-            include_dirs.to_vec(),
-        );
-
-        if !no_cache && let Some((mtime, size)) = compute_sources_stamp(source_path, extra_sources)
-        {
-            let fast_cache = self.inner.fast_results.lock();
-            if let Some((cached_mtime, cached_size, cached_res)) = fast_cache.get(&cache_key)
-                && *cached_mtime == mtime
-                && *cached_size == size
-                && cached_res.binary_path.exists()
-            {
-                let mut res = cached_res.clone();
-                res.cached = true;
-                res.duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(res);
-            }
-        }
-
         let source_bytes = fs::read(source_path)?;
 
         let problem_dir = source_path
@@ -370,6 +352,21 @@ impl CompileSession {
 
         let cache_hash = hasher.finalize().to_hex().to_string();
 
+        if !no_cache {
+            let fast_cache = self.inner.fast_results.lock();
+            if let Some(cached_res) = fast_cache.get(&cache_hash)
+                && cached_res.binary_path.exists()
+                && fs::metadata(&cached_res.binary_path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            {
+                let mut res = cached_res.clone();
+                res.cached = true;
+                res.duration_ms = start.elapsed().as_millis() as u64;
+                return Ok(res);
+            }
+        }
+
         let base_cache_dir = problem_dir
             .map(|p| p.join(".uj").join("cache").join("bin"))
             .unwrap_or_else(|| PathBuf::from(".uj/cache/bin"));
@@ -377,19 +374,50 @@ impl CompileSession {
         let exe_ext = if cfg!(windows) { ".exe" } else { "" };
         let cached_bin = cache_dir.join(format!("prog{exe_ext}"));
 
-        if !no_cache && cached_bin.exists() {
+        let is_java = lang_id == "java";
+        let java_class_name = source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Main");
+        let java_class_file = cache_dir.join(format!("{java_class_name}.class"));
+
+        let target_artifact = if is_java {
+            &java_class_file
+        } else {
+            &cached_bin
+        };
+
+        if !no_cache
+            && target_artifact.exists()
+            && fs::metadata(target_artifact)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            let interpreter_cmd = if is_java {
+                let mut cmd = Vec::new();
+                for part in &lang_cfg.run {
+                    let replaced = part
+                        .replace("{dir}", &cache_dir.to_string_lossy())
+                        .replace("{stack_mb}", &stack_mb.to_string())
+                        .replace("{memory_mb}", &mem_mb.to_string())
+                        .replace("{stack_bytes}", &stack_bytes.to_string())
+                        .replace("Main", java_class_name);
+                    cmd.push(replaced);
+                }
+                Some(cmd)
+            } else {
+                None
+            };
             let res = CompileResult {
-                binary_path: cached_bin,
-                is_interpreted: false,
-                interpreter_cmd: None,
+                binary_path: target_artifact.clone(),
+                is_interpreted: is_java,
+                interpreter_cmd,
                 compiler_output: String::new(),
                 duration_ms: start.elapsed().as_millis() as u64,
                 cached: true,
             };
-            if let Some((mtime, size)) = compute_sources_stamp(source_path, extra_sources) {
-                let mut fast_cache = self.inner.fast_results.lock();
-                fast_cache.insert(cache_key, (mtime, size, res.clone()));
-            }
+            let mut fast_cache = self.inner.fast_results.lock();
+            fast_cache.insert(cache_hash, res.clone());
             return Ok(res);
         }
 
@@ -432,7 +460,7 @@ impl CompileSession {
             }
         }
 
-        // 6. Spawn compiler process with 30s timeout
+        // 6. Spawn compiler process with concurrent reader threads to prevent pipe buffer deadlock
         let mut cmd = Command::new(&compiler_bin);
         cmd.args(&final_args);
         cmd.stdout(Stdio::piped());
@@ -440,21 +468,63 @@ impl CompileSession {
 
         let mut child = cmd.spawn()?;
         let timeout = Duration::from_secs(30);
+
+        let mut stdout_pipe = child.stdout.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
+
+        let stdout_thread = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = stdout_pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if buf.len() < 1024 * 1024 {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+            buf
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = stderr_pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if buf.len() < 1024 * 1024 {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+            buf
+        });
+
         let mut timed_out = false;
+        let mut exit_status = None;
 
         loop {
             match child.try_wait()? {
-                Some(_) => break,
+                Some(st) => {
+                    exit_status = Some(st);
+                    break;
+                }
                 None => {
                     if start.elapsed() > timeout {
                         timed_out = true;
                         let _ = child.kill();
+                        let _ = child.wait();
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
         }
+
+        let stdout_bytes = stdout_thread.join().unwrap_or_default();
+        let stderr_bytes = stderr_thread.join().unwrap_or_default();
 
         if timed_out {
             return Err(CompileError::Failed(
@@ -462,60 +532,74 @@ impl CompileSession {
             ));
         }
 
-        let output = child.wait_with_output()?;
+        let status = exit_status.unwrap_or_else(|| child.wait().unwrap());
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let combined_output = format!(
             "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stdout_bytes),
+            String::from_utf8_lossy(&stderr_bytes)
         );
 
-        if !output.status.success() {
+        if !status.success() {
             let truncated = truncate_10k(&combined_output);
             return Err(CompileError::Failed(truncated));
         }
 
+        if !target_artifact.exists()
+            || fs::metadata(target_artifact)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true)
+        {
+            return Err(CompileError::Failed(
+                "Compiler succeeded but produced no valid binary file".to_string(),
+            ));
+        }
+
+        let interpreter_cmd = if is_java {
+            let mut cmd = Vec::new();
+            for part in &lang_cfg.run {
+                let replaced = part
+                    .replace("{dir}", &cache_dir.to_string_lossy())
+                    .replace("{stack_mb}", &stack_mb.to_string())
+                    .replace("{memory_mb}", &mem_mb.to_string())
+                    .replace("{stack_bytes}", &stack_bytes.to_string())
+                    .replace("Main", java_class_name);
+                cmd.push(replaced);
+            }
+            Some(cmd)
+        } else {
+            None
+        };
+
         let res = CompileResult {
-            binary_path: cached_bin,
-            is_interpreted: false,
-            interpreter_cmd: None,
+            binary_path: target_artifact.clone(),
+            is_interpreted: is_java,
+            interpreter_cmd,
             compiler_output: truncate_10k(&combined_output),
             duration_ms,
             cached: false,
         };
 
-        if !no_cache && let Some((mtime, size)) = compute_sources_stamp(source_path, extra_sources)
-        {
+        if !no_cache {
             let mut fast_cache = self.inner.fast_results.lock();
-            fast_cache.insert(cache_key, (mtime, size, res.clone()));
+            fast_cache.insert(cache_hash, res.clone());
         }
 
         Ok(res)
     }
 }
 
-fn compute_sources_stamp(
-    source_path: &Path,
-    extra_sources: &[PathBuf],
-) -> Option<(std::time::SystemTime, u64)> {
-    let meta = fs::metadata(source_path).ok()?;
-    let mut latest_mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let mut total_size = meta.len();
-
+pub fn compute_sources_hash(source_path: &Path, extra_sources: &[PathBuf]) -> Option<String> {
+    let mut hasher = blake3::Hasher::new();
+    let src_bytes = fs::read(source_path).ok()?;
+    hasher.update(&src_bytes);
     for extra in extra_sources {
-        if let Ok(m) = fs::metadata(extra) {
-            let mt = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            if mt > latest_mtime {
-                latest_mtime = mt;
-            }
-            total_size = total_size.wrapping_add(m.len());
-        } else {
-            return None;
-        }
+        let b = fs::read(extra).ok()?;
+        hasher.update(extra.to_string_lossy().as_bytes());
+        hasher.update(&b);
     }
-
-    Some((latest_mtime, total_size))
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 pub struct Compiler;
@@ -624,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_sources_stamp_with_extra_sources() {
+    fn test_compute_sources_hash_with_extra_sources() {
         let tmp_dir = std::env::temp_dir().join(format!("uj_test_stamp_{}", std::process::id()));
         let _ = fs::create_dir_all(&tmp_dir);
         let src = tmp_dir.join("sol.cpp");
@@ -632,13 +716,12 @@ mod tests {
         fs::write(&src, b"sol").unwrap();
         fs::write(&extra, b"grader").unwrap();
 
-        let stamp1 = compute_sources_stamp(&src, std::slice::from_ref(&extra)).unwrap();
+        let hash1 = compute_sources_hash(&src, std::slice::from_ref(&extra)).unwrap();
 
-        // Modifying extra source updates the stamp
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Modifying extra source updates the content hash
         fs::write(&extra, b"grader updated content").unwrap();
-        let stamp2 = compute_sources_stamp(&src, &[extra]).unwrap();
-        assert_ne!(stamp1, stamp2);
+        let hash2 = compute_sources_hash(&src, &[extra]).unwrap();
+        assert_ne!(hash1, hash2);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

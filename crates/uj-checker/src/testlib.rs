@@ -73,14 +73,27 @@ pub fn parse_appes_xml(xml: &str, pe_as_wa: bool) -> Option<CheckResult> {
             diff: None,
         }),
         "points" | "relative-scoring" | "partially-correct" | "partially" => {
-            let ratio = if let Some(ref p_str) = points_str {
-                p_str.parse::<f64>().unwrap_or(0.0).clamp(0.0, 1.0)
+            let parsed_ratio = if let Some(ref p_str) = points_str {
+                match p_str.trim().parse::<f64>() {
+                    Ok(v) if v.is_finite() => Some(v.clamp(0.0, 1.0)),
+                    _ => None,
+                }
             } else if let Some(ref pc_str) = pctype_str {
-                // pctype is integer out of 100 or exitCode
-                let p = pc_str.parse::<f64>().unwrap_or(0.0);
-                (p / 100.0).clamp(0.0, 1.0)
+                match pc_str.trim().parse::<f64>() {
+                    Ok(v) if v.is_finite() => Some((v / 100.0).clamp(0.0, 1.0)),
+                    _ => None,
+                }
             } else {
-                0.0
+                Some(0.0)
+            };
+
+            let Some(ratio) = parsed_ratio else {
+                return Some(CheckResult {
+                    verdict: Verdict::JudgeFailed,
+                    score_ratio: 0.0,
+                    message: Some("Invalid non-finite points value in testlib XML".to_string()),
+                    diff: None,
+                });
             };
 
             let verdict = if (ratio - 1.0).abs() < 1e-6 {
@@ -358,6 +371,19 @@ mod tests {
         let res = parse_appes_xml(xml, true).unwrap();
         assert_eq!(res.verdict, Verdict::PartiallyCorrect);
         assert_eq!(res.score_ratio, 0.40);
+    }
+
+    #[test]
+    fn test_parse_appes_nan_points() {
+        let xml_nan = "<result outcome=\"points\" points=\"NaN\">corrupted NaN</result>";
+        let res_nan = parse_appes_xml(xml_nan, true).unwrap();
+        assert_eq!(res_nan.verdict, Verdict::JudgeFailed);
+        assert_eq!(res_nan.score_ratio, 0.0);
+
+        let xml_inf = "<result outcome=\"points\" points=\"Infinity\">overflow Inf</result>";
+        let res_inf = parse_appes_xml(xml_inf, true).unwrap();
+        assert_eq!(res_inf.verdict, Verdict::JudgeFailed);
+        assert_eq!(res_inf.score_ratio, 0.0);
     }
 
     #[test]

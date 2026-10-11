@@ -163,6 +163,21 @@ impl JobObject {
         Ok(total_100ns / 10)
     }
 
+    /// Query the number of currently active processes assigned to this job object.
+    pub fn query_active_processes(&self) -> Result<u32, std::io::Error> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                None,
+            )?;
+        }
+        Ok(info.ActiveProcesses)
+    }
+
     /// Query peak committed memory in bytes.
     pub fn query_peak_memory_bytes(&self) -> Result<u64, std::io::Error> {
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();

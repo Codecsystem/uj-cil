@@ -535,7 +535,9 @@ pub fn generate_multi_html(
                 .unwrap_or_else(|_| "0.0".to_string());
 
             let badge_cls = map_verdict_badge(&verdict);
-            let row_detail_id = format!("test-detail-{idx}-{id}");
+            let row_detail_id = format!("test-detail-row-{idx}");
+            let escaped_id = html_escape(&id);
+            let escaped_verdict = html_escape(&verdict);
 
             let mem_str = if memory_kb > 1024 {
                 format!("{:.2} MiB", memory_kb as f64 / 1024.0)
@@ -611,8 +613,8 @@ pub fn generate_multi_html(
             let row_html = format!(
                 r#"<tr class="clickable-row" onclick="toggleDetail('{row_detail_id}')">
                     <td>{idx}</td>
-                    <td><strong>{id}</strong></td>
-                    <td><span class="badge {badge_cls}">{verdict}</span></td>
+                    <td><strong>{escaped_id}</strong></td>
+                    <td><span class="badge {badge_cls}">{escaped_verdict}</span></td>
                     <td>{time_ms} ms</td>
                     <td>{mem_str}</td>
                     <td>{score}</td>
@@ -654,7 +656,7 @@ pub fn generate_multi_html(
 
     let ctx = ReportContext {
         title: &title,
-        generated_at: "2026-10-10 16:30".to_string(),
+        generated_at: format_system_time_utc(std::time::SystemTime::now()),
         uj_version: env!("CARGO_PKG_VERSION"),
         is_contest,
         reports,
@@ -676,6 +678,55 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn format_system_time_utc(st: std::time::SystemTime) -> String {
+    let dur = st
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = dur.as_secs();
+    let secs = total_secs % 60;
+    let total_mins = total_secs / 60;
+    let mins = total_mins % 60;
+    let total_hours = total_mins / 60;
+    let hours = total_hours % 24;
+    let mut days = total_hours / 24;
+
+    let mut year = 1970;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let days_in_months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1;
+    for &dim in &days_in_months {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day = days + 1;
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{mins:02}:{secs:02} UTC")
 }
 
 #[cfg(test)]

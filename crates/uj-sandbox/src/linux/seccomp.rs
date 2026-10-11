@@ -98,52 +98,50 @@ pub fn apply_seccomp_filter() -> Result<(), std::io::Error> {
             SYS_BPF,
         ];
 
-        let mut insts = Vec::new();
-
-        // [0] Load arch (offset 4)
-        insts.push(Inst {
-            code: BPF_LD | BPF_W | BPF_ABS,
-            jt: JumpTarget::Relative(0),
-            jf: JumpTarget::Relative(0),
-            k: 4,
-        });
-        // [1] Check arch == AUDIT_ARCH_X86_64
-        insts.push(Inst {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: JumpTarget::Relative(1), // skip kill instruction
-            jf: JumpTarget::Relative(0),
-            k: AUDIT_ARCH_X86_64,
-        });
-        // [2] Kill if architecture mismatch
-        insts.push(Inst {
-            code: BPF_RET | BPF_K,
-            jt: JumpTarget::Relative(0),
-            jf: JumpTarget::Relative(0),
-            k: SECCOMP_RET_KILL_PROCESS,
-        });
-        // [3] Load syscall number (offset 0)
-        insts.push(Inst {
-            code: BPF_LD | BPF_W | BPF_ABS,
-            jt: JumpTarget::Relative(0),
-            jf: JumpTarget::Relative(0),
-            k: 0,
-        });
-
-        // [4] Block x32 ABI (nr >= 0x40000000 / __X32_SYSCALL_BIT)
-        insts.push(Inst {
-            code: BPF_JMP | BPF_JGE | BPF_K,
-            jt: JumpTarget::Enosys,
-            jf: JumpTarget::Relative(0),
-            k: 0x40000000,
-        });
-
-        // [5] Block clone3 (args are in struct pointer, return ENOSYS so glibc falls back to clone)
-        insts.push(Inst {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: JumpTarget::Enosys,
-            jf: JumpTarget::Relative(0),
-            k: SYS_CLONE3,
-        });
+        let mut insts = vec![
+            // [0] Load arch (offset 4)
+            Inst {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: JumpTarget::Relative(0),
+                jf: JumpTarget::Relative(0),
+                k: 4,
+            },
+            // [1] Check arch == AUDIT_ARCH_X86_64
+            Inst {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: JumpTarget::Relative(1), // skip kill instruction
+                jf: JumpTarget::Relative(0),
+                k: AUDIT_ARCH_X86_64,
+            },
+            // [2] Kill if architecture mismatch
+            Inst {
+                code: BPF_RET | BPF_K,
+                jt: JumpTarget::Relative(0),
+                jf: JumpTarget::Relative(0),
+                k: SECCOMP_RET_KILL_PROCESS,
+            },
+            // [3] Load syscall number (offset 0)
+            Inst {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: JumpTarget::Relative(0),
+                jf: JumpTarget::Relative(0),
+                k: 0,
+            },
+            // [4] Block x32 ABI (nr >= 0x40000000 / __X32_SYSCALL_BIT)
+            Inst {
+                code: BPF_JMP | BPF_JGE | BPF_K,
+                jt: JumpTarget::Enosys,
+                jf: JumpTarget::Relative(0),
+                k: 0x40000000,
+            },
+            // [5] Block clone3 (args are in struct pointer, return ENOSYS so glibc falls back to clone)
+            Inst {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: JumpTarget::Enosys,
+                jf: JumpTarget::Relative(0),
+                k: SYS_CLONE3,
+            },
+        ];
 
         // [6..] Check blacklisted syscalls
         for &sys_nr in &blacklist {

@@ -265,10 +265,8 @@ pub fn run_tui(
                         app.selected_idx += 1;
                     }
                 }
-                KeyCode::Enter => {
-                    if app.is_completed {
-                        break;
-                    }
+                KeyCode::Enter if app.is_completed => {
+                    break;
                 }
                 _ => {}
             }

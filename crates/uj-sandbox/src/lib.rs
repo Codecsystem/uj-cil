@@ -272,16 +272,26 @@ pub fn force_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Recursively removes all files and subdirectories within a box directory without deleting the box directory itself.
-pub fn clean_box_dir_contents(box_dir: &std::path::Path) {
-    if let Ok(entries) = std::fs::read_dir(box_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let _ = force_remove_dir_all(&path);
-            } else {
-                let _ = force_remove_file(&path);
-            }
+/// Returns Ok(true) if clean succeeded, or Err if any entry failed to delete.
+pub fn clean_box_dir_contents(box_dir: &std::path::Path) -> Result<bool, std::io::Error> {
+    let entries = std::fs::read_dir(box_dir)?;
+    let mut any_err = None;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let res = if path.is_dir() {
+            force_remove_dir_all(&path)
+        } else {
+            force_remove_file(&path)
+        };
+        if let Err(e) = res {
+            any_err = Some(e);
         }
+    }
+    if let Some(e) = any_err {
+        Err(e)
+    } else {
+        Ok(true)
     }
 }
 
@@ -299,8 +309,8 @@ impl Drop for SlotBoxGuard {
 }
 
 impl SlotBoxGuard {
-    pub fn clean(&self) {
-        clean_box_dir_contents(&self.box_dir);
+    pub fn clean(&self) -> bool {
+        clean_box_dir_contents(&self.box_dir).unwrap_or(false)
     }
 }
 
@@ -366,6 +376,9 @@ pub fn prepare_binary_content(
         let cache = PREPARED_BINARIES_CACHE.lock();
         if let Some(cached_auth) = cache.get(&key)
             && cached_auth.exists()
+            && std::fs::metadata(cached_auth)
+                .map(|m| m.len() == size)
+                .unwrap_or(false)
         {
             return Ok(cached_auth.clone());
         }
@@ -381,7 +394,15 @@ pub fn prepare_binary_content(
     #[cfg(not(windows))]
     let authorized_exe = bin_dir.join(&hash[..16]);
 
-    if !authorized_exe.exists() {
+    let need_write = if authorized_exe.exists() {
+        std::fs::metadata(&authorized_exe)
+            .map(|m| m.len() != bytes.len() as u64)
+            .unwrap_or(true)
+    } else {
+        true
+    };
+
+    if need_write {
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_cnt = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let temp_exe = bin_dir.join(format!(
@@ -398,8 +419,12 @@ pub fn prepare_binary_content(
         }
         if let Err(_rename_err) = std::fs::rename(&temp_exe, &authorized_exe) {
             let _ = force_remove_file(&temp_exe);
-            if !authorized_exe.exists() {
-                let _ = std::fs::write(&authorized_exe, &bytes);
+            if !authorized_exe.exists()
+                || std::fs::metadata(&authorized_exe)
+                    .map(|m| m.len() != bytes.len() as u64)
+                    .unwrap_or(true)
+            {
+                std::fs::write(&authorized_exe, &bytes)?;
             }
         }
     }
@@ -517,7 +542,7 @@ mod tests {
         perms.set_readonly(true);
         std::fs::set_permissions(&test_file, perms).unwrap();
 
-        clean_box_dir_contents(&temp_dir);
+        assert!(clean_box_dir_contents(&temp_dir).is_ok());
         assert!(temp_dir.exists());
         assert!(!test_file.exists());
         let _ = std::fs::remove_dir_all(&temp_dir);

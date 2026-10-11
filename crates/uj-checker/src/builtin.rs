@@ -66,10 +66,12 @@ impl<'a> Token<'a> {
         std::str::from_utf8(self.slice).unwrap_or("<invalid-utf8>")
     }
 
-    pub fn snippet(&self, max_len: usize) -> String {
+    pub fn snippet(&self, max_chars: usize) -> String {
         let s = self.as_str();
-        if s.len() > max_len {
-            format!("{}...", &s[..max_len])
+        let char_count = s.chars().count();
+        if char_count > max_chars {
+            let prefix: String = s.chars().take(max_chars).collect();
+            format!("{prefix}...")
         } else {
             s.to_string()
         }
@@ -1057,5 +1059,28 @@ mod tests {
                 ("end".to_string(), 2, 24),
             ]
         );
+    }
+
+    #[test]
+    fn test_token_snippet_multibyte_utf8() {
+        // String with multi-byte Chinese and emoji characters (each Chinese char = 3 bytes, emoji = 4 bytes)
+        let slice = "你好世界🎉Rust竞赛判题系统".as_bytes();
+        let token = Token {
+            slice,
+            line: 1,
+            col: 1,
+            index: 0,
+        };
+        // Snippet at 4 chars: "你好世界..."
+        let s4 = token.snippet(4);
+        assert_eq!(s4, "你好世界...");
+
+        // Snippet at 5 chars: "你好世界🎉..."
+        let s5 = token.snippet(5);
+        assert_eq!(s5, "你好世界🎉...");
+
+        // Snippet larger than total char count (13 chars)
+        let s20 = token.snippet(20);
+        assert_eq!(s20, "你好世界🎉Rust竞赛判题系统");
     }
 }

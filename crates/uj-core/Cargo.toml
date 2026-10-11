@@ -15,3 +15,7 @@ tracing.workspace = true
 blake3.workspace = true
 regex.workspace = true
 globset.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

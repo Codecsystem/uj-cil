@@ -48,6 +48,7 @@ pub fn run_init(dir: &Path, problem_type: &str, format: OutputFormat) -> ExitCod
         r#"schema = 1
 name = "{name}"
 type = "{problem_type}"
+validator = "validator.cpp"
 
 [limits]
 time = "1.0s"
@@ -56,8 +57,6 @@ memory = "256MB"
 [checker]
 type = "builtin"
 name = "wcmp"
-
-validator = "validator.cpp"
 
 [tests]
 dir = "tests"
@@ -210,7 +209,7 @@ int main() {
             "dir": dir.to_string_lossy()
         });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!("Initialized problem '{}' in '{}'", name, dir.display());
     }
 
@@ -351,16 +350,18 @@ pub fn run_build_with_session(
 pub fn run_gen(
     problem_dir: &Path,
     force: bool,
+    append: bool,
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
     let session = CompileSession::new();
-    run_gen_with_session(problem_dir, force, format, cancel, &session)
+    run_gen_with_session(problem_dir, force, append, format, cancel, &session)
 }
 
 pub fn run_gen_with_session(
     problem_dir: &Path,
     force: bool,
+    append: bool,
     format: OutputFormat,
     cancel: &CancelToken,
     session: &CompileSession,
@@ -388,9 +389,9 @@ pub fn run_gen_with_session(
     let tests_dir = problem_dir.join(&cfg.tests.dir);
     let _ = fs::create_dir_all(&tests_dir);
 
-    // Find starting test index
+    // Find starting test index: only scan existing tests if append is requested
     let mut max_idx = 0u32;
-    if let Ok(entries) = fs::read_dir(&tests_dir) {
+    if append && let Ok(entries) = fs::read_dir(&tests_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "in")
@@ -637,7 +638,7 @@ pub fn run_gen_with_session(
     if format == OutputFormat::Json {
         let res = serde_json::json!({ "ok": true, "generated": generated_count });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!(
             "Generated {generated_count} test case(s) in '{}'",
             tests_dir.display()
@@ -888,7 +889,7 @@ pub fn run_validate_with_session(
     if format == OutputFormat::Json {
         let res = serde_json::json!({ "ok": true, "validated": success_count });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!("All {} test case(s) successfully validated", success_count);
     }
 
@@ -1200,7 +1201,7 @@ pub fn run_ans_with_session(
     if format == OutputFormat::Json {
         let res = serde_json::json!({ "ok": true, "answers_generated": generated_count });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!("Generated {generated_count} answer file(s)");
     }
 
@@ -1320,6 +1321,7 @@ pub fn run_verify_with_session(
                             | Verdict::RuntimeError
                             | Verdict::OutputLimitExceeded
                             | Verdict::RestrictedFunction
+                            | Verdict::JudgeFailed
                     )
                 });
                 if !has_wa || has_fatal {
@@ -1339,6 +1341,7 @@ pub fn run_verify_with_session(
                             | Verdict::RuntimeError
                             | Verdict::OutputLimitExceeded
                             | Verdict::RestrictedFunction
+                            | Verdict::JudgeFailed
                     )
                 });
                 if !has_tle || has_other {
@@ -1358,6 +1361,7 @@ pub fn run_verify_with_session(
                             | Verdict::RuntimeError
                             | Verdict::OutputLimitExceeded
                             | Verdict::RestrictedFunction
+                            | Verdict::JudgeFailed
                     )
                 });
                 if !has_mle || has_other {
@@ -1377,6 +1381,7 @@ pub fn run_verify_with_session(
                             | Verdict::MemoryLimitExceeded
                             | Verdict::OutputLimitExceeded
                             | Verdict::RestrictedFunction
+                            | Verdict::JudgeFailed
                     )
                 });
                 if !has_re || has_other {
@@ -1384,12 +1389,13 @@ pub fn run_verify_with_session(
                 }
             }
             SolutionTag::Rejected => {
-                if report.verdict == Verdict::Accepted {
+                if report.verdict == Verdict::Accepted || report.verdict == Verdict::JudgeFailed {
                     matches_tag = false;
                 }
             }
             SolutionTag::Partial => {
-                if report.score <= 0.0 || report.score >= 100.0 {
+                let max_score = cfg.max_score();
+                if report.score <= 0.0 || report.score >= max_score {
                     matches_tag = false;
                 }
             }
@@ -1454,7 +1460,7 @@ pub fn run_verify_with_session(
     if format == OutputFormat::Json {
         let res = serde_json::json!({ "ok": true, "verified": cfg.solutions.len() });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!(
             "All {} solution(s) passed verification!",
             cfg.solutions.len()
@@ -1556,7 +1562,7 @@ pub fn run_tl_with_session(
             if cancel.is_cancelled() {
                 return ExitCode::from(EXIT_INTERRUPTED);
             }
-            if let Ok(report) = scheduler.judge_submission(
+            match scheduler.judge_submission(
                 problem_dir,
                 &cfg,
                 &compiled,
@@ -1566,11 +1572,46 @@ pub fn run_tl_with_session(
                 None,
                 cancel,
             ) {
-                let max_ms = report.max_time_ms;
-                if sol.tag == SolutionTag::Main {
-                    t_main = t_main.max(max_ms);
+                Ok(report) => {
+                    if !report.verdict.is_accepted() {
+                        if format == OutputFormat::Json {
+                            let err = serde_json::json!({
+                                "ok": false,
+                                "error": {
+                                    "kind": "CalibrationError",
+                                    "message": format!("Solution '{}' failed with verdict {:?}", sol_name, report.verdict)
+                                }
+                            });
+                            println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                        } else if format == OutputFormat::Human {
+                            eprintln!(
+                                "Solution '{}' failed with verdict {:?}",
+                                sol_name, report.verdict
+                            );
+                        }
+                        return ExitCode::from(EXIT_NON_AC);
+                    }
+                    let max_ms = report.max_time_ms;
+                    if sol.tag == SolutionTag::Main {
+                        t_main = t_main.max(max_ms);
+                    }
+                    t_slowest_ac = t_slowest_ac.max(max_ms);
                 }
-                t_slowest_ac = t_slowest_ac.max(max_ms);
+                Err(e) => {
+                    if format == OutputFormat::Json {
+                        let err = serde_json::json!({
+                            "ok": false,
+                            "error": {
+                                "kind": "JudgeFailed",
+                                "message": format!("Calibration judge failed: {e}")
+                            }
+                        });
+                        println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                    } else if format == OutputFormat::Human {
+                        eprintln!("Calibration judge failed: {e}");
+                    }
+                    return ExitCode::from(EXIT_JUDGE_FAILED);
+                }
             }
         }
     }
@@ -1592,7 +1633,21 @@ pub fn run_tl_with_session(
     if apply {
         let pattern = regex::Regex::new(r#"(?m)^\s*time\s*=\s*"[^"]*""#).unwrap();
         let updated = pattern.replace(&content, format!(r#"time = "{formatted_tl}""#));
-        let _ = fs::write(&config_path, updated.as_bytes());
+        if let Err(e) = fs::write(&config_path, updated.as_bytes()) {
+            if format == OutputFormat::Json {
+                let err = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "kind": "ConfigWriteError",
+                        "message": format!("Failed to write updated problem.toml: {e}")
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            } else if format == OutputFormat::Human {
+                eprintln!("Failed to write updated problem.toml: {e}");
+            }
+            return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+        }
     }
 
     if format == OutputFormat::Json {
@@ -1605,7 +1660,7 @@ pub fn run_tl_with_session(
             "applied": apply
         });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!("=== CPU Time Limit Calibration ===");
         println!("  Main solution peak CPU:       {t_main} ms");
         println!("  Slowest accepted peak CPU:    {t_slowest_ac} ms");
@@ -1721,6 +1776,31 @@ pub fn run_stress(
             }
         };
 
+        if !gen_res.status.is_success() || gen_res.killed_by.is_some() || gen_res.oom_killed {
+            let stderr_msg = String::from_utf8_lossy(&gen_res.stderr_tail);
+            let reason = format!(
+                "Generator failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
+                gen_res.status,
+                gen_res.killed_by,
+                gen_res.oom_killed,
+                stderr_msg.trim()
+            );
+            if format == OutputFormat::Json {
+                let res = serde_json::json!({
+                    "ok": false,
+                    "seed": seed,
+                    "error": {
+                        "kind": "GeneratorFailed",
+                        "message": reason
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&res).unwrap());
+            } else if format == OutputFormat::Human {
+                eprintln!("{reason}");
+            }
+            return ExitCode::from(EXIT_JUDGE_FAILED);
+        }
+
         let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
 
         // Write temp input to sandbox scratch
@@ -1753,6 +1833,43 @@ pub fn run_stress(
             }
         };
 
+        if !sol_res.status.is_success() || sol_res.killed_by.is_some() || sol_res.oom_killed {
+            let stress_dir = problem_dir.join("stress");
+            let _ = fs::create_dir_all(&stress_dir);
+            let fail_in = stress_dir.join(format!("fail-{seed}.in"));
+            let fail_sol = stress_dir.join(format!("fail-{seed}.sol.out"));
+            let _ = fs::write(&fail_in, &in_bytes);
+            let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
+            let _ = fs::write(&fail_sol, &sol_bytes);
+            let reason = format!(
+                "Solution failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
+                sol_res.status,
+                sol_res.killed_by,
+                sol_res.oom_killed,
+                String::from_utf8_lossy(&sol_res.stderr_tail).trim()
+            );
+            if format == OutputFormat::Json {
+                let res = serde_json::json!({
+                    "ok": false,
+                    "seed": seed,
+                    "diff": reason,
+                    "saved_to": stress_dir.to_string_lossy()
+                });
+                println!("{}", serde_json::to_string_pretty(&res).unwrap());
+            } else if format == OutputFormat::Human {
+                println!("=== Stress Test Failure Found on Seed {seed} ===");
+                println!("  Message:    {reason}");
+                println!("  Input:      {}", fail_in.display());
+                println!(
+                    "  Repro:      uj run -- {} < {}",
+                    compiled_sol.binary_path.display(),
+                    fail_in.display()
+                );
+            }
+            let _ = fs::remove_file(&in_tmp);
+            return ExitCode::from(EXIT_NON_AC);
+        }
+
         // 3. Run brute oracle
         let spec_brute = RunSpec {
             argv: vec![compiled_brute.binary_path.as_os_str().to_os_string()],
@@ -1779,6 +1896,31 @@ pub fn run_stress(
         };
 
         let _ = fs::remove_file(&in_tmp);
+
+        if !brute_res.status.is_success() || brute_res.killed_by.is_some() || brute_res.oom_killed {
+            let stderr_msg = String::from_utf8_lossy(&brute_res.stderr_tail);
+            let reason = format!(
+                "Brute oracle failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
+                brute_res.status,
+                brute_res.killed_by,
+                brute_res.oom_killed,
+                stderr_msg.trim()
+            );
+            if format == OutputFormat::Json {
+                let res = serde_json::json!({
+                    "ok": false,
+                    "seed": seed,
+                    "error": {
+                        "kind": "BruteFailed",
+                        "message": reason
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&res).unwrap());
+            } else if format == OutputFormat::Human {
+                eprintln!("{reason}");
+            }
+            return ExitCode::from(EXIT_JUDGE_FAILED);
+        }
 
         let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
         let brute_bytes = brute_res.stdout.map(|o| o.bytes).unwrap_or_default();
@@ -1851,56 +1993,94 @@ pub fn run_pipeline(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
-    macro_rules! step {
-        ($name:expr, $expr:expr) => {
-            if cancel.is_cancelled() {
-                return ExitCode::from(EXIT_INTERRUPTED);
-            }
+    let session = CompileSession::new();
+    let sub_format = match format {
+        OutputFormat::Json => OutputFormat::Silent,
+        other => other,
+    };
+
+    let mut step_records = Vec::new();
+    let mut failed_step: Option<String> = None;
+    let mut final_code = ExitCode::from(EXIT_SUCCESS);
+
+    let mut step = |name: &'static str, run_fn: &dyn Fn() -> ExitCode| -> bool {
+        if cancel.is_cancelled() {
+            final_code = ExitCode::from(EXIT_INTERRUPTED);
+            return false;
+        }
+        if format == OutputFormat::Human {
+            println!("==> Step: uj {name}");
+        } else if format == OutputFormat::Ndjson {
+            println!(
+                "{}",
+                serde_json::json!({ "event": "step_started", "step": name })
+            );
+        }
+
+        let code = run_fn();
+        let success = code == ExitCode::from(EXIT_SUCCESS);
+        step_records.push(serde_json::json!({
+            "name": name,
+            "status": if success { "success" } else { "failed" }
+        }));
+
+        if format == OutputFormat::Ndjson {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "step_finished",
+                    "step": name,
+                    "status": if success { "success" } else { "failed" }
+                })
+            );
+        }
+
+        if !success {
+            failed_step = Some(name.to_string());
+            final_code = code;
             if format == OutputFormat::Human {
-                println!("==> Step: uj {}", $name);
+                eprintln!("Pipeline stopped: step 'uj {name}' failed with status {code:?}");
             }
-            let code = $expr;
-            if code != ExitCode::from(EXIT_SUCCESS) {
-                if format == OutputFormat::Human {
-                    eprintln!(
-                        "Pipeline stopped: step 'uj {}' failed with status {:?}",
-                        $name, code
-                    );
-                }
-                return code;
-            }
-        };
+            return false;
+        }
+        true
+    };
+
+    if step("build", &|| {
+        run_build_with_session(problem_dir, &[], cli.no_cache, sub_format, &session)
+    }) && step("gen", &|| {
+        run_gen_with_session(problem_dir, false, false, sub_format, cancel, &session)
+    }) && step("validate", &|| {
+        run_validate_with_session(problem_dir, sub_format, cancel, &session)
+    }) && step("ans", &|| {
+        run_ans_with_session(problem_dir, false, sub_format, cancel, &session)
+    }) && step("verify", &|| {
+        run_verify_with_session(problem_dir, cli, sub_format, cancel, &session)
+    }) {
+        step("tl", &|| {
+            run_tl_with_session(problem_dir, false, cli, sub_format, cancel, &session)
+        });
     }
 
-    let session = CompileSession::new();
-
-    step!(
-        "build",
-        run_build_with_session(problem_dir, &[], cli.no_cache, format, &session)
-    );
-    step!(
-        "gen",
-        run_gen_with_session(problem_dir, false, format, cancel, &session)
-    );
-    step!(
-        "validate",
-        run_validate_with_session(problem_dir, format, cancel, &session)
-    );
-    step!(
-        "ans",
-        run_ans_with_session(problem_dir, false, format, cancel, &session)
-    );
-    step!(
-        "verify",
-        run_verify_with_session(problem_dir, cli, format, cancel, &session)
-    );
-    step!(
-        "tl",
-        run_tl_with_session(problem_dir, false, cli, format, cancel, &session)
-    );
-
-    if format == OutputFormat::Human {
+    if format == OutputFormat::Json {
+        let is_ok = failed_step.is_none();
+        let res = serde_json::json!({
+            "ok": is_ok,
+            "steps": step_records,
+            "failed_step": failed_step
+        });
+        println!("{}", serde_json::to_string_pretty(&res).unwrap());
+    } else if format == OutputFormat::Ndjson {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "pipeline_finished",
+                "ok": failed_step.is_none()
+            })
+        );
+    } else if format == OutputFormat::Human && failed_step.is_none() {
         println!("Pipeline completed successfully!");
     }
-    ExitCode::from(EXIT_SUCCESS)
+
+    final_code
 }

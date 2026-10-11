@@ -57,3 +57,13 @@ run = ["{exe}"]
 time_factor = 1.0
 max_processes = 1
 seccomp = "strict"
+
+[lang.go]
+name = "Go"
+ext = ["go"]
+compile = ["go", "build", "-o", "{exe}", "{src}"]
+run = ["{exe}"]
+time_factor = 1.5
+max_processes = 64
+seccomp = "default"
+

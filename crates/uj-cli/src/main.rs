@@ -298,13 +298,17 @@ fn main() -> ExitCode {
         Commands::Build { problem, targets } => {
             author_cmd::run_build(problem, targets, args.no_cache, format)
         }
-        Commands::Gen { problem, force } => {
+        Commands::Gen {
+            problem,
+            force,
+            append,
+        } => {
             let cancel = uj_sandbox::CancelToken::new();
             let cancel_clone = cancel.clone();
             let _ = ctrlc::set_handler(move || {
                 cancel_clone.cancel();
             });
-            author_cmd::run_gen(problem, *force, format, &cancel)
+            author_cmd::run_gen(problem, *force, *append, format, &cancel)
         }
         Commands::Validate { problem } => {
             let cancel = uj_sandbox::CancelToken::new();

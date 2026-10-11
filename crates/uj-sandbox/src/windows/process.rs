@@ -18,7 +18,7 @@ use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    ResumeThread, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_core::{PCWSTR, PWSTR};
 
@@ -208,6 +208,7 @@ pub fn execute_in_job(
     // Assign process to Job Object
     if let Err(e) = job.assign_process(pi.hProcess) {
         unsafe {
+            let _ = TerminateProcess(pi.hProcess, 1);
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
         }
@@ -287,7 +288,10 @@ pub fn execute_in_job(
         // 5. Check if process terminated
         let wait_res = unsafe { WaitForSingleObject(pi.hProcess, 5) };
         if wait_res == WAIT_OBJECT_0 {
-            break;
+            let active = job.query_active_processes().unwrap_or(0);
+            if spec.limits.max_processes <= 1 || active == 0 {
+                break;
+            }
         }
 
         // 6. Memory check
@@ -325,6 +329,11 @@ pub fn execute_in_job(
         let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
         let _ = CloseHandle(pi.hProcess);
     }
+
+    // CRITICAL (P0-02): Terminate any remaining descendant processes in the Job.
+    // Child processes that inherited stdout/stderr hold write pipe handles open.
+    // If not terminated, reader threads will block in ReadFile indefinitely!
+    let _ = job.terminate(3);
 
     // Join readers
     let captured_stdout = if let Some(h) = stdout_handle {
@@ -721,7 +730,7 @@ pub fn execute_group_in_jobs(
             stdout: captured_stdout,
             stderr_tail,
             residue_cleaned: false,
-            sandbox_tier: if i == 0 { tier } else { Tier::Degraded },
+            sandbox_tier: tier,
             exit_order: exit_order[i],
         });
     }
@@ -892,16 +901,23 @@ fn read_pipe_to_end(
                 break;
             }
             let n = bytes_read as usize;
-            if buf.len() + n > limit {
+            if buf.len() < limit {
+                let keep = n.min(limit - buf.len());
+                buf.extend_from_slice(&chunk[..keep]);
+                if buf.len() >= limit && ole_flag.is_some() {
+                    if let Some(flag) = &ole_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    break;
+                }
+            } else if ole_flag.is_some() {
                 if let Some(flag) = &ole_flag {
                     flag.store(true, Ordering::SeqCst);
                 }
-                let keep = limit.saturating_sub(buf.len());
-                buf.extend_from_slice(&chunk[..keep]);
                 break;
-            } else {
-                buf.extend_from_slice(&chunk[..n]);
             }
+            // For stderr (ole_flag is None): keep draining into chunk so the child process
+            // does not receive a broken pipe error when stderr is chatty.
         }
         let _ = CloseHandle(pipe_handle);
     }
@@ -983,7 +999,21 @@ fn build_environment_block(
 /// Runs the binary briefly inside AppContainer with CREATE_NO_WINDOW and waits up to 100ms or until it finishes,
 /// then cleanly terminates it.
 pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
-    let app_container = AppContainerProfile::get_shared().ok();
+    let app_container = match AppContainerProfile::get_shared() {
+        Ok(ac) => ac,
+        Err(e) => {
+            tracing::debug!("Skipping Windows prewarm: AppContainer creation failed: {e}");
+            return;
+        }
+    };
+    let job = match JobObject::create(None) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::debug!("Skipping Windows prewarm: JobObject creation failed: {e}");
+            return;
+        }
+    };
+
     let spec = RunSpec {
         argv: vec![exe_path.into()],
         env: vec![],
@@ -999,6 +1029,11 @@ pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
         trusted: false,
     };
 
+    if let Err(e) = job.set_limits(spec.limits.memory_bytes, 1, spec.cpu_affinity.as_deref()) {
+        tracing::debug!("Skipping Windows prewarm: Job set_limits failed: {e}");
+        return;
+    }
+
     let (h_stdin, c1) = match prepare_stdin(&spec.stdin) {
         Ok(v) => v,
         Err(_) => return,
@@ -1013,33 +1048,37 @@ pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
     };
 
     let pi = unsafe {
-        spawn_suspended_process(&spec, h_stdin, h_stdout, h_stderr, app_container.as_deref())
+        spawn_suspended_process(&spec, h_stdin, h_stdout, h_stderr, Some(&app_container))
     };
 
     drop(c1);
     drop(c2);
     drop(c3);
 
-    let job = JobObject::create(None).ok();
-    if let Some(ref j) = job {
-        let _ = j.set_limits(spec.limits.memory_bytes, 1, spec.cpu_affinity.as_deref());
-    }
-
-    if let Ok(pi) = pi {
-        if let Some(ref j) = job {
-            let _ = j.assign_process(pi.hProcess);
+    let pi = match pi {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("Skipping Windows prewarm: spawn_suspended_process failed: {e}");
+            return;
         }
+    };
+
+    if let Err(e) = job.assign_process(pi.hProcess) {
+        tracing::debug!("Skipping Windows prewarm: assign_process failed: {e}");
         unsafe {
-            let _ = ResumeThread(pi.hThread);
-            let _ = WaitForSingleObject(pi.hProcess, 50);
-            if let Some(ref j) = job {
-                let _ = j.terminate(0);
-            } else {
-                let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 0);
-            }
+            let _ = TerminateProcess(pi.hProcess, 1);
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
         }
+        return;
+    }
+
+    unsafe {
+        let _ = ResumeThread(pi.hThread);
+        let _ = WaitForSingleObject(pi.hProcess, 50);
+        let _ = job.terminate(0);
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
     }
 }
 

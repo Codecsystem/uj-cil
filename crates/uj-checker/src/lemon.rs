@@ -18,19 +18,35 @@ pub fn parse_lemon_output(
     message_content: &str,
     full_score: f64,
 ) -> CheckResult {
-    let raw_score = score_content.trim().parse::<f64>().unwrap_or(0.0);
+    let parsed = score_content.trim().parse::<f64>();
+    let raw_score = match parsed {
+        Ok(v) if v.is_finite() => v,
+        _ => {
+            return CheckResult {
+                verdict: Verdict::JudgeFailed,
+                score_ratio: 0.0,
+                message: Some("Invalid non-finite score returned by Lemon SPJ".to_string()),
+                diff: None,
+            };
+        }
+    };
+
+    if !full_score.is_finite() || full_score <= 0.0 {
+        return CheckResult {
+            verdict: Verdict::JudgeFailed,
+            score_ratio: 0.0,
+            message: Some("Invalid non-finite full_score for Lemon SPJ".to_string()),
+            diff: None,
+        };
+    }
+
+    let ratio = (raw_score / full_score).clamp(0.0, 1.0);
 
     let message = message_content.trim();
     let message_opt = if message.is_empty() {
         None
     } else {
         Some(message.to_string())
-    };
-
-    let ratio = if full_score > 0.0 {
-        (raw_score / full_score).clamp(0.0, 1.0)
-    } else {
-        0.0
     };
 
     let verdict = if (raw_score - full_score).abs() < 1e-6 || ratio >= 1.0 {
@@ -146,5 +162,13 @@ mod tests {
         let pc = parse_lemon_output("60\n", "partial 60/100", 100.0);
         assert_eq!(pc.verdict, Verdict::PartiallyCorrect);
         assert!((pc.score_ratio - 0.6).abs() < 1e-6);
+
+        let nan_res = parse_lemon_output("NaN\n", "nan score", 100.0);
+        assert_eq!(nan_res.verdict, Verdict::JudgeFailed);
+        assert_eq!(nan_res.score_ratio, 0.0);
+
+        let inf_res = parse_lemon_output("inf\n", "inf score", 100.0);
+        assert_eq!(inf_res.verdict, Verdict::JudgeFailed);
+        assert_eq!(inf_res.score_ratio, 0.0);
     }
 }

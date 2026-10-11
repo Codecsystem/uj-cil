@@ -7,7 +7,10 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uj_core::config::{ProblemConfig, SolutionTag};
@@ -19,10 +22,11 @@ use uj_engine::scheduler::Scheduler;
 use uj_report::result::SubmissionJudgeReport;
 use uj_sandbox::{CancelToken, create_sandbox};
 
+use crate::cli::{Cli, OutputFormat};
 use crate::doctor;
 use crate::error::EXIT_SUCCESS;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
     jsonrpc: String,
@@ -51,9 +55,7 @@ struct JsonRpcError {
 }
 
 pub fn run_mcp_server() -> ExitCode {
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut reader = stdin.lock();
     let mut writer = stdout.lock();
 
     let cancel = CancelToken::new();
@@ -62,15 +64,28 @@ pub fn run_mcp_server() -> ExitCode {
         cancel_clone.cancel();
     });
 
-    let mut line = String::new();
-    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+    let (line_tx, line_rx) = crossbeam_channel::unbounded::<String>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if line_tx.send(line.clone()).is_err() {
+                break;
+            }
+            line.clear();
+        }
+    });
+
+    let active_task_cancel: Arc<Mutex<Option<CancelToken>>> = Arc::new(Mutex::new(None));
+
+    while let Ok(line) = line_rx.recv() {
         if cancel.is_cancelled() {
             break;
         }
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            line.clear();
             continue;
         }
 
@@ -89,17 +104,100 @@ pub fn run_mcp_server() -> ExitCode {
                 };
                 let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
                 let _ = writer.flush();
-                line.clear();
                 continue;
             }
         };
 
-        if let Some(resp) = handle_rpc_request(req, &cancel) {
+        // Validate JSON-RPC 2.0 version
+        if req.jsonrpc != "2.0" {
+            if req.id.is_some() {
+                let err_resp = JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id: req.id.unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32600,
+                        message: "Invalid Request: jsonrpc must be '2.0'".to_string(),
+                        data: None,
+                    }),
+                };
+                let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
+                let _ = writer.flush();
+            }
+            continue;
+        }
+
+        // Handle cancellation notifications
+        let is_cancel = req.id.is_none()
+            && (req.method == "notifications/cancelled"
+                || req.method == "$/cancelRequest"
+                || req.method == "cancelled");
+        if is_cancel {
+            if let Some(token) = active_task_cancel.lock().unwrap().as_ref() {
+                token.cancel();
+            }
+            continue;
+        }
+
+        // Ignore standard notifications (no response per JSON-RPC spec)
+        if req.id.is_none()
+            && (req.method.starts_with("notifications/") || req.method.starts_with("$/"))
+        {
+            continue;
+        }
+
+        if req.method == "tools/call" {
+            let task_cancel = CancelToken::new();
+            *active_task_cancel.lock().unwrap() = Some(task_cancel.clone());
+            let (resp_tx, resp_rx) = crossbeam_channel::bounded::<JsonRpcResponse>(1);
+            let cancel_for_worker = task_cancel.clone();
+            let req_clone = req;
+
+            thread::spawn(move || {
+                let resp = handle_rpc_request(req_clone, &cancel_for_worker);
+                if let Some(r) = resp {
+                    let _ = resp_tx.send(r);
+                }
+            });
+
+            loop {
+                crossbeam_channel::select! {
+                    recv(resp_rx) -> resp_res => {
+                        if let Ok(resp) = resp_res {
+                            let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
+                            let _ = writer.flush();
+                        }
+                        *active_task_cancel.lock().unwrap() = None;
+                        break;
+                    }
+                    recv(line_rx) -> incoming_res => {
+                        match incoming_res {
+                            Ok(inc_line) => {
+                                let inc_trimmed = inc_line.trim();
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(inc_trimmed) {
+                                    let method = val.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                                    let cancel_notify = val.get("id").is_none()
+                                        && (method == "notifications/cancelled"
+                                            || method == "$/cancelRequest"
+                                            || method == "cancelled");
+                                    if cancel_notify {
+                                        task_cancel.cancel();
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                task_cancel.cancel();
+                                *active_task_cancel.lock().unwrap() = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(resp) = handle_rpc_request(req, &cancel) {
             let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
             let _ = writer.flush();
         }
-
-        line.clear();
     }
 
     ExitCode::from(EXIT_SUCCESS)
@@ -350,6 +448,32 @@ fn get_tools_list() -> Vec<Value> {
                 "required": ["dir"]
             }
         }),
+        serde_json::json!({
+            "name": "init_problem",
+            "description": "Initialize a new problem directory structure with problem.toml, validator, checker, generator and solutions",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dir": {
+                        "type": "string",
+                        "description": "Target problem directory"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Problem identifier name"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Human-readable problem title"
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "Problem type: traditional, interactive, etc."
+                    }
+                },
+                "required": ["dir"]
+            }
+        }),
     ]
 }
 
@@ -468,7 +592,8 @@ fn dispatch_tool_call(
                     None,
                     cancel,
                 )?;
-                reports.push(report);
+                reports.push(report.clone());
+                let _ = crate::judge_cmd::save_run_report(problem_dir, &report);
             }
 
             if reports.len() == 1 {
@@ -536,32 +661,47 @@ fn dispatch_tool_call(
             let prob_str = args.get("problem").and_then(|v| v.as_str()).unwrap_or(".");
             let problem_dir = Path::new(prob_str);
             let config_path = problem_dir.join("problem.toml");
+            if !config_path.exists() {
+                return Err(
+                    format!("problem.toml not found in '{}'", problem_dir.display()).into(),
+                );
+            }
             let content = fs::read_to_string(&config_path)?;
             let cfg = ProblemConfig::from_toml_str(&content, Some(&config_path))?;
-            let session = CompileSession::new();
 
-            // 1. Build
-            let mut compiled_count = 0;
-            if let Some(ref val) = cfg.validator {
-                session.compile(&problem_dir.join(val), false)?;
-                compiled_count += 1;
-            }
-            if let Some(ref chk) = cfg.checker.path {
-                session.compile(&problem_dir.join(chk), false)?;
-                compiled_count += 1;
-            }
-            for sol in &cfg.solutions {
-                session.compile(&problem_dir.join(&sol.path), false)?;
-                compiled_count += 1;
+            // Fail-closed if configured generator source does not exist
+            for g in &cfg.tests.generators {
+                let gen_path = problem_dir.join(&g.generator);
+                if !gen_path.exists() {
+                    return Err(format!(
+                        "Generator source '{}' does not exist",
+                        gen_path.display()
+                    )
+                    .into());
+                }
             }
 
-            // 2. Discover tests
+            let cli = Cli::parse_from(["uj", "pipeline"]);
+            let code =
+                crate::author_cmd::run_pipeline(problem_dir, &cli, OutputFormat::Silent, cancel);
+            if code != ExitCode::from(EXIT_SUCCESS) {
+                return Err(
+                    format!("Pipeline execution failed for '{}'", problem_dir.display()).into(),
+                );
+            }
+
             let tests = uj_core::tests::discover_tests(problem_dir, &cfg)?;
+            if tests.is_empty() {
+                return Err(format!(
+                    "Pipeline completed but no test cases found in '{}'",
+                    problem_dir.display()
+                )
+                .into());
+            }
 
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
                 "step": "pipeline_complete",
-                "components_compiled": compiled_count,
                 "tests_count": tests.len()
             }))?)
         }
@@ -725,12 +865,48 @@ fn dispatch_tool_call(
                 return Err(format!("Contest directory '{}' not found", dir_str).into());
             }
 
-            // We can invoke contest_cmd discovery and judging directly
+            let cli = Cli::parse_from(["uj", "contest", dir_str]);
+            let code =
+                crate::contest_cmd::run_contest(contest_dir, &cli, OutputFormat::Silent, cancel);
+            if code != ExitCode::from(EXIT_SUCCESS) {
+                return Err(format!("Contest judging failed for '{dir_str}'").into());
+            }
+
             let report_path = contest_dir.join("contest_report.csv");
+            if !report_path.exists() {
+                return Err(format!(
+                    "Contest report '{}' was not generated",
+                    report_path.display()
+                )
+                .into());
+            }
+
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
                 "contest_dir": dir_str,
-                "csv_report": report_path.to_string_lossy()
+                "csv_report": report_path.to_string_lossy().to_string()
+            }))?)
+        }
+        "init_problem" => {
+            let dir_str = args
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .ok_or("dir required")?;
+            let dir = Path::new(dir_str);
+            let ptype = args
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("traditional");
+
+            let code = crate::author_cmd::run_init(dir, ptype, OutputFormat::Silent);
+            if code != ExitCode::from(EXIT_SUCCESS) {
+                return Err(format!("Failed to initialize problem at '{dir_str}'").into());
+            }
+
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "dir": dir_str,
+                "message": format!("Problem initialized at '{dir_str}'")
             }))?)
         }
         _ => Err(format!("Unknown tool '{name}'").into()),

@@ -4,3 +4,5 @@ pub mod config;
 pub mod run;
 pub mod tests;
 pub mod verdict;
+
+pub use run::{ArtifactReadResult, ReadArtifactError, read_artifact_bounded};

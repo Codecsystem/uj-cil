@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use uj_core::config::ProblemConfig;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,14 +89,11 @@ pub fn generate_problem_toml(task: &LemonTask, tests_dir: Option<&str>) -> Strin
         _ => "traditional",
     };
 
-    let title = task
-        .problem_title
-        .as_deref()
-        .unwrap_or(&task.source_file_name);
-
-    toml.push_str("[problem]\n");
+    toml.push_str("schema = 1\n");
     toml.push_str(&format!("name = \"{}\"\n", task.source_file_name));
-    toml.push_str(&format!("title = \"{}\"\n", title));
+    if let Some(ref title) = task.problem_title {
+        toml.push_str(&format!("title = \"{title}\"\n"));
+    }
     toml.push_str(&format!("type = \"{problem_type}\"\n\n"));
 
     let time_limit = task
@@ -317,6 +315,26 @@ pub fn run_import_lemon(cdf_path: &Path, format: OutputFormat) -> ExitCode {
         if let Err(e) = fs::write(&toml_path, &toml_str) {
             eprintln!("Failed to write {}: {e}", toml_path.display());
             return ExitCode::from(EXIT_JUDGE_FAILED);
+        }
+
+        if let Err(e) = ProblemConfig::from_toml_str(&toml_str, Some(&toml_path)) {
+            let _ = fs::remove_dir_all(&problem_dir);
+            if format == OutputFormat::Json {
+                let err_obj = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "kind": "InvalidImportedConfig",
+                        "message": format!("Imported problem.toml for '{}' failed validation: {e}", task.source_file_name)
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
+            } else {
+                eprintln!(
+                    "Imported problem.toml for '{}' failed validation: {e}",
+                    task.source_file_name
+                );
+            }
+            return ExitCode::from(EXIT_USAGE_OR_CONFIG);
         }
 
         let total_score: f64 = task

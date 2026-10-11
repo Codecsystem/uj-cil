@@ -12,10 +12,7 @@ fn uj_bin() -> PathBuf {
     if path.ends_with("deps") {
         path.pop();
     }
-    path.push("uj.exe");
-    if !path.exists() {
-        path.set_extension("");
-    }
+    path.push(if cfg!(windows) { "uj.exe" } else { "uj" });
     path
 }
 
@@ -59,7 +56,8 @@ fn test_html_and_csv_report_generation() {
 
     assert!(
         judge_output.status.success(),
-        "Judge should pass: {}",
+        "Judge should pass: stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&judge_output.stdout),
         String::from_utf8_lossy(&judge_output.stderr)
     );
 

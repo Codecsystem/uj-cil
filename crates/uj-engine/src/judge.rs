@@ -67,7 +67,7 @@ pub fn judge_single_test(
         .unwrap_or_else(|| Path::new("."));
 
     let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
-        uj_sandbox::clean_box_dir_contents(cb);
+        let _ = uj_sandbox::clean_box_dir_contents(cb);
         (cb.to_path_buf(), None, true)
     } else {
         let bd = match sandbox.create_box_dir(base_dir) {
@@ -189,7 +189,7 @@ pub fn judge_single_test(
         Ok(r) => r,
         Err(e) => {
             if is_reused_box {
-                uj_sandbox::clean_box_dir_contents(&box_dir);
+                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
             } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
@@ -317,102 +317,185 @@ pub fn judge_single_test(
                 (Verdict::RuntimeError, 0.0, Some(msg), None, None)
             } else {
                 // Program exited cleanly (Exit code 0), run checker
-                let stdout_bytes = if is_file_io && box_dir.join(out_name).exists() {
-                    fs::read(box_dir.join(out_name)).unwrap_or_default()
+                // 1. Resolve contestant output bytes (enforcing file_io vs stdout and bounds)
+                let output_bytes_res = if is_file_io {
+                    let out_path = box_dir.join(out_name);
+                    if !out_path.exists() {
+                        Err((
+                            Verdict::WrongAnswer,
+                            0.0,
+                            Some(format!("Output file '{out_name}' was not created")),
+                            None,
+                            None,
+                        ))
+                    } else {
+                        match uj_core::read_artifact_bounded(&out_path, spec.limits.output_bytes) {
+                            Ok(art) => Ok(art.bytes),
+                            Err(uj_core::ReadArtifactError::TooLarge { size, limit }) => Err((
+                                Verdict::OutputLimitExceeded,
+                                0.0,
+                                Some(format!(
+                                    "Output file '{out_name}' size ({size} bytes) exceeds limit ({limit} bytes)"
+                                )),
+                                None,
+                                None,
+                            )),
+                            Err(e) => Err((
+                                Verdict::JudgeFailed,
+                                0.0,
+                                Some(format!("Failed to read output file '{out_name}': {e}")),
+                                None,
+                                None,
+                            )),
+                        }
+                    }
+                } else if let Some(ref out) = res.stdout {
+                    if out.truncated || res.killed_by == Some(KillReason::OutputLimit) {
+                        Err((
+                            Verdict::OutputLimitExceeded,
+                            0.0,
+                            Some("Standard output exceeded limit".to_string()),
+                            None,
+                            None,
+                        ))
+                    } else {
+                        Ok(out.bytes.clone())
+                    }
                 } else {
-                    res.stdout.map(|o| o.bytes).unwrap_or_default()
+                    Ok(Vec::new())
                 };
-                match checker {
-                    ResolvedChecker::Builtin(b) => {
-                        let ans_bytes = test
-                            .answer_path
-                            .as_ref()
-                            .and_then(|p| uj_checker::read_file_bytes(p).ok());
-                        let ans_slice = ans_bytes.as_deref().unwrap_or(b"");
 
-                        let check_res = b.check(&stdout_bytes, ans_slice);
-                        let diff = check_res.diff.map(|d| DiffSummary {
-                            line: d.line,
-                            column: d.column,
-                            token_index: d.token_index,
-                            expected: d.expected,
-                            found: d.actual,
-                            truncated: false,
-                        });
-                        (
-                            check_res.verdict,
-                            check_res.score_ratio,
-                            None,
-                            check_res.message,
-                            diff,
-                        )
-                    }
-                    ResolvedChecker::Testlib(chk_exe) => {
-                        let out_file = box_dir.join(format!(
-                            "uj_out_{}_{}_{}.txt",
-                            std::process::id(),
-                            test.name,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or(0)
-                        ));
-                        let _ = fs::write(&out_file, &stdout_bytes);
-                        let empty_path = PathBuf::new();
-                        let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
+                match output_bytes_res {
+                    Err(verdict_tuple) => verdict_tuple,
+                    Ok(stdout_bytes) => {
+                        // 2. Validate and read answer file with bounded reader
+                        match &test.answer_path {
+                            None => (
+                                Verdict::JudgeFailed,
+                                0.0,
+                                Some("No answer file specified for test case".to_string()),
+                                None,
+                                None,
+                            ),
+                            Some(ans_path) => {
+                                let ans_limit = std::cmp::max(
+                                    spec.limits.output_bytes.saturating_mul(2),
+                                    Limits::DEFAULT_OUTPUT_BYTES,
+                                );
+                                match uj_core::read_artifact_bounded(ans_path, ans_limit) {
+                                    Err(uj_core::ReadArtifactError::NotFound(p)) => (
+                                        Verdict::JudgeFailed,
+                                        0.0,
+                                        Some(format!("Answer file not found: {p}")),
+                                        None,
+                                        None,
+                                    ),
+                                    Err(uj_core::ReadArtifactError::AccessDenied(p)) => (
+                                        Verdict::JudgeFailed,
+                                        0.0,
+                                        Some(format!("Permission denied reading answer file: {p}")),
+                                        None,
+                                        None,
+                                    ),
+                                    Err(e) => (
+                                        Verdict::JudgeFailed,
+                                        0.0,
+                                        Some(format!("Failed to read answer file: {e}")),
+                                        None,
+                                        None,
+                                    ),
+                                    Ok(ans_artifact) => {
+                                        let ans_slice = &ans_artifact.bytes;
 
-                        let check_res = uj_checker::testlib::run_testlib_checker(
-                            sandbox,
-                            chk_exe,
-                            &test.input_path,
-                            &out_file,
-                            ans_file,
-                            pe_as_wa,
-                            cancel,
-                        );
-                        let _ = fs::remove_file(&out_file);
-                        (
-                            check_res.verdict,
-                            check_res.score_ratio,
-                            None,
-                            check_res.message,
-                            None,
-                        )
-                    }
-                    ResolvedChecker::Lemon {
-                        path: chk_exe,
-                        full_score,
-                    } => {
-                        let out_file = box_dir.join(format!(
-                            "uj_out_{}_{}_{}.txt",
-                            std::process::id(),
-                            test.name,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or(0)
-                        ));
-                        let _ = fs::write(&out_file, &stdout_bytes);
-                        let empty_path = PathBuf::new();
-                        let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
+                                        match checker {
+                                            ResolvedChecker::Builtin(b) => {
+                                                let check_res = b.check(&stdout_bytes, ans_slice);
+                                                let diff = check_res.diff.map(|d| DiffSummary {
+                                                    line: d.line,
+                                                    column: d.column,
+                                                    token_index: d.token_index,
+                                                    expected: d.expected,
+                                                    found: d.actual,
+                                                    truncated: false,
+                                                });
+                                                (
+                                                    check_res.verdict,
+                                                    check_res.score_ratio,
+                                                    None,
+                                                    check_res.message,
+                                                    diff,
+                                                )
+                                            }
+                                            ResolvedChecker::Testlib(chk_exe) => {
+                                                let out_file = box_dir.join(format!(
+                                                    "uj_out_{}_{}_{}.txt",
+                                                    std::process::id(),
+                                                    test.name,
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_nanos())
+                                                        .unwrap_or(0)
+                                                ));
+                                                let _ = fs::write(&out_file, &stdout_bytes);
 
-                        let check_res = uj_checker::lemon::run_lemon_checker(
-                            sandbox,
-                            chk_exe,
-                            &test.input_path,
-                            &out_file,
-                            ans_file,
-                            *full_score,
-                            cancel,
-                        );
-                        let _ = fs::remove_file(&out_file);
-                        (
-                            check_res.verdict,
-                            check_res.score_ratio,
-                            None,
-                            check_res.message,
-                            None,
-                        )
+                                                let check_res =
+                                                    uj_checker::testlib::run_testlib_checker(
+                                                        sandbox,
+                                                        chk_exe,
+                                                        &test.input_path,
+                                                        &out_file,
+                                                        ans_path,
+                                                        pe_as_wa,
+                                                        cancel,
+                                                    );
+                                                let _ = fs::remove_file(&out_file);
+                                                (
+                                                    check_res.verdict,
+                                                    check_res.score_ratio,
+                                                    None,
+                                                    check_res.message,
+                                                    None,
+                                                )
+                                            }
+                                            ResolvedChecker::Lemon {
+                                                path: chk_exe,
+                                                full_score,
+                                            } => {
+                                                let out_file = box_dir.join(format!(
+                                                    "uj_out_{}_{}_{}.txt",
+                                                    std::process::id(),
+                                                    test.name,
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_nanos())
+                                                        .unwrap_or(0)
+                                                ));
+                                                let _ = fs::write(&out_file, &stdout_bytes);
+
+                                                let check_res =
+                                                    uj_checker::lemon::run_lemon_checker(
+                                                        sandbox,
+                                                        chk_exe,
+                                                        &test.input_path,
+                                                        &out_file,
+                                                        ans_path,
+                                                        *full_score,
+                                                        cancel,
+                                                    );
+                                                let _ = fs::remove_file(&out_file);
+                                                (
+                                                    check_res.verdict,
+                                                    check_res.score_ratio,
+                                                    None,
+                                                    check_res.message,
+                                                    None,
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -427,7 +510,7 @@ pub fn judge_single_test(
 
     // Clean up isolated run directory and all files inside it
     if is_reused_box {
-        uj_sandbox::clean_box_dir_contents(&box_dir);
+        let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
     } else if let Some(ref rd) = run_dir {
         let _ = fs::remove_dir_all(rd);
     }
@@ -455,6 +538,64 @@ pub fn judge_single_test(
         },
         sandbox_tier: Some(res.sandbox_tier),
     }
+}
+
+/// Compute deterministic topological order of subtask configurations.
+fn topological_subtask_order(subtasks: &[uj_core::config::SubtaskConfig]) -> Vec<usize> {
+    let n = subtasks.len();
+    if n <= 1 {
+        return (0..n).collect();
+    }
+
+    let id_to_idx: std::collections::HashMap<u32, usize> = subtasks
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| (s.id, idx))
+        .collect();
+
+    let mut in_degree: Vec<usize> = vec![0; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (u_idx, st) in subtasks.iter().enumerate() {
+        for &dep_id in &st.depends {
+            if let Some(&dep_idx) = id_to_idx.get(&dep_id)
+                && dep_idx != u_idx
+            {
+                in_degree[u_idx] += 1;
+                dependents[dep_idx].push(u_idx);
+            }
+        }
+    }
+
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<(u32, usize)>> =
+        std::collections::BinaryHeap::new();
+
+    for (idx, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(std::cmp::Reverse((subtasks[idx].id, idx)));
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse((_, u_idx))) = ready.pop() {
+        order.push(u_idx);
+        for &v_idx in &dependents[u_idx] {
+            in_degree[v_idx] -= 1;
+            if in_degree[v_idx] == 0 {
+                ready.push(std::cmp::Reverse((subtasks[v_idx].id, v_idx)));
+            }
+        }
+    }
+
+    if order.len() < n {
+        for idx in 0..n {
+            if !order.contains(&idx) {
+                order.push(idx);
+            }
+        }
+    }
+
+    order
 }
 
 /// Aggregate single test results into subtasks and overall submission report.
@@ -490,24 +631,27 @@ pub fn aggregate_submission_report(
         }
     }
 
-    let mut subtask_results = Vec::new();
-    let mut total_score_fixed: i64 = 0;
-    let mut worst_verdict = Verdict::Accepted;
+    let mut subtask_results_map: std::collections::HashMap<u32, SubtaskResult> =
+        std::collections::HashMap::new();
 
-    // Evaluate subtasks defined in config using fixed-point integer math (scale 10_000)
-    for st_cfg in &config.subtasks {
+    // Evaluate subtasks in deterministic topological order
+    let topo_indices = topological_subtask_order(&config.subtasks);
+
+    for &idx in &topo_indices {
+        let st_cfg = &config.subtasks[idx];
         let tests = subtask_map.remove(&st_cfg.id).unwrap_or_default();
         let test_ids: Vec<String> = tests.iter().map(|t| t.id.clone()).collect();
         let st_max_fixed = (st_cfg.score * 10000.0).round() as i64;
 
-        // Check dependencies
+        // Check dependencies - all dependencies are already evaluated and in subtask_results_map
         let mut dep_failed = false;
         for &dep_id in &st_cfg.depends {
-            if let Some(dep_res) = subtask_results
-                .iter()
-                .find(|s: &&SubtaskResult| s.id == dep_id)
-                && dep_res.score < dep_res.max_score
-            {
+            if let Some(dep_res) = subtask_results_map.get(&dep_id) {
+                if dep_res.score < dep_res.max_score || dep_res.verdict != Verdict::Accepted {
+                    dep_failed = true;
+                    break;
+                }
+            } else {
                 dep_failed = true;
                 break;
             }
@@ -543,7 +687,11 @@ pub fn aggregate_submission_report(
                     .sum(),
             };
 
-            let final_verdict = if score_fixed >= st_max_fixed {
+            // Verdict resolution:
+            // Severe errors (SE, CE, RF, MLE, OLE, TLE, RE) must NEVER be masked by PartiallyCorrect!
+            let final_verdict = if score_fixed >= st_max_fixed
+                || worst.priority() > Verdict::WrongAnswer.priority()
+            {
                 worst
             } else if score_fixed > 0 {
                 Verdict::PartiallyCorrect
@@ -555,16 +703,30 @@ pub fn aggregate_submission_report(
         };
 
         let st_score = st_score_fixed as f64 / 10000.0;
-        worst_verdict = worst_verdict.merge(st_verdict);
-        total_score_fixed += st_score_fixed;
 
-        subtask_results.push(SubtaskResult {
-            id: st_cfg.id,
-            score: st_score,
-            max_score: st_cfg.score,
-            verdict: st_verdict,
-            test_ids,
-        });
+        subtask_results_map.insert(
+            st_cfg.id,
+            SubtaskResult {
+                id: st_cfg.id,
+                score: st_score,
+                max_score: st_cfg.score,
+                verdict: st_verdict,
+                test_ids,
+            },
+        );
+    }
+
+    let mut subtask_results = Vec::new();
+    let mut total_score_fixed: i64 = 0;
+    let mut worst_verdict = Verdict::Accepted;
+
+    // Assemble subtasks in config declaration order
+    for st_cfg in &config.subtasks {
+        if let Some(res) = subtask_results_map.remove(&st_cfg.id) {
+            worst_verdict = worst_verdict.merge(res.verdict);
+            total_score_fixed += (res.score * 10000.0).round() as i64;
+            subtask_results.push(res);
+        }
     }
 
     // Handle any unassigned tests
@@ -587,7 +749,10 @@ pub fn aggregate_submission_report(
         Verdict::JudgeFailed
     } else if (total_score - max_possible_score).abs() < 1e-6 && max_possible_score > 0.0 {
         worst_verdict
-    } else if total_score > 0.0 && worst_verdict == Verdict::WrongAnswer {
+    } else if worst_verdict.priority() > Verdict::WrongAnswer.priority() {
+        // Severe errors (JudgeFailed, TLE, MLE, OLE, RE, etc.) must NEVER be masked by PC!
+        worst_verdict
+    } else if total_score > 0.0 && worst_verdict.priority() <= Verdict::WrongAnswer.priority() {
         Verdict::PartiallyCorrect
     } else {
         worst_verdict
@@ -637,7 +802,7 @@ pub fn judge_interactive_test(
         .unwrap_or_else(|| Path::new("."));
 
     let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
-        uj_sandbox::clean_box_dir_contents(cb);
+        let _ = uj_sandbox::clean_box_dir_contents(cb);
         (cb.to_path_buf(), None, true)
     } else {
         let bd = match sandbox.create_box_dir(base_dir) {
@@ -695,8 +860,17 @@ pub fn judge_interactive_test(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    let tout_file = box_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
-    let result_file = box_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
+    // CRITICAL (P0-01): Create a dedicated trusted directory OUTSIDE the contestant's box_dir.
+    // The contestant's AppContainer on Windows and userns on Linux only have write access to box_dir.
+    // Placing judge results outside box_dir prevents contestant code from spoofing or modifying XML results.
+    let trusted_dir = box_dir
+        .parent()
+        .unwrap_or(&box_dir)
+        .join(format!("trusted_int_{pid}_{time_now}"));
+    let _ = fs::create_dir_all(&trusted_dir);
+
+    let tout_file = trusted_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
+    let result_file = trusted_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
 
     let spec_sol = RunSpec {
         argv: argv_sol,
@@ -764,8 +938,9 @@ pub fn judge_interactive_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) => {
+            let _ = fs::remove_dir_all(&trusted_dir);
             if is_reused_box {
-                uj_sandbox::clean_box_dir_contents(&box_dir);
+                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
             } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
@@ -781,13 +956,14 @@ pub fn judge_interactive_test(
                 message: Some("Incomplete process group results".to_string()),
                 checker: None,
                 diff: None,
-                timing: Default::default(),
+                timing: TimingInfo::default(),
                 sandbox_tier: Some(sandbox.tier()),
             };
         }
         Err(e) => {
+            let _ = fs::remove_dir_all(&trusted_dir);
             if is_reused_box {
-                uj_sandbox::clean_box_dir_contents(&box_dir);
+                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
             } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
@@ -975,8 +1151,9 @@ pub fn judge_interactive_test(
         }
     };
 
+    let _ = fs::remove_dir_all(&trusted_dir);
     if is_reused_box {
-        uj_sandbox::clean_box_dir_contents(&box_dir);
+        let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
     } else if let Some(ref rd) = run_dir {
         let _ = fs::remove_dir_all(rd);
     }
@@ -1073,15 +1250,131 @@ pub fn judge_output_only_test(
         };
     };
 
-    let empty_path = PathBuf::new();
-    let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
+    // P0-03: Validate answer file existence
+    let ans_path = match &test.answer_path {
+        Some(p) if p.is_file() => p,
+        Some(p) => {
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms: 0,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                message: Some(format!("Answer file not found: {}", p.display())),
+                checker: None,
+                diff: None,
+                timing: TimingInfo {
+                    rejudged: false,
+                    confidence: "high".to_string(),
+                    samples_ms: vec![0],
+                },
+                sandbox_tier: Some(Tier::None),
+            };
+        }
+        None => {
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                time_ms: 0,
+                wall_ms: 0,
+                memory_kb: 0,
+                exit: ExitInfo::default(),
+                message: Some("No answer file specified for test case".to_string()),
+                checker: None,
+                diff: None,
+                timing: TimingInfo {
+                    rejudged: false,
+                    confidence: "high".to_string(),
+                    samples_ms: vec![0],
+                },
+                sandbox_tier: Some(Tier::None),
+            };
+        }
+    };
+
+    // P0-03: Enforce output size limit on submitted output file
+    let out_artifact =
+        match uj_core::read_artifact_bounded(&existing_out, Limits::DEFAULT_OUTPUT_BYTES) {
+            Ok(art) => art,
+            Err(uj_core::ReadArtifactError::TooLarge { size, limit, .. }) => {
+                return SingleTestResult {
+                    id: test.name.clone(),
+                    subtask: test.subtask_id,
+                    verdict: Verdict::OutputLimitExceeded,
+                    score: 0.0,
+                    time_ms: 0,
+                    wall_ms: 0,
+                    memory_kb: 0,
+                    exit: ExitInfo::default(),
+                    message: Some(format!(
+                        "Submission output file exceeded limit ({size} > {limit} bytes)"
+                    )),
+                    checker: None,
+                    diff: None,
+                    timing: TimingInfo {
+                        rejudged: false,
+                        confidence: "high".to_string(),
+                        samples_ms: vec![0],
+                    },
+                    sandbox_tier: Some(Tier::None),
+                };
+            }
+            Err(e) => {
+                return SingleTestResult {
+                    id: test.name.clone(),
+                    subtask: test.subtask_id,
+                    verdict: Verdict::JudgeFailed,
+                    score: 0.0,
+                    time_ms: 0,
+                    wall_ms: 0,
+                    memory_kb: 0,
+                    exit: ExitInfo::default(),
+                    message: Some(format!("Failed to read submission output file: {e}")),
+                    checker: None,
+                    diff: None,
+                    timing: TimingInfo {
+                        rejudged: false,
+                        confidence: "high".to_string(),
+                        samples_ms: vec![0],
+                    },
+                    sandbox_tier: Some(Tier::None),
+                };
+            }
+        };
 
     let (mut verdict, score_ratio, checker_msg, diff) = match checker {
         ResolvedChecker::Builtin(b) => {
-            let out_bytes = fs::read(&existing_out).unwrap_or_default();
-            let ans_bytes = uj_checker::read_file_bytes(ans_file).ok();
-            let ans_slice = ans_bytes.as_deref().unwrap_or(b"");
-            let check_res = b.check(&out_bytes, ans_slice);
+            let ans_artifact =
+                match uj_core::read_artifact_bounded(ans_path, Limits::DEFAULT_OUTPUT_BYTES * 2) {
+                    Ok(art) => art,
+                    Err(e) => {
+                        return SingleTestResult {
+                            id: test.name.clone(),
+                            subtask: test.subtask_id,
+                            verdict: Verdict::JudgeFailed,
+                            score: 0.0,
+                            time_ms: 0,
+                            wall_ms: 0,
+                            memory_kb: 0,
+                            exit: ExitInfo::default(),
+                            message: Some(format!("Failed to read answer file: {e}")),
+                            checker: None,
+                            diff: None,
+                            timing: TimingInfo {
+                                rejudged: false,
+                                confidence: "high".to_string(),
+                                samples_ms: vec![0],
+                            },
+                            sandbox_tier: Some(Tier::None),
+                        };
+                    }
+                };
+            let check_res = b.check(&out_artifact.bytes, &ans_artifact.bytes);
             let diff = check_res.diff.map(|d| DiffSummary {
                 line: d.line,
                 column: d.column,
@@ -1103,7 +1396,7 @@ pub fn judge_output_only_test(
                 chk_exe,
                 &test.input_path,
                 &existing_out,
-                ans_file,
+                ans_path,
                 pe_as_wa,
                 cancel,
             );
@@ -1123,7 +1416,7 @@ pub fn judge_output_only_test(
                 chk_exe,
                 &test.input_path,
                 &existing_out,
-                ans_file,
+                ans_path,
                 *full_score,
                 cancel,
             );
@@ -1175,6 +1468,7 @@ pub fn judge_communication_test(
     limits: &Limits,
     cancel: &CancelToken,
     custom_box: Option<&Path>,
+    num_processes: usize,
 ) -> SingleTestResult {
     let base_dir = test
         .input_path
@@ -1189,7 +1483,7 @@ pub fn judge_communication_test(
         .unwrap_or_else(|| Path::new("."));
 
     let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
-        uj_sandbox::clean_box_dir_contents(cb);
+        let _ = uj_sandbox::clean_box_dir_contents(cb);
         (cb.to_path_buf(), None, true)
     } else {
         let bd = match sandbox.create_box_dir(base_dir) {
@@ -1215,6 +1509,9 @@ pub fn judge_communication_test(
         let rd = bd.parent().map(|p| p.to_path_buf());
         (bd, rd, false)
     };
+
+    let trusted_dir = tempfile::tempdir().ok();
+    let score_file = trusted_dir.as_ref().map(|d| d.path().join("score.txt"));
 
     let argv_sol = if let Some(cmd) = interpreter_cmd {
         let mut modified_cmd = Vec::new();
@@ -1245,12 +1542,22 @@ pub fn judge_communication_test(
     let mut mgr_limits = Limits::new(limits.cpu_time_ms * 2 + 5000, 1024 * 1024 * 1024);
     mgr_limits.wall_time_ms = limits.wall_time_ms + 2000;
 
+    let mut mgr_argv = vec![
+        manager_exe.as_os_str().to_os_string(),
+        test.input_path.as_os_str().to_os_string(),
+    ];
+    let mut mgr_env = Vec::new();
+    if let Some(ref sf) = score_file {
+        mgr_argv.push(sf.as_os_str().to_os_string());
+        mgr_env.push((
+            std::ffi::OsString::from("UJ_SCORE_FILE"),
+            sf.as_os_str().to_os_string(),
+        ));
+    }
+
     let spec_mgr = RunSpec {
-        argv: vec![
-            manager_exe.as_os_str().to_os_string(),
-            test.input_path.as_os_str().to_os_string(),
-        ],
-        env: vec![],
+        argv: mgr_argv,
+        env: mgr_env,
         work_dir: box_dir.clone(),
         ro_binds: vec![],
         stdin: Stdio::Inherit,
@@ -1278,28 +1585,53 @@ pub fn judge_communication_test(
         trusted: false,
     };
 
-    let wiring = Wiring {
-        connections: vec![
-            PipeConnection {
-                from_proc: 0,
-                to_proc: 1,
-            },
-            PipeConnection {
-                from_proc: 1,
-                to_proc: 0,
-            },
-        ],
+    let num_participants = num_processes.max(1);
+    let mut specs = vec![spec_mgr];
+    for _ in 0..num_participants {
+        specs.push(spec_sol.clone());
+    }
+
+    let wiring = if num_participants == 1 {
+        Wiring {
+            connections: vec![
+                PipeConnection {
+                    from_proc: 0,
+                    to_proc: 1,
+                },
+                PipeConnection {
+                    from_proc: 1,
+                    to_proc: 0,
+                },
+            ],
+        }
+    } else {
+        let mut connections = Vec::new();
+        connections.push(PipeConnection {
+            from_proc: 0,
+            to_proc: 1,
+        });
+        for p in 1..num_participants {
+            connections.push(PipeConnection {
+                from_proc: p,
+                to_proc: p + 1,
+            });
+        }
+        connections.push(PipeConnection {
+            from_proc: num_participants,
+            to_proc: 0,
+        });
+        Wiring { connections }
     };
 
     let start_instant = Instant::now();
-    let group_res = sandbox.run_group(&[spec_mgr, spec_sol], &wiring, cancel);
+    let group_res = sandbox.run_group(&specs, &wiring, cancel);
     let wall_ms = start_instant.elapsed().as_millis() as u64;
 
     let results = match group_res {
-        Ok(r) if r.len() >= 2 => r,
+        Ok(r) if r.len() > num_participants => r,
         Ok(_) | Err(_) => {
             if is_reused_box {
-                uj_sandbox::clean_box_dir_contents(&box_dir);
+                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
             } else if let Some(ref rd) = run_dir {
                 let _ = fs::remove_dir_all(rd);
             }
@@ -1322,29 +1654,211 @@ pub fn judge_communication_test(
     };
 
     let mgr_res = &results[0];
-    let sol_res = &results[1];
+    let sol_results = &results[1..];
 
-    let time_ms = (sol_res.cpu_time_us / 1000).max(1);
-    let memory_kb = sol_res.memory_peak_bytes / 1024;
+    let max_time_us = sol_results.iter().map(|r| r.cpu_time_us).max().unwrap_or(0);
+    let time_ms = (max_time_us / 1000).max(1);
+    let max_peak_bytes = sol_results
+        .iter()
+        .map(|r| r.memory_peak_bytes)
+        .max()
+        .unwrap_or(0);
+    let memory_kb = max_peak_bytes / 1024;
+    let participant_tier = sol_results[0].sandbox_tier;
 
+    let cleanup = || {
+        if is_reused_box {
+            let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
+        } else if let Some(ref rd) = run_dir {
+            let _ = fs::remove_dir_all(rd);
+        }
+    };
+
+    if cancel.is_cancelled() {
+        cleanup();
+        return SingleTestResult {
+            id: test.name.clone(),
+            subtask: test.subtask_id,
+            verdict: Verdict::JudgeFailed,
+            score: 0.0,
+            time_ms,
+            wall_ms,
+            memory_kb,
+            exit: ExitInfo::default(),
+            message: Some("Cancelled by user".to_string()),
+            checker: None,
+            diff: None,
+            timing: Default::default(),
+            sandbox_tier: Some(participant_tier),
+        };
+    }
+
+    // Check if any participant violated limits or crashed
+    for (i, p_res) in sol_results.iter().enumerate() {
+        if p_res.killed_by == Some(KillReason::CpuLimit)
+            || p_res.killed_by == Some(KillReason::WallLimit)
+        {
+            cleanup();
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::TimeLimitExceeded,
+                score: 0.0,
+                time_ms,
+                wall_ms,
+                memory_kb,
+                exit: ExitInfo::default(),
+                message: Some(format!("Participant {} exceeded time limit", i + 1)),
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: Some(participant_tier),
+            };
+        }
+        if p_res.killed_by == Some(KillReason::MemoryLimit) || p_res.oom_killed {
+            cleanup();
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::MemoryLimitExceeded,
+                score: 0.0,
+                time_ms,
+                wall_ms,
+                memory_kb,
+                exit: ExitInfo::default(),
+                message: Some(format!("Participant {} exceeded memory limit", i + 1)),
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: Some(participant_tier),
+            };
+        }
+        if p_res.killed_by == Some(KillReason::OutputLimit) {
+            cleanup();
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::OutputLimitExceeded,
+                score: 0.0,
+                time_ms,
+                wall_ms,
+                memory_kb,
+                exit: ExitInfo::default(),
+                message: Some(format!("Participant {} exceeded output limit", i + 1)),
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: Some(participant_tier),
+            };
+        }
+        if !p_res.status.is_success() {
+            let stderr_msg = String::from_utf8_lossy(&p_res.stderr_tail)
+                .trim()
+                .to_string();
+            cleanup();
+            return SingleTestResult {
+                id: test.name.clone(),
+                subtask: test.subtask_id,
+                verdict: Verdict::RuntimeError,
+                score: 0.0,
+                time_ms,
+                wall_ms,
+                memory_kb,
+                exit: ExitInfo::default(),
+                message: Some(if stderr_msg.is_empty() {
+                    format!(
+                        "Participant {} failed with status {:?}",
+                        i + 1,
+                        p_res.status
+                    )
+                } else {
+                    stderr_msg
+                }),
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: Some(participant_tier),
+            };
+        }
+    }
+
+    // Parse score from score_file
+    let mut score_float: Option<f64> = None;
+    if let Some(ref sf) = score_file
+        && let Ok(content) = fs::read_to_string(sf)
+        && let Some(first_line) = content.lines().next()
+        && let Ok(val) = first_line.trim().parse::<f64>()
+        && val.is_finite()
+    {
+        score_float = Some(val);
+    }
+
+    // Fallback: check manager stderr
+    let mgr_stderr = String::from_utf8_lossy(&mgr_res.stderr_tail)
+        .trim()
+        .to_string();
+    if score_float.is_none() {
+        for line in mgr_stderr.lines() {
+            let trimmed = line.trim();
+            if let Ok(val) = trimmed.parse::<f64>()
+                && val.is_finite()
+            {
+                score_float = Some(val);
+                break;
+            }
+        }
+    }
+
+    // Fallback: check manager stdout
     let mgr_stdout = mgr_res
         .stdout
         .as_ref()
         .map(|o| String::from_utf8_lossy(&o.bytes).trim().to_string())
         .unwrap_or_default();
-    let mgr_stderr = String::from_utf8_lossy(&mgr_res.stderr_tail)
-        .trim()
-        .to_string();
+    if score_float.is_none()
+        && let Some(line) = mgr_stdout.lines().next()
+        && let Ok(val) = line.trim().parse::<f64>()
+        && val.is_finite()
+    {
+        score_float = Some(val);
+    }
 
-    let score_float: f64 = mgr_stdout
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse().ok())
-        .unwrap_or(0.0);
-    let score_ratio = if score_float > 1.0 {
-        score_float / 100.0
+    // If manager crashed or timed out and produced no score: JudgeFailed
+    if !mgr_res.status.is_success() && score_float.is_none() {
+        cleanup();
+        return SingleTestResult {
+            id: test.name.clone(),
+            subtask: test.subtask_id,
+            verdict: Verdict::JudgeFailed,
+            score: 0.0,
+            time_ms,
+            wall_ms,
+            memory_kb,
+            exit: ExitInfo::default(),
+            message: Some(if mgr_stderr.is_empty() {
+                format!("Manager failed with status {:?}", mgr_res.status)
+            } else {
+                mgr_stderr
+            }),
+            checker: None,
+            diff: None,
+            timing: Default::default(),
+            sandbox_tier: Some(participant_tier),
+        };
+    }
+
+    let parsed_score = score_float.unwrap_or_else(|| {
+        if mgr_res.status.is_success() {
+            1.0
+        } else {
+            0.0
+        }
+    });
+
+    let score_ratio = if parsed_score > 1.0 {
+        parsed_score / 100.0
     } else {
-        score_float
+        parsed_score
     }
     .clamp(0.0, 1.0);
 
@@ -1357,13 +1871,7 @@ pub fn judge_communication_test(
     };
 
     let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
-
-    // Clean up isolated run directory
-    if is_reused_box {
-        uj_sandbox::clean_box_dir_contents(&box_dir);
-    } else if let Some(ref rd) = run_dir {
-        let _ = fs::remove_dir_all(rd);
-    }
+    cleanup();
 
     SingleTestResult {
         id: test.name.clone(),
@@ -1382,6 +1890,6 @@ pub fn judge_communication_test(
         }),
         diff: None,
         timing: Default::default(),
-        sandbox_tier: Some(sol_res.sandbox_tier),
+        sandbox_tier: Some(participant_tier),
     }
 }

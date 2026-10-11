@@ -80,7 +80,7 @@ flowchart TD
 ### 1. 编译安装
 
 ```bash
-# 需已安装 Rust 1.85+ (Edition 2024)
+# 需已安装 Rust 1.88+ (Edition 2024)
 git clone https://github.com/Codecsystem/uj-cil.git
 cd uj-cil
 cargo build --release
@@ -164,23 +164,20 @@ uj report --html report.html --csv results.csv
 ## ⚙️ 配置文件示例 (`problem.toml`)
 
 ```toml
-[problem]
-id = "aplusb"
+schema = 1
+name = "aplusb"
 title = "A + B Problem"
 type = "traditional" # traditional | interactive | communication | output-only
 
 [limits]
-time_ms = 1000       # CPU 时间上限 (ms)
-wall_time_ms = 2000  # 墙钟时间上限 (ms)
-memory_bytes = 268435456 # 256 MB
-output_bytes = 10485760  # 10 MB
-
-[io]
-mode = "standard"    # standard (stdin/stdout) | file (指定 in_file/out_file)
+time = "1000ms"       # CPU 时间上限
+wall_time = "2000ms"  # 墙钟时间上限
+memory = "256MB"      # 内存限制
+output = "10MB"       # 输出量限制
 
 [checker]
 type = "builtin"
-name = "wcmp"        # 过滤多余空白符比较
+name = "wcmp"         # 过滤多余空白符比较
 
 [[subtasks]]
 id = 1
@@ -191,7 +188,7 @@ pattern = "data/1-*.in"
 id = 2
 score = 60
 pattern = "data/2-*.in"
-dependencies = [1]   # 依赖子任务 1
+dependencies = [1]    # 依赖子任务 1
 
 [[solutions]]
 source = "solutions/ac.cpp"
@@ -224,8 +221,10 @@ expect = "TLE"
 |---|---|---|
 | `0` | `EXIT_SUCCESS` | 判题结论完全为 Accepted (AC)，或命令执行成功 |
 | `1` | `EXIT_NON_AC` | 评测完成，但存在非 AC 测试点（WA, TLE, MLE, RE 等） |
-| `2` | `EXIT_JUDGE_FAILED` | 裁判系统错误（编译失败、校验器崩溃、沙盒错误等） |
-| `3` | `EXIT_USAGE_OR_CONFIG` | 命令行参数无效或题目配置文件损坏 |
+| `2` | `EXIT_USAGE_OR_CONFIG` | 命令行参数无效或题目配置文件损坏 |
+| `3` | `EXIT_JUDGE_FAILED` | 裁判系统错误（沙盒错误、环境异常等） |
+| `4` | `EXIT_VERIFY_MISMATCH` | 解法实际评测结果与预期 `expect` 声明不匹配 |
+| `5` | `EXIT_COMPILE_ERROR` | 选手源码或评测辅助程序编译失败 |
 | `130` | `EXIT_INTERRUPTED` | 用户主动通过 Ctrl+C 中断评测流程 |
 
 ---

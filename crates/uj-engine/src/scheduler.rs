@@ -298,6 +298,7 @@ impl Scheduler {
             let fail_fast = self.options.fail_fast;
             let checker_clone = resolved_checker.clone();
             let problem_type = problem_config.problem_type;
+            let num_processes = problem_config.processes.unwrap_or(1);
             let interactor_bin_clone = interactor_bin.clone();
             let manager_bin_clone = manager_bin.clone();
             let io_config = problem_config.io.clone();
@@ -448,6 +449,7 @@ impl Scheduler {
                                     &limits_clone,
                                     &cancel_clone,
                                     custom_box_ref,
+                                    num_processes,
                                 )
                             } else {
                                 judge_single_test(
@@ -626,6 +628,23 @@ impl Scheduler {
                                     pe_as_wa,
                                     cancel,
                                     rejudge_box,
+                                )
+                            }
+                            ProblemType::Communication => {
+                                let mgr_exe = manager_bin
+                                    .as_ref()
+                                    .expect("manager binary must exist for communication problem");
+                                judge_communication_test(
+                                    exclusive_sandbox.as_ref(),
+                                    mgr_exe,
+                                    &compiled.binary_path,
+                                    compiled.interpreter_cmd.as_deref(),
+                                    prepared_exe.as_deref(),
+                                    orig_test,
+                                    &limits,
+                                    cancel,
+                                    rejudge_box,
+                                    problem_config.processes.unwrap_or(1),
                                 )
                             }
                             ProblemType::OutputOnly => unreachable!(),

@@ -178,3 +178,153 @@ impl RunResult {
         self.memory_peak_bytes / 1024
     }
 }
+
+/// Result of reading a bounded artifact (e.g. output file, answer file).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactReadResult {
+    pub bytes: Vec<u8>,
+    pub size: u64,
+    pub truncated: bool,
+    pub source: String,
+}
+
+/// Errors that can occur when reading artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ReadArtifactError {
+    NotFound(String),
+    AccessDenied(String),
+    TooLarge { size: u64, limit: u64 },
+    Io(String),
+    IllegalPath(String),
+}
+
+impl std::fmt::Display for ReadArtifactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(path) => write!(f, "Artifact not found: {path}"),
+            Self::AccessDenied(path) => write!(f, "Permission denied reading artifact: {path}"),
+            Self::TooLarge { size, limit } => {
+                write!(f, "Artifact size {size} bytes exceeds limit {limit} bytes")
+            }
+            Self::Io(msg) => write!(f, "I/O error reading artifact: {msg}"),
+            Self::IllegalPath(msg) => write!(f, "Illegal artifact path: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadArtifactError {}
+
+/// Safely read an artifact from `path` up to `limit_bytes`.
+///
+/// Distinguishes between:
+/// - File not found -> `ReadArtifactError::NotFound`
+/// - Permission denied -> `ReadArtifactError::AccessDenied`
+/// - File size or content exceeding limit -> `ReadArtifactError::TooLarge`
+/// - Legitimate 0-byte file -> `Ok(ArtifactReadResult)` with empty bytes
+pub fn read_artifact_bounded(
+    path: &std::path::Path,
+    limit_bytes: u64,
+) -> Result<ArtifactReadResult, ReadArtifactError> {
+    use std::io::Read;
+
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ReadArtifactError::NotFound(path.display().to_string()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(ReadArtifactError::AccessDenied(path.display().to_string()));
+        }
+        Err(e) => return Err(ReadArtifactError::Io(e.to_string())),
+    };
+
+    if meta.is_dir() {
+        return Err(ReadArtifactError::IllegalPath(format!(
+            "Path '{}' is a directory, not a regular file",
+            path.display()
+        )));
+    }
+
+    let file_len = meta.len();
+    if file_len > limit_bytes {
+        return Err(ReadArtifactError::TooLarge {
+            size: file_len,
+            limit: limit_bytes,
+        });
+    }
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ReadArtifactError::NotFound(path.display().to_string()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(ReadArtifactError::AccessDenied(path.display().to_string()));
+        }
+        Err(e) => return Err(ReadArtifactError::Io(e.to_string())),
+    };
+
+    let mut reader = file.take(limit_bytes.saturating_add(1));
+    let mut bytes = Vec::with_capacity(file_len.min(65536) as usize);
+    if let Err(e) = reader.read_to_end(&mut bytes) {
+        return Err(ReadArtifactError::Io(e.to_string()));
+    }
+
+    if bytes.len() as u64 > limit_bytes {
+        return Err(ReadArtifactError::TooLarge {
+            size: bytes.len() as u64,
+            limit: limit_bytes,
+        });
+    }
+
+    Ok(ArtifactReadResult {
+        size: bytes.len() as u64,
+        bytes,
+        truncated: false,
+        source: path.display().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_read_artifact_bounded_success_and_empty() {
+        // Normal file
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"hello world").unwrap();
+        let res = read_artifact_bounded(file.path(), 100).unwrap();
+        assert_eq!(res.bytes, b"hello world");
+        assert_eq!(res.size, 11);
+
+        // Empty file is a legitimate artifact, NOT an error
+        let empty = NamedTempFile::new().unwrap();
+        let res_empty = read_artifact_bounded(empty.path(), 100).unwrap();
+        assert!(res_empty.bytes.is_empty());
+        assert_eq!(res_empty.size, 0);
+    }
+
+    #[test]
+    fn test_read_artifact_bounded_not_found() {
+        let fake_path = std::path::Path::new("non_existent_artifact_file_12345.txt");
+        let err = read_artifact_bounded(fake_path, 100).unwrap_err();
+        assert!(matches!(err, ReadArtifactError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_read_artifact_bounded_too_large() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&[b'a'; 128]).unwrap();
+        let err = read_artifact_bounded(file.path(), 64).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadArtifactError::TooLarge {
+                size: 128,
+                limit: 64
+            }
+        ));
+    }
+}

@@ -150,10 +150,8 @@ pub fn execute_in_sandbox_with_stdio(
         .skip(1)
         .map(|a| {
             let p = Path::new(a);
-            if p.is_absolute() && p.starts_with(&work_dir) {
-                if let Ok(rel) = p.strip_prefix(&work_dir) {
-                    return format!("/box/{}", rel.display());
-                }
+            if let Ok(rel) = p.strip_prefix(&work_dir) {
+                return format!("/box/{}", rel.display());
             }
             a.to_string_lossy().to_string()
         })
@@ -187,9 +185,7 @@ pub fn execute_in_sandbox_with_stdio(
         cmd.pre_exec(move || {
             // Immediately join the cgroup v2 before unsharing or execing
             if let Some(ref procs_file) = cgroup_procs_file {
-                if fs::write(procs_file, b"0\n").is_err() {
-                    return Err(std::io::Error::last_os_error());
-                }
+                fs::write(procs_file, b"0\n")?;
             }
 
             if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
@@ -566,7 +562,7 @@ pub fn execute_in_sandbox_with_stdio(
                                 libc::setrlimit(libc::RLIMIT_AS, &rlim_as);
                             }
                             if cpu_limit_ms > 0 {
-                                let cpu_sec = (cpu_limit_ms + 999) / 1000;
+                                let cpu_sec = cpu_limit_ms.div_ceil(1000);
                                 let rlim_cpu = libc::rlimit {
                                     rlim_cur: cpu_sec,
                                     rlim_max: cpu_sec + 1,
