@@ -6,6 +6,10 @@
 # uj runtime & cache directories
 .uj/
 **/.uj/
+.uj_rootfs/
+**/.uj_rootfs/
+__uj_bin
+**/__uj_bin
 
 # IDE & Editor files
 .vscode/

@@ -221,6 +221,31 @@ pub fn execute_in_sandbox_with_stdio(
         .as_ref()
         .and_then(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).ok());
 
+    let jail_rootfs_path = if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
+        let rootfs = if Path::new("/dev/shm").is_dir() {
+            PathBuf::from(format!(
+                "/dev/shm/.uj_rootfs_{}_{}",
+                std::process::id(),
+                rustix::thread::gettid().as_raw_nonzero()
+            ))
+        } else if Path::new("/run").is_dir() {
+            PathBuf::from(format!(
+                "/run/.uj_rootfs_{}_{}",
+                std::process::id(),
+                rustix::thread::gettid().as_raw_nonzero()
+            ))
+        } else {
+            PathBuf::from(format!(
+                "/tmp/.uj_rootfs_{}_{}",
+                std::process::id(),
+                rustix::thread::gettid().as_raw_nonzero()
+            ))
+        };
+        Some(rootfs)
+    } else {
+        None
+    };
+
     let (
         c_rootfs,
         c_usr,
@@ -242,16 +267,7 @@ pub fn execute_in_sandbox_with_stdio(
         c_argv_ptrs,
         c_env_ptrs,
         c_exe,
-    ) = if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
-        let rootfs = if work_dir == Path::new("/tmp") || work_dir.starts_with("/tmp") {
-            if Path::new("/dev/shm").is_dir() {
-                PathBuf::from(format!("/dev/shm/.uj_rootfs_{}", std::process::id()))
-            } else {
-                PathBuf::from(format!("/run/.uj_rootfs_{}", std::process::id()))
-            }
-        } else {
-            work_dir.join(".uj_rootfs")
-        };
+    ) = if let Some(ref rootfs) = jail_rootfs_path {
         let _ = fs::create_dir_all(&rootfs);
         for d in ["usr", "dev", "proc", "tmp", "box", "etc", "old_root"] {
             let _ = fs::create_dir_all(rootfs.join(d));
@@ -1185,6 +1201,13 @@ pub fn execute_in_sandbox_with_stdio(
     // Nuclear kill and cleanup
     if let Some(ref cg) = cgroup {
         cg.kill();
+    }
+    if let Some(ref rootfs) = jail_rootfs_path {
+        let _ = fs::remove_dir_all(rootfs);
+    }
+    let stray_bin = work_dir.join("__uj_bin");
+    if stray_bin.exists() {
+        let _ = fs::remove_file(stray_bin);
     }
 
     let exit_status = if let Some(ref pkt) = status_from_packet {
