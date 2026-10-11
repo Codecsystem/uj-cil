@@ -1518,7 +1518,17 @@ pub fn run_verify_with_session(
                     match ev {
                         uj_report::result::JudgeEvent::TestDone(ref res) => {
                             pb.inc(1);
-                            pb.set_message(format!("{}: {}", res.id, res.verdict.short_code()));
+                            let mem_str = if res.memory_kb > 1024 {
+                                format!("{:.1}M", res.memory_kb as f64 / 1024.0)
+                            } else {
+                                format!("{}K", res.memory_kb)
+                            };
+                            pb.set_message(format!(
+                                "{}: {} ({}ms, {mem_str})",
+                                res.id,
+                                res.verdict.short_code(),
+                                res.time_ms
+                            ));
                         }
                         uj_report::result::JudgeEvent::SubmissionDone(_) => {
                             break;
@@ -1699,15 +1709,20 @@ pub fn run_verify_with_session(
 
         if format == OutputFormat::Human {
             let max_time = report.tests.iter().map(|t| t.time_ms).max().unwrap_or(0);
+            let mem_str = if report.max_memory_kb > 1024 {
+                format!("{:.1} MiB", report.max_memory_kb as f64 / 1024.0)
+            } else {
+                format!("{} KiB", report.max_memory_kb)
+            };
             if matches_tag {
                 println!(
-                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> OK ({:?}, {max_time} ms)",
+                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> OK ({:?}, {max_time} ms, {mem_str})",
                     sol.path.display(),
                     report.verdict
                 );
             } else {
                 println!(
-                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> FAILED (got {:?})",
+                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> FAILED (got {:?}, {max_time} ms, {mem_str})",
                     sol.path.display(),
                     report.verdict
                 );
@@ -1824,6 +1839,7 @@ pub fn run_tl_with_session(
 
     let mut t_main = 0u64;
     let mut t_slowest_ac = 0u64;
+    let mut peak_mem_kb = 0u64;
 
     let total_sols = target_solutions.len();
     for (sol_idx, sol) in target_solutions.into_iter().enumerate() {
@@ -1889,7 +1905,17 @@ pub fn run_tl_with_session(
                         match ev {
                             uj_report::result::JudgeEvent::TestDone(ref res) => {
                                 pb.inc(1);
-                                pb.set_message(format!("{}: {} ({}ms)", res.id, res.verdict.short_code(), res.time_ms));
+                                let mem_str = if res.memory_kb > 1024 {
+                                    format!("{:.1}M", res.memory_kb as f64 / 1024.0)
+                                } else {
+                                    format!("{}K", res.memory_kb)
+                                };
+                                pb.set_message(format!(
+                                    "{}: {} ({}ms, {mem_str})",
+                                    res.id,
+                                    res.verdict.short_code(),
+                                    res.time_ms
+                                ));
                             }
                             uj_report::result::JudgeEvent::SubmissionDone(_) => {
                                 break;
@@ -1937,6 +1963,7 @@ pub fn run_tl_with_session(
                         return ExitCode::from(EXIT_NON_AC);
                     }
                     let max_ms = report.max_time_ms;
+                    peak_mem_kb = peak_mem_kb.max(report.max_memory_kb);
                     if sol.tag == SolutionTag::Main {
                         t_main = t_main.max(max_ms);
                     }
@@ -2003,15 +2030,22 @@ pub fn run_tl_with_session(
             "ok": true,
             "t_main_ms": t_main,
             "t_slowest_ac_ms": t_slowest_ac,
+            "peak_memory_kb": peak_mem_kb,
             "recommended_tl_ms": rec_tl_ms,
             "recommended_tl": formatted_tl,
             "applied": apply
         });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
     } else if format == OutputFormat::Human {
+        let mem_str = if peak_mem_kb > 1024 {
+            format!("{:.1} MiB", peak_mem_kb as f64 / 1024.0)
+        } else {
+            format!("{} KiB", peak_mem_kb)
+        };
         println!("=== CPU Time Limit Calibration ===");
         println!("  Main solution peak CPU:       {t_main} ms");
         println!("  Slowest accepted peak CPU:    {t_slowest_ac} ms");
+        println!("  Peak memory observed:         {mem_str}");
         println!("  Recommended Time Limit:       {formatted_tl} ({rec_tl_ms} ms)");
         if apply {
             println!("  [Applied] Updated limits.time in problem.toml");

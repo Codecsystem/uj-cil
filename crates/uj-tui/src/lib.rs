@@ -133,6 +133,8 @@ impl TuiApp {
                 let verd = res.verdict.short_code();
                 let time = res.time_ms;
 
+                let mem_kb = res.memory_kb;
+
                 if let Some(entry) = self.test_entries.iter_mut().find(|(name, _)| *name == id) {
                     entry.1 = TestCaseStatus::Done(Box::new(res));
                 }
@@ -143,7 +145,12 @@ impl TuiApp {
                         break;
                     }
                 }
-                self.add_log(format!("{timestamp} Test {id}: {verd} ({time}ms)"));
+                let mem_str = if mem_kb > 1024 {
+                    format!("{:.1}M", mem_kb as f64 / 1024.0)
+                } else {
+                    format!("{}K", mem_kb)
+                };
+                self.add_log(format!("{timestamp} Test {id}: {verd} ({time}ms, {mem_str})"));
             }
             JudgeEvent::SubtaskDone(st) => {
                 let id = st.id;
@@ -435,7 +442,32 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         }
     };
 
-    let text = Line::from(vec![
+    let (peak_time, peak_mem) = if let Some(ref r) = app.final_report {
+        (r.max_time_ms, r.max_memory_kb)
+    } else {
+        let mut max_t = 0;
+        let mut max_m = 0;
+        for (_, st) in &app.test_entries {
+            if let TestCaseStatus::Done(res) = st {
+                max_t = max_t.max(res.time_ms);
+                max_m = max_m.max(res.memory_kb);
+            }
+        }
+        (max_t, max_m)
+    };
+
+    let peak_str = if peak_mem > 0 || peak_time > 0 {
+        let mem_str = if peak_mem > 1024 {
+            format!("{:.1}M", peak_mem as f64 / 1024.0)
+        } else {
+            format!("{}K", peak_mem)
+        };
+        format!(" | Peak: {peak_time}ms, {mem_str}")
+    } else {
+        String::new()
+    };
+
+    let mut spans = vec![
         Span::styled(
             " uj ",
             Style::default()
@@ -454,9 +486,13 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         Span::styled(&app.submission_name, Style::default().fg(Color::White)),
         Span::raw(" | Status: "),
         status_span,
-        Span::raw(" | Elapsed: "),
-        Span::styled(elapsed_str, Style::default().fg(Color::DarkGray)),
-    ]);
+    ];
+    if !peak_str.is_empty() {
+        spans.push(Span::styled(peak_str, Style::default().fg(Color::Cyan)));
+    }
+    spans.push(Span::raw(" | Elapsed: "));
+    spans.push(Span::styled(elapsed_str, Style::default().fg(Color::DarkGray)));
+    let text = Line::from(spans);
 
     let block = Block::default()
         .borders(Borders::ALL)
