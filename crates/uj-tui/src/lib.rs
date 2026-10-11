@@ -223,11 +223,47 @@ pub fn run_tui(
     );
 
     let mut completion_time: Option<Instant> = None;
+    let mut all_done_time: Option<Instant> = None;
 
     loop {
         // Drain pending events
-        while let Ok(ev) = event_rx.try_recv() {
-            app.handle_event(ev);
+        let mut disconnected = false;
+        loop {
+            match event_rx.try_recv() {
+                Ok(ev) => {
+                    all_done_time = None;
+                    app.handle_event(ev);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if disconnected {
+            app.is_completed = true;
+            for slot in &mut app.slots {
+                slot.active_test = None;
+            }
+        }
+
+        // If all tests are done and all slots are idle, but SubmissionDone didn't arrive,
+        // mark completed after 800ms
+        if !app.is_completed
+            && app
+                .test_entries
+                .iter()
+                .all(|(_, st)| matches!(st, TestCaseStatus::Done(_)))
+            && app.slots.iter().all(|s| s.active_test.is_none())
+        {
+            let t = all_done_time.get_or_insert_with(Instant::now);
+            if t.elapsed() >= Duration::from_millis(800) {
+                app.is_completed = true;
+            }
+        } else if !app.slots.iter().all(|s| s.active_test.is_none()) {
+            all_done_time = None;
         }
 
         // Draw UI
@@ -239,7 +275,7 @@ pub fn run_tui(
 
         if auto_exit_on_done
             && let Some(comp_t) = completion_time
-            && comp_t.elapsed() >= Duration::from_millis(500)
+            && comp_t.elapsed() >= Duration::from_millis(600)
         {
             break;
         }
@@ -248,6 +284,9 @@ pub fn run_tui(
         if event::poll(Duration::from_millis(40))?
             && let Event::Key(key) = event::read()?
         {
+            if key.kind == crossterm::event::KeyEventKind::Release {
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     app.cancel_token.cancel();
@@ -280,7 +319,13 @@ pub fn run_tui(
                 KeyCode::End | KeyCode::Char('G') => {
                     app.selected_idx = app.test_entries.len().saturating_sub(1);
                 }
-                KeyCode::Enter if app.is_completed => {
+                KeyCode::Enter
+                    if app.is_completed
+                        || app
+                            .test_entries
+                            .iter()
+                            .all(|(_, st)| matches!(st, TestCaseStatus::Done(_))) =>
+                {
                     break;
                 }
                 _ => {}
@@ -334,18 +379,60 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
             format!("{name} ({:.1} pts)", r.score),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )
+    } else if app.is_completed {
+        let mut worst_verdict = Verdict::Accepted;
+        let mut total_score = 0.0;
+        let mut any_done = false;
+        for (_, st) in &app.test_entries {
+            if let TestCaseStatus::Done(res) = st {
+                any_done = true;
+                total_score += res.score;
+                if res.verdict.priority() > worst_verdict.priority() {
+                    worst_verdict = res.verdict;
+                }
+            }
+        }
+        if any_done {
+            let (color, name) = match worst_verdict {
+                Verdict::Accepted => (Color::Green, "ACCEPTED"),
+                Verdict::WrongAnswer => (Color::Red, "WRONG ANSWER"),
+                Verdict::TimeLimitExceeded => (Color::Yellow, "TIME LIMIT EXCEEDED"),
+                Verdict::MemoryLimitExceeded => (Color::Magenta, "MEMORY LIMIT EXCEEDED"),
+                Verdict::RuntimeError => (Color::LightRed, "RUNTIME ERROR"),
+                Verdict::CompileError => (Color::Yellow, "COMPILE ERROR"),
+                _ => (Color::Red, "JUDGE FAILED"),
+            };
+            Span::styled(
+                format!("{name} ({total_score:.1} pts)"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "COMPLETED",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )
+        }
     } else {
         let done_count = app
             .test_entries
             .iter()
             .filter(|(_, st)| matches!(st, TestCaseStatus::Done(_)))
             .count();
-        Span::styled(
-            format!("RUNNING ({done_count}/{} done)", app.total_tests),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        if done_count == app.total_tests && app.slots.iter().any(|s| s.active_test.is_some()) {
+            Span::styled(
+                "PRECISE REJUDGING",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                format!("RUNNING ({done_count}/{} done)", app.total_tests),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }
     };
 
     let text = Line::from(vec![

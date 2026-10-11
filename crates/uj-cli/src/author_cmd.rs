@@ -1437,14 +1437,6 @@ pub fn run_verify_with_session(
         SandboxMode::None => "none",
     };
 
-    let options = JudgeOptions {
-        sandbox_mode: sandbox_mode_str.to_string(),
-        require_tier: cli.require_tier,
-        fail_fast: cli.fail_fast,
-        precise: cli.precise,
-    };
-    let scheduler = Scheduler::with_session(options, session.clone());
-
     let mut verification_failures = Vec::new();
 
     let total_sols = cfg.solutions.len();
@@ -1452,6 +1444,15 @@ pub fn run_verify_with_session(
         if cancel.is_cancelled() {
             return ExitCode::from(EXIT_INTERRUPTED);
         }
+
+        let is_positive = matches!(sol.tag, SolutionTag::Main | SolutionTag::Accepted);
+        let options = JudgeOptions {
+            sandbox_mode: sandbox_mode_str.to_string(),
+            require_tier: cli.require_tier,
+            fail_fast: cli.fail_fast,
+            precise: cli.precise && is_positive,
+        };
+        let scheduler = Scheduler::with_session(options, session.clone());
 
         let sol_num = idx + 1;
         let tag_name = format!("{:?}", sol.tag);

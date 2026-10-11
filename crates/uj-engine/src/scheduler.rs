@@ -557,6 +557,19 @@ impl Scheduler {
                 }
             }
 
+            // If there are multiple candidates, prioritize the ones closest to TL and cap at 3
+            if candidate_indices.len() > 3 {
+                candidate_indices.sort_by_key(|&idx| {
+                    let t = test_results[idx].time_ms;
+                    if t >= tl_ms {
+                        t - tl_ms
+                    } else {
+                        tl_ms - t
+                    }
+                });
+                candidate_indices.truncate(3);
+            }
+
             if !candidate_indices.is_empty() {
                 let exclusive_sandbox = match create_sandbox(
                     &self.options.sandbox_mode,
@@ -607,6 +620,17 @@ impl Scheduler {
                         else {
                             continue;
                         };
+
+                        if let Some(ref tx) = event_sender {
+                            let _ = tx.send(JudgeEvent::TestStart {
+                                id: target_test_id.clone(),
+                                subtask: None,
+                            });
+                            let _ = tx.send(JudgeEvent::Warning {
+                                message: format!("Precise rejudging test {} in exclusive slot...", target_test_id),
+                                context: Some(target_test_id.clone()),
+                            });
+                        }
 
                         let mut samples = vec![test_results[idx].time_ms];
                         let mut best_result = test_results[idx].clone();
@@ -687,9 +711,11 @@ impl Scheduler {
 
                         best_result.timing.rejudged = true;
                         best_result.timing.confidence = confidence;
-                        best_result.timing.samples_ms = samples;
+                        test_results[idx] = best_result.clone();
 
-                        test_results[idx] = best_result;
+                        if let Some(ref tx) = event_sender {
+                            let _ = tx.send(JudgeEvent::TestDone(best_result));
+                        }
                     }
                 }
             }
