@@ -52,6 +52,7 @@ pub struct TuiApp {
     pub final_report: Option<SubmissionJudgeReport>,
     pub is_completed: bool,
     pub selected_idx: usize,
+    pub scroll_offset: std::cell::Cell<usize>,
     pub cancel_token: CancelToken,
 }
 
@@ -90,6 +91,7 @@ impl TuiApp {
             final_report: None,
             is_completed: false,
             selected_idx: 0,
+            scroll_offset: std::cell::Cell::new(0),
             cancel_token,
         }
     }
@@ -265,6 +267,19 @@ pub fn run_tui(
                         app.selected_idx += 1;
                     }
                 }
+                KeyCode::PageUp => {
+                    app.selected_idx = app.selected_idx.saturating_sub(15);
+                }
+                KeyCode::PageDown => {
+                    app.selected_idx =
+                        (app.selected_idx + 15).min(app.test_entries.len().saturating_sub(1));
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    app.selected_idx = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    app.selected_idx = app.test_entries.len().saturating_sub(1);
+                }
                 KeyCode::Enter if app.is_completed => {
                     break;
                 }
@@ -389,10 +404,22 @@ fn draw_tests_table(f: &mut Frame, app: &TuiApp, area: Rect) {
     ])
     .style(Style::default().fg(Color::DarkGray));
 
+    let visible_count = (area.height as usize).saturating_sub(4).max(1);
+    let mut offset = app.scroll_offset.get();
+    if app.selected_idx < offset {
+        offset = app.selected_idx;
+    } else if app.selected_idx >= offset + visible_count {
+        offset = app.selected_idx + 1 - visible_count;
+    }
+    app.scroll_offset.set(offset);
+
+    let total_tests = app.test_entries.len();
     let rows: Vec<Row> = app
         .test_entries
         .iter()
         .enumerate()
+        .skip(offset)
+        .take(visible_count)
         .map(|(i, (name, status))| {
             let num = (i + 1).to_string();
             let (verd_cell, time_str, mem_str, score_str) = match status {
@@ -439,7 +466,10 @@ fn draw_tests_table(f: &mut Frame, app: &TuiApp, area: Rect) {
             };
 
             let row_style = if i == app.selected_idx {
-                Style::default().bg(Color::Rgb(30, 30, 40))
+                Style::default()
+                    .bg(Color::Rgb(40, 50, 75))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -455,6 +485,17 @@ fn draw_tests_table(f: &mut Frame, app: &TuiApp, area: Rect) {
             .style(row_style)
         })
         .collect();
+
+    let title = if total_tests > visible_count {
+        format!(
+            " Tests [{}-{} of {}] (▲/▼ to scroll) ",
+            offset + 1,
+            (offset + visible_count).min(total_tests),
+            total_tests
+        )
+    } else {
+        format!(" Tests [{total_tests}] ")
+    };
 
     let table = Table::new(
         rows,
@@ -472,7 +513,7 @@ fn draw_tests_table(f: &mut Frame, app: &TuiApp, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Tests ")
+            .title(title)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
 

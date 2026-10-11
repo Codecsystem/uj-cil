@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use indicatif::{ProgressBar, ProgressStyle};
 use uj_checker::builtin::BuiltinCheckerType;
 use uj_core::config::{ProblemConfig, SolutionTag};
-use uj_core::run::{Limits, RunSpec, Stdio};
+use uj_core::run::{KillReason, Limits, RunSpec, Stdio};
 use uj_core::verdict::Verdict;
 use uj_engine::compiler::CompileSession;
 use uj_engine::judge::JudgeOptions;
@@ -23,6 +24,39 @@ use crate::error::{
 };
 
 const VENDORED_TESTLIB_H: &str = include_str!("../../../assets/testlib.h");
+
+fn safe_write_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(path, content) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let mut last_err = e;
+            for attempt in 0..5 {
+                std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+                match fs::write(path, content) {
+                    Ok(()) => return Ok(()),
+                    Err(retry_err) => {
+                        last_err = retry_err;
+                    }
+                }
+            }
+            let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
+            let tmp_path = path.with_file_name(format!(".{filename}.{}.tmp", std::process::id()));
+            if let Ok(()) = fs::write(&tmp_path, content) {
+                for attempt in 0..5 {
+                    if fs::rename(&tmp_path, path).is_ok() {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+                }
+                let _ = fs::remove_file(&tmp_path);
+            }
+            Err(last_err)
+        }
+    }
+}
 
 // ============================================================================
 // 1. uj init
@@ -303,36 +337,112 @@ pub fn run_build_with_session(
         }
     }
 
-    for target in to_compile {
-        if target
+    to_compile.retain(|target| {
+        !target
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-        {
-            continue;
+    });
+
+    if to_compile.is_empty() {
+        if format == OutputFormat::Json {
+            let res = serde_json::json!({ "ok": true, "status": "Build succeeded" });
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
         }
-        match compile_session.compile(&target, no_cache) {
-            Ok(c) => {
+        return ExitCode::from(EXIT_SUCCESS);
+    }
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+        .min(to_compile.len());
+
+    enum BuildMsg {
+        Success { target: PathBuf, duration_ms: u64 },
+        Failed { target: PathBuf, error: String },
+    }
+
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<BuildMsg>();
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    for target in to_compile {
+        let _ = job_tx.send(target);
+    }
+    drop(job_tx);
+
+    let mut handles = Vec::new();
+    for _ in 0..num_workers {
+        let job_rx = job_rx.clone();
+        let res_tx = res_tx.clone();
+        let stop = stop_flag.clone();
+        let session = compile_session.clone();
+
+        let handle = std::thread::spawn(move || {
+            while let Ok(target) = job_rx.recv() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match session.compile(&target, no_cache) {
+                    Ok(c) => {
+                        let _ = res_tx.send(BuildMsg::Success {
+                            target,
+                            duration_ms: c.duration_ms,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = res_tx.send(BuildMsg::Failed {
+                            target,
+                            error: e.to_string(),
+                        });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+    drop(res_tx);
+
+    let mut first_error: Option<(PathBuf, String)> = None;
+    while let Ok(res) = res_rx.recv() {
+        match res {
+            BuildMsg::Success {
+                target,
+                duration_ms,
+            } => {
                 if format == OutputFormat::Human {
-                    println!("Compiled {} ({} ms)", target.display(), c.duration_ms);
+                    println!("Compiled {} ({} ms)", target.display(), duration_ms);
                 }
             }
-            Err(e) => {
-                if format == OutputFormat::Json {
-                    let err = serde_json::json!({
-                        "ok": false,
-                        "error": {
-                            "kind": "CompileError",
-                            "target": target.to_string_lossy(),
-                            "message": e.to_string()
-                        }
-                    });
-                    println!("{}", serde_json::to_string_pretty(&err).unwrap());
-                } else {
-                    eprintln!("Failed to compile {}: {e}", target.display());
+            BuildMsg::Failed { target, error } => {
+                if first_error.is_none() {
+                    first_error = Some((target, error));
                 }
-                return ExitCode::from(EXIT_COMPILE_ERROR);
             }
         }
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+
+    if let Some((target, e)) = first_error {
+        if format == OutputFormat::Json {
+            let err = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "kind": "CompileError",
+                    "target": target.to_string_lossy(),
+                    "message": e
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&err).unwrap());
+        } else {
+            eprintln!("Failed to compile {}: {e}", target.display());
+        }
+        return ExitCode::from(EXIT_COMPILE_ERROR);
     }
 
     if format == OutputFormat::Json {
@@ -497,6 +607,7 @@ pub fn run_gen_with_session(
     let (res_tx, res_rx) = crossbeam_channel::unbounded::<GenResult>();
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let total_jobs = jobs.len();
     for job in jobs {
         let _ = job_tx.send(job);
     }
@@ -568,23 +679,35 @@ pub fn run_gen_with_session(
                 }
 
                 let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
-                if let Err(e) = fs::write(&job.target_in, stdout_bytes) {
+                if let Err(e) = safe_write_file(&job.target_in, &stdout_bytes) {
                     let _ = res_tx.send(GenResult::Error {
                         err: format!("Failed to write {}: {e}", job.target_in.display()),
                     });
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                if let Some(parent) = job.cache_meta.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::write(job.cache_meta, &job.hash);
+                let _ = safe_write_file(&job.cache_meta, job.hash.as_bytes());
                 let _ = res_tx.send(GenResult::Generated);
             }
         });
         handles.push(handle);
     }
     drop(res_tx);
+
+    let pb = if format == OutputFormat::Human && total_jobs > 0 {
+        let p = ProgressBar::new(total_jobs as u64);
+        p.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} Generating tests [{bar:25.cyan/blue}] {pos}/{len} ({eta})",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=>-"),
+        );
+        Some(p)
+    } else {
+        None
+    };
 
     let mut generated_count = 0;
     let mut first_failure: Option<(u32, String, String, String)> = None;
@@ -594,6 +717,9 @@ pub fn run_gen_with_session(
         match res {
             GenResult::Generated => {
                 generated_count += 1;
+                if let Some(ref p) = pb {
+                    p.inc(1);
+                }
             }
             GenResult::Failed {
                 idx,
@@ -619,6 +745,10 @@ pub fn run_gen_with_session(
 
     for h in handles {
         let _ = h.join();
+    }
+
+    if let Some(p) = pb {
+        p.finish_and_clear();
     }
 
     if cancel.is_cancelled() {
@@ -830,6 +960,21 @@ pub fn run_validate_with_session(
     }
     drop(res_tx);
 
+    let pb = if format == OutputFormat::Human && !tests.is_empty() {
+        let p = ProgressBar::new(tests.len() as u64);
+        p.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} Validating tests [{bar:25.cyan/blue}] {pos}/{len} ({eta})",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=>-"),
+        );
+        Some(p)
+    } else {
+        None
+    };
+
     let mut first_failure: Option<(usize, String, String)> = None;
     let mut runtime_error: Option<String> = None;
     let mut success_count = 0;
@@ -838,6 +983,9 @@ pub fn run_validate_with_session(
         match res {
             ValResult::Ok => {
                 success_count += 1;
+                if let Some(ref p) = pb {
+                    p.inc(1);
+                }
             }
             ValResult::Failed { idx, name, msg } => {
                 if let Some((f_idx, _, _)) = first_failure {
@@ -858,6 +1006,10 @@ pub fn run_validate_with_session(
 
     for h in handles {
         let _ = h.join();
+    }
+
+    if let Some(p) = pb {
+        p.finish_and_clear();
     }
 
     if cancel.is_cancelled() {
@@ -995,11 +1147,8 @@ pub fn run_ans_with_session(
         .to_limits()
         .unwrap_or_else(|_| Limits::new(1000, 256 * 1024 * 1024));
 
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 16)
-        .min(tests.len().max(1));
+    let topo = uj_engine::topology::Topology::detect(limits.memory_bytes, None);
+    let num_workers = topo.slots.len().max(1).min(tests.len().max(1));
 
     struct AnsJob {
         idx: usize,
@@ -1110,7 +1259,7 @@ pub fn run_ans_with_session(
                     trusted: false,
                 };
 
-                let res = match sandbox.run(&spec, &cancel) {
+                let mut res = match sandbox.run(&spec, &cancel) {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = res_tx.send(AnsResult::Error {
@@ -1120,6 +1269,18 @@ pub fn run_ans_with_session(
                         break;
                     }
                 };
+
+                // Cold-start Defender / scheduling stall retry:
+                if res.killed_by == Some(KillReason::WallLimit)
+                    && !cancel.is_cancelled()
+                    && (res.cpu_time_us / 1000) < limits.cpu_time_ms
+                {
+                    let mut retry_spec = spec.clone();
+                    retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(15000);
+                    if let Ok(retry_res) = sandbox.run(&retry_spec, &cancel) {
+                        res = retry_res;
+                    }
+                }
 
                 if !res.status.is_success() || res.killed_by.is_some() {
                     let reason = res
@@ -1136,23 +1297,35 @@ pub fn run_ans_with_session(
                 }
 
                 let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
-                if let Err(e) = fs::write(&job.ans_path, &stdout_bytes) {
+                if let Err(e) = safe_write_file(&job.ans_path, &stdout_bytes) {
                     let _ = res_tx.send(AnsResult::Error {
                         err: format!("Failed to write ans file {}: {e}", job.ans_path.display()),
                     });
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                if let Some(parent) = job.cache_meta.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::write(&job.cache_meta, &stdout_bytes);
+                let _ = safe_write_file(&job.cache_meta, &stdout_bytes);
                 let _ = res_tx.send(AnsResult::Generated);
             }
         });
         handles.push(handle);
     }
     drop(res_tx);
+
+    let pb = if format == OutputFormat::Human && !tests.is_empty() {
+        let p = ProgressBar::new(tests.len() as u64);
+        p.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} Generating answers [{bar:25.cyan/blue}] {pos}/{len} ({eta})",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=>-"),
+        );
+        Some(p)
+    } else {
+        None
+    };
 
     let mut generated_count = 0;
     let mut first_failure: Option<(usize, String, String)> = None;
@@ -1162,6 +1335,9 @@ pub fn run_ans_with_session(
         match res {
             AnsResult::Generated => {
                 generated_count += 1;
+                if let Some(ref p) = pb {
+                    p.inc(1);
+                }
             }
             AnsResult::Failed { idx, name, reason } => {
                 if let Some((f_idx, _, _)) = first_failure {
@@ -1182,6 +1358,10 @@ pub fn run_ans_with_session(
 
     for h in handles {
         let _ = h.join();
+    }
+
+    if let Some(p) = pb {
+        p.finish_and_clear();
     }
 
     if cancel.is_cancelled() {
@@ -1267,15 +1447,25 @@ pub fn run_verify_with_session(
 
     let mut verification_failures = Vec::new();
 
-    for sol in &cfg.solutions {
+    let total_sols = cfg.solutions.len();
+    for (idx, sol) in cfg.solutions.iter().enumerate() {
         if cancel.is_cancelled() {
             return ExitCode::from(EXIT_INTERRUPTED);
         }
+
+        let sol_num = idx + 1;
+        let tag_name = format!("{:?}", sol.tag);
 
         let sol_path = problem_dir.join(&sol.path);
         let compiled = match session.compile(&sol_path, cli.no_cache) {
             Ok(c) => c,
             Err(e) => {
+                if format == OutputFormat::Human {
+                    eprintln!(
+                        "[{sol_num}/{total_sols}] {} ({tag_name}) -> COMPILATION FAILED: {e}",
+                        sol.path.display()
+                    );
+                }
                 verification_failures
                     .push(format!("{}: compilation failed: {e}", sol.path.display()));
                 continue;
@@ -1283,6 +1473,65 @@ pub fn run_verify_with_session(
         };
 
         let sol_name = sol.path.file_name().unwrap_or_default().to_string_lossy();
+        let (event_sender, event_thread) = if cli.tui {
+            let (tx, rx) = crossbeam_channel::unbounded::<uj_report::result::JudgeEvent>();
+            let prob_name = cfg.name.clone();
+            let sub_name = format!("{} ({tag_name})", sol.path.display());
+            let cancel_clone = cancel.clone();
+            let test_names: Vec<String> = tests.iter().map(|t| t.name.clone()).collect();
+            let limits = cfg
+                .to_limits()
+                .unwrap_or_else(|_| Limits::new(1000, 256 * 1024 * 1024));
+            let slot_count = uj_engine::topology::Topology::detect(limits.memory_bytes, cli.jobs)
+                .slots
+                .len();
+
+            let handle = std::thread::spawn(move || {
+                let _ = uj_tui::run_tui(
+                    &prob_name,
+                    &sub_name,
+                    &test_names,
+                    slot_count,
+                    rx,
+                    cancel_clone,
+                    true,
+                );
+            });
+            (Some(tx), Some(handle))
+        } else if format == OutputFormat::Human && !cli.quiet {
+            let (tx, rx) = crossbeam_channel::unbounded::<uj_report::result::JudgeEvent>();
+            let total_cnt = tests.len() as u64;
+            let sol_disp = sol.path.display().to_string();
+            let handle = std::thread::spawn(move || {
+                let pb = ProgressBar::new(total_cnt);
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template(&format!(
+                            "{{spinner:.green}} [{sol_num}/{total_sols}] {sol_disp} ({{msg}}) [{{bar:25.cyan/blue}}] {{pos}}/{{len}}"
+                        ))
+                        .unwrap_or_else(|_| ProgressStyle::default_bar())
+                        .progress_chars("=>-"),
+                );
+                pb.set_message("testing...");
+                for ev in rx {
+                    match ev {
+                        uj_report::result::JudgeEvent::TestDone(ref res) => {
+                            pb.inc(1);
+                            pb.set_message(format!("{}: {}", res.id, res.verdict.short_code()));
+                        }
+                        uj_report::result::JudgeEvent::SubmissionDone(_) => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                pb.finish_and_clear();
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
+
         let report = match scheduler.judge_submission(
             problem_dir,
             &cfg,
@@ -1290,15 +1539,28 @@ pub fn run_verify_with_session(
             &sol_name,
             tests.clone(),
             cli.jobs,
-            None,
+            event_sender,
             cancel,
         ) {
             Ok(r) => r,
             Err(e) => {
+                if let Some(h) = event_thread {
+                    let _ = h.join();
+                }
+                if format == OutputFormat::Human {
+                    eprintln!(
+                        "[{sol_num}/{total_sols}] {} ({tag_name}) -> JUDGE FAILED: {e}",
+                        sol.path.display()
+                    );
+                }
                 verification_failures.push(format!("{}: judging failed: {e}", sol.path.display()));
                 continue;
             }
         };
+
+        if let Some(h) = event_thread {
+            let _ = h.join();
+        }
 
         // Check against expected SolutionTag
         let mut matches_tag = true;
@@ -1432,6 +1694,25 @@ pub fn run_verify_with_session(
                     ));
                 }
             }
+        }
+
+        if format == OutputFormat::Human {
+            let max_time = report.tests.iter().map(|t| t.time_ms).max().unwrap_or(0);
+            if matches_tag {
+                println!(
+                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> OK ({:?}, {max_time} ms)",
+                    sol.path.display(),
+                    report.verdict
+                );
+            } else {
+                println!(
+                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> FAILED (got {:?})",
+                    sol.path.display(),
+                    report.verdict
+                );
+            }
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
         }
     }
 
