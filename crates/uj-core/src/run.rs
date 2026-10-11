@@ -27,7 +27,7 @@ impl Limits {
     pub const DEFAULT_STDERR_BYTES: u64 = 64 * 1024; // 64 KiB
 
     pub fn new(cpu_time_ms: u64, memory_bytes: u64) -> Self {
-        let wall_time_ms = std::cmp::max(cpu_time_ms * 2, cpu_time_ms + 1000);
+        let wall_time_ms = std::cmp::max(cpu_time_ms * 3 + 2000, 5000);
         Self {
             cpu_time_ms,
             wall_time_ms,

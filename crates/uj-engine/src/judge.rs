@@ -174,34 +174,25 @@ pub fn judge_single_test(
     #[cfg(windows)]
     if let Ok(ref res) = run_res {
         let cpu_ms = res.cpu_time_us / 1000;
-        let threshold_ms = ((limits.cpu_time_ms / 10).max(50)).min(limits.cpu_time_ms);
         if res.killed_by == Some(KillReason::WallLimit)
-            && cpu_ms < threshold_ms
+            && cpu_ms < limits.cpu_time_ms
             && !cancel.is_cancelled()
         {
             let should_retry = {
                 let mut state = RETRY_TRACKER.lock();
-                if state.0.contains(exe_path) {
-                    false
+                let count = state.1.entry(exe_path.to_path_buf()).or_insert(0);
+                if *count < 5 {
+                    *count += 1;
+                    true
                 } else {
-                    let count = state.1.entry(exe_path.to_path_buf()).or_insert(0);
-                    if *count < 3 {
-                        *count += 1;
-                        true
-                    } else {
-                        false
-                    }
+                    false
                 }
             };
             if should_retry {
                 let mut retry_spec = spec.clone();
-                retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(10000);
+                retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(15000);
                 let retry_start = Instant::now();
                 if let Ok(retry_res) = sandbox.run(&retry_spec, cancel) {
-                    if retry_res.killed_by == Some(KillReason::WallLimit) {
-                        let mut state = RETRY_TRACKER.lock();
-                        state.0.insert(exe_path.to_path_buf());
-                    }
                     run_res = Ok(retry_res);
                     duration_ms = retry_start.elapsed().as_millis() as u64;
                 }
@@ -292,7 +283,7 @@ pub fn judge_single_test(
         Some(KillReason::WallLimit) => (
             Verdict::TimeLimitExceeded,
             0.0,
-            if time_ms < limits.cpu_time_ms / 2 {
+            if time_ms < (limits.cpu_time_ms / 4).max(100) {
                 Some("Process idleness detected (waiting on input or sleeping)".to_string())
             } else {
                 None
