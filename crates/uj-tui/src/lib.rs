@@ -150,7 +150,9 @@ impl TuiApp {
                 } else {
                     format!("{}K", mem_kb)
                 };
-                self.add_log(format!("{timestamp} Test {id}: {verd} ({time}ms, {mem_str})"));
+                self.add_log(format!(
+                    "{timestamp} Test {id}: {verd} ({time}ms, {mem_str})"
+                ));
             }
             JudgeEvent::SubtaskDone(st) => {
                 let id = st.id;
@@ -416,7 +418,9 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         } else {
             Span::styled(
                 "COMPLETED",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )
         }
     } else {
@@ -491,7 +495,10 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         spans.push(Span::styled(peak_str, Style::default().fg(Color::Cyan)));
     }
     spans.push(Span::raw(" | Elapsed: "));
-    spans.push(Span::styled(elapsed_str, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        elapsed_str,
+        Style::default().fg(Color::DarkGray),
+    ));
     let text = Line::from(spans);
 
     let block = Block::default()

@@ -561,11 +561,7 @@ impl Scheduler {
             if candidate_indices.len() > 3 {
                 candidate_indices.sort_by_key(|&idx| {
                     let t = test_results[idx].time_ms;
-                    if t >= tl_ms {
-                        t - tl_ms
-                    } else {
-                        tl_ms - t
-                    }
+                    t.abs_diff(tl_ms)
                 });
                 candidate_indices.truncate(3);
             }
@@ -627,7 +623,10 @@ impl Scheduler {
                                 subtask: None,
                             });
                             let _ = tx.send(JudgeEvent::Warning {
-                                message: format!("Precise rejudging test {} in exclusive slot...", target_test_id),
+                                message: format!(
+                                    "Precise rejudging test {} in exclusive slot...",
+                                    target_test_id
+                                ),
                                 context: Some(target_test_id.clone()),
                             });
                         }

@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "uj-checker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "memchr",
  "memmap2",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "uj-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "uj-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "globset",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "uj-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "uj-report"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "minijinja",
  "schemars",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "uj-sandbox"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "uj-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-channel",
  "crossterm",

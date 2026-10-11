@@ -62,10 +62,12 @@ uj-cil/
 │       ├── src/judge_cmd.rs   # 独立评测与批量评测命令调度
 │       ├── src/mcp_server.rs  # Model Context Protocol stdio 交互服务端
 │       └── src/doctor.rs      # 宿主系统环境健康检查
+│       └── tests/             # 集成测试套件 (authoring, contest, evil, mcp, pipeline, regression, report)
 ├── tests/
 │   ├── evil/                  # 恶意对抗测试源码 (防作弊、防逃逸、防死锁、资源耗尽)
+│   ├── evil_seed/             # 种子数据与随机用例
 │   ├── problems/              # 端到端测试题目套件 (传统、交互、通信、子任务依赖)
-│   └── *.rs                   # 各模块集成测试套件 (authoring, evil, pipeline, sandbox 等)
+│   └── regression/            # 回归测试固化用例
 └── docs/                      # 文档索引 (README.md) 与分类库 (specs/, plans/, reviews/, opt/)
 ```
 
@@ -120,7 +122,7 @@ source ~/.cargo/env
 cargo test --workspace
 ```
 
-### Step 3: 对抗用例特别验证 (`tests/evil_tests.rs`)
+### Step 3: 对抗用例特别验证 (`crates/uj-cli/tests/evil_tests.rs`)
 对抗测试套件覆盖了以下严苛攻击与边界场景，必须确保 100% 绿色通过：
 - `test_evil_cheat_read_blocked`: 尝试跨目录偷读标准答案（必须阻断）。
 - `test_evil_cheat_write_blocked`: 尝试篡改题目数据（必须阻断）。
