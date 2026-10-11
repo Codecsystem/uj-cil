@@ -370,7 +370,7 @@ pub fn run_import_lemon(cdf_path: &Path, format: OutputFormat) -> ExitCode {
             "imported_tasks": task_items,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!(
             "Successfully imported contest: {}",
             cdf.contest_title.as_deref().unwrap_or("Untitled Contest")

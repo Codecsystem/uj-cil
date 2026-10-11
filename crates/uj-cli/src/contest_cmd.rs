@@ -420,7 +420,7 @@ pub fn run_contest(
             "csv_report": csv_path.to_string_lossy().to_string(),
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
-    } else {
+    } else if format == OutputFormat::Human {
         println!("\n=== Contest Leaderboard ===");
         print!(
             "{:<6} {:<16} {:<12} {:<10}",

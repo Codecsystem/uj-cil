@@ -710,7 +710,7 @@ pub fn run_validate_with_session(
         if format == OutputFormat::Json {
             let res = serde_json::json!({ "ok": true, "validated": 0 });
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
-        } else {
+        } else if format == OutputFormat::Human {
             println!("No test cases to validate");
         }
         return ExitCode::from(EXIT_SUCCESS);
