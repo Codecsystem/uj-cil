@@ -245,6 +245,7 @@ pub struct ProblemConfig {
     pub grader: Option<GraderConfig>,
     pub manager: Option<PathBuf>,
     pub processes: Option<usize>,
+    pub communication_topology: Option<String>,
     pub validator: Option<PathBuf>,
     #[serde(default)]
     pub tests: TestsConfig,
@@ -399,15 +400,35 @@ impl ProblemConfig {
                 column: None,
             });
         }
-        if self.problem_type == ProblemType::Communication && self.manager.is_none() {
-            return Err(ConfigErrorInfo {
-                kind: "ConfigError".to_string(),
-                message: "Communication problem requires a 'manager' file".to_string(),
-                hint: Some("Specify `manager = \"manager.cpp\"` in problem.toml".to_string()),
-                path: path_str.clone(),
-                line: None,
-                column: None,
-            });
+        if self.problem_type == ProblemType::Communication {
+            if self.manager.is_none() {
+                return Err(ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: "Communication problem requires a 'manager' file".to_string(),
+                    hint: Some("Specify `manager = \"manager.cpp\"` in problem.toml".to_string()),
+                    path: path_str.clone(),
+                    line: None,
+                    column: None,
+                });
+            }
+            let procs = self.processes.unwrap_or(1);
+            if procs > 1 {
+                let topo = self.communication_topology.as_deref().unwrap_or("");
+                if topo != "ring" && topo != "pipeline" {
+                    return Err(ConfigErrorInfo {
+                        kind: "ConfigError".to_string(),
+                        message: format!(
+                            "Multi-participant communication (processes = {procs}) requires explicit supported topology (e.g. `communication_topology = \"ring\"`). Star topology is currently unsupported."
+                        ),
+                        hint: Some(
+                            "Add `communication_topology = \"ring\"` to problem.toml if ring/pipeline wiring is intended".to_string(),
+                        ),
+                        path: path_str.clone(),
+                        line: None,
+                        column: None,
+                    });
+                }
+            }
         }
 
         // Path safety check (prevent escaping problem directory via ..)

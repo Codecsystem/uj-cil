@@ -1,234 +1,260 @@
 # uj (Universal Judge)
 
-<p align="center">
-  <strong>现代化、高性能、跨平台的算法竞赛本地判题与出题套件</strong>
-  <br>
-  <em>针对 AI 出题 Agent 与人类命题团队量身打造</em>
-</p>
+uj 是一个轻量、现代且跨平台的算法竞赛本地评测与命题工具，使用 Rust 编写。
+
+它主要解决算法竞赛（OI / ACM-ICPC / 校赛出题）与程序设计教学中常见的几个痛点：
+- 传统评测工具架构老旧，缺乏现代操作系统的细粒度安全隔离与精准计量；
+- 出题过程中，测试数据生成、校验、标程出数据、多解法反向验证和时限测定流程零散，缺乏一致的自动化管理；
+- 本地脚本或简易评测器容易受到恶意/异常代码干扰（如死循环、内存耗尽、句柄泄漏、跨目录读取答案等）；
+- AI 编程助手或自动化流水线在调用评测器时，容易因标准输出混入日志而解析失败。
+
+uj 将单题评测、命题全流程管理、差分对拍、整场比赛导入评测以及 AI 智能体协议（MCP）整合为一个统一的单文件二进制程序。
 
 ---
 
-## 🌟 核心特性
+## 核心能力
 
-- ⚡ **极致性能与低开销**：基于 Rust（Edition 2024）构建，无运行时沉重依赖；冷启动耗时 `< 50 ms`，Linux 单次沙盒调度开销 `≤ 5 ms`，Windows `≤ 15 ms`。
-- 🛡️ **健全的双平台原生沙盒**：
-  - **Linux**：基于非 root 用户命名空间（`user`, `mount`, `pid`, `net`, `ipc`, `uts`）+ `cgroup v2`（精准计量 `memory.peak` 与 `cpu.stat`）+ `seccomp-bpf` 系统调用过滤（阻断 `x32` ABI 越界与特权调用）；在缺少 cgroup v2 时平滑降级至 `Tier::Degraded`（保留 namespace 与 seccomp 强隔离，辅以 POSIX rlimits 与 `getrusage` 计量）。
-  - **Windows**：基于独占 `AppContainer` 安全隔离配置文件（严控文件 ACL，禁止访问外部答案与宿主文件）+ `Job Object`（精准计量 Commit 提交内存与 CPU 时间，物理 P 核绑核，句柄泄漏防御与 Defender 启动扫描阻滞自适应）。
-- 🤖 **面向 AI Agent 的原生设计**：
-  - 内置 **Model Context Protocol (MCP)** stdio 服务端，AI Agent 可通过标准协议自动完成初始化、数据生成、解法校验、时限校准与判题。
-  - 纯粹的零标准输出污染设计：结构化日志全走 `stderr`，`stdout` 输出严格遵循 JSON Schema / NDJSON 规范。
-- 🔄 **全生命周期出题流水线**：
-  - `init` ➡️ `build` ➡️ `gen` ➡️ `validate` ➡️ `ans` ➡️ `verify` ➡️ `tl` ➡️ `pipeline` ➡️ `stress` 一站式自动化。
-- ⚖️ **丰富的评测协议与题型支持**：
-  - 支持 **传统题（Traditional）**、**交互题（Interactive）**、**通信题（Communication，多选手进程与 Manager 管道互联）** 与 **提交答案题（Output-only）**。
-  - 内嵌零拷贝高速比较器（`exact`, `wcmp`, `fcmp`, `lcmp`, `rcmp`, `yesno`, `hcmp`, `ncmp`），原生兼容 **Testlib**（Checker, Validator, Interactor）与 **Lemon / LemonLime** 传统竞赛工程及子任务依赖。
-- 📊 **可视化与专业报表**：
-  - 支持交互式 **Ratatui TUI** 实时评测监视器。
-  - 支持导出结构化 HTML 与 CSV 成绩单。
+### 1. 本地高效评测
+- 支持 C++、C、Python、Rust、Go 等主流竞赛语言，自动检测环境编译器。
+- 支持传统题（Traditional）、交互题（Interactive）、多选手通信题（Communication）与提交答案题（Output-only）。
+- 内置基于内存映射与 SIMD/SWAR 加速的高速文本比较器（exact、wcmp、lcmp、fcmp 等），同时无缝兼容 Testlib（Checker / Interactor / Validator）与 Lemon / LemonLime 传统工程。
 
----
+### 2. 双平台原生沙盒与精准计量
+- Linux：基于非 root 用户命名空间（user, pid, mount, net, ipc, uts）+ cgroup v2 资源控制 + seccomp-bpf 系统调用过滤。无 cgroup v2 委派时平滑降级至 Degraded 模式，保证隔离不中断。在多线程 fork 场景下保证 async-signal-safe，杜绝子进程死锁。
+- Windows：基于 Job Object 作业对象限制 + AppContainer 细粒度临时目录访问控制。具备句柄泄漏防护与 Windows Defender 首次冷启动扫描自适应重跑机制，并支持物理 P 核独占绑定。
+- 零虚标原则：当前环境不支持所要求的隔离层级时，明确报错或真实降级，绝不谎报隔离状态。
 
-## 🏗️ 架构概览
+### 3. 一站式命题流水线
+- 提供 `init` -> `build` -> `gen` -> `validate` -> `ans` -> `verify` -> `tl` 的完整出题流水线。
+- 支持子任务 DAG 依赖（Subtask Dependencies）与灵活计分（Min / Sum）。
+- 支持多解法行为标签验证（标程需 AC，暴力解需 TLE，错误解需 WA），防止题目数据水或标程写假。
+- 内置多核并发差分对拍（`uj stress`），自动对比随机数据下不同解法的输出差异。
 
-```mermaid
-flowchart TD
-    CLI["uj-cli (clap)"] --> CORE["uj-core: 数据模型 / 配置解析 / 计分 / 拓扑"]
-    CLI --> ENGINE["uj-engine: DAG 并行调度 / 缓存 / 编译器 / 拓扑绑核"]
-    ENGINE --> SANDBOX["uj-sandbox: 沙盒抽象 (Sandbox trait)"]
-    ENGINE --> CHECK["uj-checker: 内置流式比较器 + Testlib / Lemon 适配"]
-    ENGINE --> REPORT["uj-report: JSON Schema / HTML (minijinja) / CSV"]
-    CLI --> TUI["uj-tui (ratatui 终端实时看板)"]
-    CLI --> MCP["uj MCP Server (Model Context Protocol)"]
-
-    SANDBOX --> LINUX["Linux 后端: userns + mountns + pidns + netns + cgroup v2 + seccomp"]
-    SANDBOX --> WIN["Windows 后端: Job Object + AppContainer + 句柄限制"]
-    SANDBOX --> NONE["None: 无隔离开发调试模式 (--sandbox none)"]
-```
-
-### Workspace 组件划分
-
-| Crate | 功能职责 |
-|---|---|
-| [`crates/uj-core`](file:///crates/uj-core) | 数据结构（`Verdict`, `RunSpec`, `RunResult`, `Limits`）、`problem.toml` / `languages.toml` 解析、计分规则与子任务 DAG 依赖。 |
-| [`crates/uj-sandbox`](file:///crates/uj-sandbox) | 平台原生沙盒驱动（Linux userns/cgroup/seccomp, Windows JobObject/AppContainer, None）、匿名状态管道、环境健康探测（`doctor`）。 |
-| [`crates/uj-engine`](file:///crates/uj-engine) | 调度引擎（纯线程池 + crossbeam，**零 tokio**）、多源编译与 Blake3 增量缓存、大小核感知拓扑（物理 P 核独占绑定）、测试运行循环。 |
-| [`crates/uj-checker`](file:///crates/uj-checker) | 内置 mmap/memchr 高速比较器、Testlib（SPJ Checker/Interactor）适配协议、Lemon CDF 格式适配。 |
-| [`crates/uj-report`](file:///crates/uj-report) | 报表生成器，支持 JSON Schema（schemars）、NDJSON 流式事件、HTML 离线报告与 CSV 汇总。 |
-| [`crates/uj-tui`](file:///crates/uj-tui) | 基于 Ratatui 的多任务并发评测实时看板。 |
-| [`crates/uj-cli`](file:///crates/uj-cli) | 命令行入口、子命令路由、stdio MCP Server、退出状态码映射与信号收敛。 |
+### 4. 机器与人类友好的双重接口
+- 人类用户：提供直观的终端格式化报表与交互式 Ratatui 终端实时看板（`--tui`）。
+- 外部集成：提供严格遵循规范的 JSON 与 NDJSON 实时事件流，日志与调试信息严格写入 stderr，确保 stdout 纯净。
+- AI Agent 原生集成：内置标准 Model Context Protocol (MCP) 服务端，支持与 Claude Desktop、Cursor、Antigravity 等编程助手通过 stdio 协议直接联动。
+- 支持将评测结果一键导出为独立离线 HTML 网页或 CSV 成绩单。
 
 ---
 
-## 🔒 安全与威胁模型
+## 快速上手
 
-`uj` 旨在执行**不可信、具有潜在 Bug 或由 LLM 生成的代码**。
+### 1. 编译环境与安装
 
-### 防御范围
-1. **文件系统隔离**：被测程序运行在隔离的只读环境（Linux 为独立的 tmpfs 根目录与只读 bind mount，Windows 为只授权给当前 slot 的临时 box 目录）。严禁读取其他题目的标准输入输出答案，严禁篡改宿主机文件。
-2. **网络隔离**：全面切断外部网络（Linux 独立的空网络命名空间，Windows AppContainer 禁用网络功能）。
-3. **资源失控防护**：通过 CPU 时间（精确至微秒）、墙钟时间（防死锁）、内存（Windows 提交内存 / Linux 物理页峰值）、输出量（防止磁盘填满）与进程数（防 fork 炸弹）进行强力限制。
-4. **宿主进程保护**：独立的 PID 命名空间，选手程序仅能看到容器内部，无法探测或向宿主进程发送信号。
-
-### 不防御范围
-- CPU 硬件级侧信道攻击（Spectre/Meltdown）。
-- 宿主操作系统内核未修复的 0-day 漏洞。
-
----
-
-## 🚀 快速上手
-
-### 1. 编译安装
+要求已安装 Rust 工具链（Rust 1.88+，Edition 2024）以及对应语言的编译器（如 g++ / clang++ / python）。
 
 ```bash
-# 需已安装 Rust 1.88+ (Edition 2024)
 git clone https://github.com/Codecsystem/uj-cil.git
 cd uj-cil
 cargo build --release
 
-# 二进制位于 target/release/uj
+# 编译产物位于 target/release/uj
 ```
+
+建议将编译出的 `uj` 加入系统的 PATH 环境变量中。
 
 ### 2. 环境健康检查
 
+首次运行建议执行环境诊断，检查当前系统对沙盒、编译器和内核特性的支持状态：
+
 ```bash
-# 检查当前系统对沙盒、编译器、cgroup/JobObject 的支持状态
 uj doctor
 ```
 
-### 3. 题目创建与生命周期管理
+### 3. 评测单份代码
+
+对单题目录下的选手代码进行评测：
 
 ```bash
-# 1. 初始化标准传统题
+# 默认终端模式评测
+uj judge solution.cpp -p /path/to/problem
+
+# 启用实时终端交互看板
+uj judge solution.cpp -p /path/to/problem --tui
+
+# 输出纯 JSON 结果（供脚本或流水线调用）
+uj judge solution.cpp -p /path/to/problem --format json
+```
+
+### 4. 快速体验出题流水线
+
+```bash
+# 1. 初始化标准传统题模板
 uj init my_problem --type traditional
 cd my_problem
 
-# 2. 编写题目配置 (problem.toml)，生成测试数据
-uj gen
+# 2. 根据需要修改 problem.toml，编写生成器 gen.cpp 与校验器 validator.cpp
 
-# 3. 校验输入数据是否合法
+# 3. 编译题内组件
+uj build
+
+# 4. 生成测试点并验证合法性
+uj gen
 uj validate
 
-# 4. 生成标准参考答案 (.ans)
+# 5. 使用标程生成参考答案
 uj ans
 
-# 5. 校验各种标程/部分分程序是否符合预期结论
+# 6. 验证所有预期解法是否符合预期
 uj verify
 
-# 6. 一键全自动执行完整命题流水线
+# 7. 或者，使用一条命令自动执行整套流水线
 uj pipeline
 ```
 
-### 4. 判题与对拍
+### 5. 差分对拍
+
+当解法遇到 WA 或找不出反例时，可以使用对拍命令：
 
 ```bash
-# 评测单份选手源码（支持 C++、C、Python、Rust、Go 等）
-uj judge solution.cpp
-
-# 评测并启动 Ratatui 实时监控看板
-uj judge solution.cpp --tui
-
-# 多核对拍（随机生成器 + 待测解 + 暴力正解）
-uj stress --gen gen.cpp --sol sol.cpp --brute brute.cpp -n 1000
-
-# 模拟赛整包评测（Lemon / LemonLime 目录结构）
-uj contest /path/to/contest_dir
+uj stress --gen gen.cpp --sol solutions/wa.cpp --brute solutions/brute.cpp -n 1000
 ```
-
-### 5. 导出评测报告
-
-```bash
-# 生成最新评测记录的 HTML 报告与 CSV 报表
-uj report --html report.html --csv results.csv
-```
-
-### 6. 作为 AI Agent 的 MCP Server 运行
-
-在 Claude Desktop 或其它 Agent 客户端的配置中添加：
-
-```json
-{
-  "mcpServers": {
-    "uj": {
-      "command": "uj",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-> 🤖 **面向 AI 编程助手的完整使用手册**：
-> 请直接参阅 [**docs/AGENT_GUIDE.md**](docs/AGENT_GUIDE.md)（含自动化解题循环、命题流水线 Recipe、JSON 字段解析与 Token 优化策略）与 [**AGENTS.md**](AGENTS.md)（系统硬性约束与底层架构地图）。
 
 ---
 
-## ⚙️ 配置文件示例 (`problem.toml`)
+## 常用命令速查
+
+| 命令 | 用途说明 |
+|---|---|
+| `uj judge <file>` | 评测单份源码或可执行文件 |
+| `uj init <name>` | 创建题目目录骨架（支持 traditional, interactive, communication 等） |
+| `uj build` | 编译当前题目下的生成器、校验器、交互器与各解法 |
+| `uj gen` | 运行生成器生成测试输入数据 |
+| `uj validate` | 运行校验器检查输入数据合法性 |
+| `uj ans` | 使用主标程为各测试点生成标准答案文件 |
+| `uj verify` | 批量运行解法并核对实际结论与声明标签是否匹配 |
+| `uj tl` | 依据标程在各测试点上的运行时间给出推荐时间限制 |
+| `uj pipeline` | 一键顺序执行完整出题生命周期 |
+| `uj stress` | 使用数据生成器、待测解与暴力正解进行并发差分对拍 |
+| `uj contest <dir>` | 评测 Lemon / LemonLime 结构的整场比赛包并汇总成绩 |
+| `uj report` | 将最近一次评测记录导出为 HTML 网页报告或 CSV 表格 |
+| `uj doctor` | 检查宿主机系统环境、沙盒可用性与编译器状态 |
+| `uj mcp` | 启动标准 stdio Model Context Protocol (MCP) 服务端 |
+
+---
+
+## 配置文件示例 (`problem.toml`)
+
+题目根目录下的 `problem.toml` 是题目的核心配置文件。以下为一个包含子任务依赖的标准传统题范例：
 
 ```toml
 schema = 1
 name = "aplusb"
 title = "A + B Problem"
-type = "traditional" # traditional | interactive | communication | output-only
+type = "traditional"
 
 [limits]
 time = "1000ms"       # CPU 时间上限
-wall_time = "2000ms"  # 墙钟时间上限
+wall_time = "2000ms"  # 墙钟时间上限（防挂死）
 memory = "256MB"      # 内存限制
-output = "10MB"       # 输出量限制
+output = "10MB"       # 最大允许输出量
+
+[io]
+mode = "stdio"        # stdio 或 file
 
 [checker]
 type = "builtin"
-name = "wcmp"         # 过滤多余空白符比较
+name = "wcmp"         # 过滤行末空格与空行的文本比较
+
+validator = "validator.cpp"
+
+[tests]
+dir = "tests"
+pattern = "auto"
+
+[[tests.gen]]
+generator = "gen.cpp"
+args = "100 100"
+count = 5
 
 [[subtasks]]
 id = 1
-score = 40
-pattern = "data/1-*.in"
+score = 40.0
+tests = ["1-5"]
 
 [[subtasks]]
 id = 2
-score = 60
-pattern = "data/2-*.in"
-dependencies = [1]    # 依赖子任务 1
+score = 60.0
+tests = ["6-10"]
+depends = [1]         # 依赖子任务 1，子任务 1 未 AC 时当前子任务直接跳过
 
 [[solutions]]
-source = "solutions/ac.cpp"
-expect = "AC"
+path = "solutions/ac.cpp"
+tag = "main"          # 主标程，要求全部通过
 
 [[solutions]]
-source = "solutions/tle.cpp"
-expect = "TLE"
+path = "solutions/tle.cpp"
+tag = "time_limit"    # 预期超时的解法，必须触发 TLE 且不得发生 WA/RE
+```
+
+对于多选手通信题（`type = "communication"`），若选手进程数大于 1，需在根配置中显式指定拓扑结构：
+
+```toml
+type = "communication"
+manager = "manager.cpp"
+processes = 2
+communication_topology = "ring"
 ```
 
 ---
 
-## 💻 命令行常用选项
+## 全局常用参数
+
+各子命令均支持以下全局选项：
 
 | 参数 | 说明 | 默认值 |
 |---|---|---|
-| `-j, --jobs <N>` | 并发评测槽位数 | 物理核心数 - 1 |
+| `-p, --problem <DIR>` | 指定包含 problem.toml 的题目根目录 | 当前目录 `.` |
+| `-j, --jobs <N>` | 并发评测/编译槽位数 | 自动探测物理核心数 |
 | `--sandbox <MODE>` | 沙盒隔离级别：`auto` \| `full` \| `degraded` \| `none` | `auto` |
-| `--require-tier` | 严格要求 Full 沙盒，若不支持则直接报错中止 | `false` |
-| `--fail-fast` | 遇到第一个未通过测试点时立即中止当前子任务 | `false` |
-| `--tui` | 开启 Ratatui 交互式终端监控界面 | `false` |
-| `--format <FMT>` | 报告输出格式：`human` \| `json` \| `ndjson` | TTY 环境为 human，否则为 json |
-| `--no-cache` | 禁用编译结果与运行结果的 Blake3 缓存 | `false` |
+| `--require-tier` | 严格要求 Full 沙盒，若当前环境不支持则直接报错退出 | `false` |
+| `--fail-fast` | 遇到第一个未通过测试点时立即中止当前子任务后续测试 | `false` |
+| `--tui` | 启用 Ratatui 交互式终端评测看板 | `false` |
+| `--format <FMT>` | 报告输出格式：`human` \| `json` \| `ndjson` | 交互终端为 human，非终端为 json |
+| `--no-cache` | 禁用编译与运行结果的 Blake3 增量缓存，强制重测 | `false` |
 
 ---
 
-## 📄 退出状态码规范
+## 退出状态码规范
 
-| 退出码 | 常量 | 语义说明 |
+自动化脚本与集成系统可根据进程退出码快速判定执行结论：
+
+| 退出码 | 常量定义 | 语义说明 |
 |---|---|---|
-| `0` | `EXIT_SUCCESS` | 判题结论完全为 Accepted (AC)，或命令执行成功 |
+| `0` | `EXIT_SUCCESS` | 评测全部 Accepted (AC)，或命令顺利完成 |
 | `1` | `EXIT_NON_AC` | 评测完成，但存在非 AC 测试点（WA, TLE, MLE, RE 等） |
-| `2` | `EXIT_USAGE_OR_CONFIG` | 命令行参数无效或题目配置文件损坏 |
-| `3` | `EXIT_JUDGE_FAILED` | 裁判系统错误（沙盒错误、环境异常等） |
-| `4` | `EXIT_VERIFY_MISMATCH` | 解法实际评测结果与预期 `expect` 声明不匹配 |
+| `2` | `EXIT_USAGE_OR_CONFIG` | 命令行参数无效、测试用例未找到或 problem.toml 损坏 |
+| `3` | `EXIT_JUDGE_FAILED` | 裁判系统错误（沙盒错误、校验器崩溃、环境异常等） |
+| `4` | `EXIT_VERIFY_MISMATCH` | 解法实际评测结论与声明的预期标签不匹配 |
 | `5` | `EXIT_COMPILE_ERROR` | 选手源码或评测辅助程序编译失败 |
-| `130` | `EXIT_INTERRUPTED` | 用户主动通过 Ctrl+C 中断评测流程 |
+| `130` | `EXIT_INTERRUPTED` | 用户通过 Ctrl+C (SIGINT) 主动中止 |
 
 ---
 
-## 📜 许可证
+## 平台说明与最佳实践
+
+### Windows 环境
+- 内存统计口径：采用 Job Object 的 Commit Charge（提交内存）。程序静态预分配的大数组即使未完全访问，也会全额计入内存。
+- Defender 扫描提示：Windows Defender 对新编译二进制的首次启动扫描可能消耗数秒。uj 内置了扫描阻滞自适应机制，但仍建议将出题目录与 `.uj` 缓存目录添加至 Defender 排除名单以获得最平稳的性能。
+
+### Linux 环境
+- 内核版本建议：建议使用 Linux 内核 >= 5.19，以获得完整的 cgroup v2 peak 内存统计、cgroup.kill 与 pidfd 支持。
+- systemd cgroup 委派：普通用户建议启用 systemd user 委派（`systemd-run --user --scope`），以获得免 root 的 Full 级别沙盒体验。
+
+---
+
+## 关联文档
+
+- 文档总览与分类索引：[docs/README.md](docs/README.md)
+- 架构技术决策记录：[docs/specs/DECISIONS.md](docs/specs/DECISIONS.md)
+- 协议与结构化交互规范：[docs/specs/PROTOCOL.md](docs/specs/PROTOCOL.md)
+- 沙盒底层设计与隔离机制：[docs/specs/SANDBOX.md](docs/specs/SANDBOX.md)
+- AI Agent 集成与自动化工作流：[docs/specs/AGENT_GUIDE.md](docs/specs/AGENT_GUIDE.md)
+- Agent 核心代码维护指南：[AGENTS.md](AGENTS.md)
+
+---
+
+## 许可证
 
 本项目采用 [GNU General Public License v3.0 (GPL-3.0)](LICENSE) 开源许可证授权。

@@ -155,11 +155,21 @@ pub fn judge_single_test(
     let mut duration_ms = start_instant.elapsed().as_millis() as u64;
 
     // Windows Defender mitigation retry:
-    // Only allowed on the FIRST execution of a binary to avoid 10s stalls on real blocking/sleep tests.
+    // Tracks retry attempts per binary to handle concurrent -j execution under Defender jitter,
+    // while identifying genuinely slow binaries to avoid repeated 10s stalls.
     #[cfg(windows)]
-    static RETRIED_BINARIES: std::sync::LazyLock<
-        parking_lot::Mutex<std::collections::HashSet<PathBuf>>,
-    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    #[allow(clippy::type_complexity)]
+    static RETRY_TRACKER: std::sync::LazyLock<
+        parking_lot::Mutex<(
+            std::collections::HashSet<PathBuf>,
+            std::collections::HashMap<PathBuf, u32>,
+        )>,
+    > = std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new((
+            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
+        ))
+    });
 
     #[cfg(windows)]
     if let Ok(ref res) = run_res {
@@ -170,14 +180,28 @@ pub fn judge_single_test(
             && !cancel.is_cancelled()
         {
             let should_retry = {
-                let mut set = RETRIED_BINARIES.lock();
-                set.insert(exe_path.to_path_buf())
+                let mut state = RETRY_TRACKER.lock();
+                if state.0.contains(exe_path) {
+                    false
+                } else {
+                    let count = state.1.entry(exe_path.to_path_buf()).or_insert(0);
+                    if *count < 3 {
+                        *count += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
             };
             if should_retry {
                 let mut retry_spec = spec.clone();
                 retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(10000);
                 let retry_start = Instant::now();
                 if let Ok(retry_res) = sandbox.run(&retry_spec, cancel) {
+                    if retry_res.killed_by == Some(KillReason::WallLimit) {
+                        let mut state = RETRY_TRACKER.lock();
+                        state.0.insert(exe_path.to_path_buf());
+                    }
                     run_res = Ok(retry_res);
                     duration_ms = retry_start.elapsed().as_millis() as u64;
                 }
@@ -382,30 +406,111 @@ pub fn judge_single_test(
                                     spec.limits.output_bytes.saturating_mul(2),
                                     Limits::DEFAULT_OUTPUT_BYTES,
                                 );
-                                match uj_core::read_artifact_bounded(ans_path, ans_limit) {
-                                    Err(uj_core::ReadArtifactError::NotFound(p)) => (
-                                        Verdict::JudgeFailed,
-                                        0.0,
-                                        Some(format!("Answer file not found: {p}")),
-                                        None,
-                                        None,
+                                #[allow(clippy::type_complexity)]
+                                static ANSWER_FILE_CACHE: std::sync::LazyLock<
+                                    parking_lot::Mutex<
+                                        std::collections::HashMap<
+                                            PathBuf,
+                                            (
+                                                std::time::SystemTime,
+                                                u64,
+                                                std::sync::Arc<uj_checker::FileBytes>,
+                                            ),
+                                        >,
+                                    >,
+                                > = std::sync::LazyLock::new(|| {
+                                    parking_lot::Mutex::new(std::collections::HashMap::new())
+                                });
+
+                                #[allow(clippy::type_complexity, clippy::result_large_err)]
+                                let ans_bytes_res = (|| -> Result<
+                                    std::sync::Arc<uj_checker::FileBytes>,
+                                    (
+                                        Verdict,
+                                        f64,
+                                        Option<String>,
+                                        Option<String>,
+                                        Option<DiffSummary>,
                                     ),
-                                    Err(uj_core::ReadArtifactError::AccessDenied(p)) => (
-                                        Verdict::JudgeFailed,
-                                        0.0,
-                                        Some(format!("Permission denied reading answer file: {p}")),
-                                        None,
-                                        None,
-                                    ),
-                                    Err(e) => (
-                                        Verdict::JudgeFailed,
-                                        0.0,
-                                        Some(format!("Failed to read answer file: {e}")),
-                                        None,
-                                        None,
-                                    ),
+                                > {
+                                    let meta = match fs::metadata(ans_path) {
+                                        Ok(m) => m,
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                            return Err((
+                                                Verdict::JudgeFailed,
+                                                0.0,
+                                                Some(format!(
+                                                    "Answer file not found: {}",
+                                                    ans_path.display()
+                                                )),
+                                                None,
+                                                None,
+                                            ));
+                                        }
+                                        Err(e)
+                                            if e.kind() == std::io::ErrorKind::PermissionDenied =>
+                                        {
+                                            return Err((
+                                                Verdict::JudgeFailed,
+                                                0.0,
+                                                Some(format!(
+                                                    "Permission denied reading answer file: {}",
+                                                    ans_path.display()
+                                                )),
+                                                None,
+                                                None,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            return Err((
+                                                Verdict::JudgeFailed,
+                                                0.0,
+                                                Some(format!("Failed to read answer file: {e}")),
+                                                None,
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    let len = meta.len();
+                                    if len > ans_limit {
+                                        return Err((
+                                            Verdict::JudgeFailed,
+                                            0.0,
+                                            Some(format!(
+                                                "Answer file exceeded limit: {len} bytes > {ans_limit} bytes"
+                                            )),
+                                            None,
+                                            None,
+                                        ));
+                                    }
+                                    let mtime = meta
+                                        .modified()
+                                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                    let mut cache = ANSWER_FILE_CACHE.lock();
+                                    if let Some((c_mtime, c_len, c_bytes)) = cache.get(ans_path)
+                                        && *c_mtime == mtime
+                                        && *c_len == len
+                                    {
+                                        return Ok(c_bytes.clone());
+                                    }
+                                    let fb = uj_checker::read_file_bytes(ans_path).map_err(|e| {
+                                        (
+                                            Verdict::JudgeFailed,
+                                            0.0,
+                                            Some(format!("Failed to read answer file: {e}")),
+                                            None,
+                                            None,
+                                        )
+                                    })?;
+                                    let arc = std::sync::Arc::new(fb);
+                                    cache.insert(ans_path.to_path_buf(), (mtime, len, arc.clone()));
+                                    Ok(arc)
+                                })();
+
+                                match ans_bytes_res {
+                                    Err(fail_tuple) => fail_tuple,
                                     Ok(ans_artifact) => {
-                                        let ans_slice = &ans_artifact.bytes;
+                                        let ans_slice = &ans_artifact[..];
 
                                         match checker {
                                             ResolvedChecker::Builtin(b) => {
@@ -427,15 +532,7 @@ pub fn judge_single_test(
                                                 )
                                             }
                                             ResolvedChecker::Testlib(chk_exe) => {
-                                                let out_file = box_dir.join(format!(
-                                                    "uj_out_{}_{}_{}.txt",
-                                                    std::process::id(),
-                                                    test.name,
-                                                    std::time::SystemTime::now()
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .map(|d| d.as_nanos())
-                                                        .unwrap_or(0)
-                                                ));
+                                                let out_file = box_dir.join("uj_out.txt");
                                                 let _ = fs::write(&out_file, &stdout_bytes);
 
                                                 let check_res =
@@ -461,15 +558,7 @@ pub fn judge_single_test(
                                                 path: chk_exe,
                                                 full_score,
                                             } => {
-                                                let out_file = box_dir.join(format!(
-                                                    "uj_out_{}_{}_{}.txt",
-                                                    std::process::id(),
-                                                    test.name,
-                                                    std::time::SystemTime::now()
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .map(|d| d.as_nanos())
-                                                        .unwrap_or(0)
-                                                ));
+                                                let out_file = box_dir.join("uj_out.txt");
                                                 let _ = fs::write(&out_file, &stdout_bytes);
 
                                                 let check_res =
@@ -1469,6 +1558,7 @@ pub fn judge_communication_test(
     cancel: &CancelToken,
     custom_box: Option<&Path>,
     num_processes: usize,
+    topology: Option<&str>,
 ) -> SingleTestResult {
     let base_dir = test
         .input_path
@@ -1604,7 +1694,7 @@ pub fn judge_communication_test(
                 },
             ],
         }
-    } else {
+    } else if topology == Some("ring") || topology == Some("pipeline") {
         let mut connections = Vec::new();
         connections.push(PipeConnection {
             from_proc: 0,
@@ -1621,6 +1711,30 @@ pub fn judge_communication_test(
             to_proc: 0,
         });
         Wiring { connections }
+    } else {
+        if is_reused_box {
+            let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
+        } else if let Some(ref rd) = run_dir {
+            let _ = fs::remove_dir_all(rd);
+        }
+        return SingleTestResult {
+            id: test.name.clone(),
+            subtask: test.subtask_id,
+            verdict: Verdict::JudgeFailed,
+            score: 0.0,
+            time_ms: 0,
+            wall_ms: 0,
+            memory_kb: 0,
+            exit: ExitInfo::default(),
+            message: Some(format!(
+                "Unsupported communication topology '{:?}' for {} participants",
+                topology, num_participants
+            )),
+            checker: None,
+            diff: None,
+            timing: Default::default(),
+            sandbox_tier: None,
+        };
     };
 
     let start_instant = Instant::now();

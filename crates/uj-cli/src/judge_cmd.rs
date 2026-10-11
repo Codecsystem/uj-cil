@@ -362,6 +362,12 @@ pub fn run_judge(
                         duration_ms: 0,
                         error_output: Some(e.to_string()),
                     });
+                    let _ = tx.send(JudgeEvent::Summary {
+                        total_time_ms: 0,
+                        peak_memory_kb: 0,
+                        final_verdict: Verdict::CompileError,
+                        final_score: 0.0,
+                    });
                 }
 
                 let err_msg = match &e {

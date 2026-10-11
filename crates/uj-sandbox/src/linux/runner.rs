@@ -26,6 +26,36 @@ struct SandboxStatusPacket {
     ru_maxrss_kb: u64,
 }
 
+#[derive(Clone)]
+struct SendSyncPtrs {
+    _storage: Vec<std::ffi::CString>,
+    ptrs: Vec<*const libc::c_char>,
+}
+unsafe impl Send for SendSyncPtrs {}
+unsafe impl Sync for SendSyncPtrs {}
+
+impl SendSyncPtrs {
+    pub fn new(cstrings: Vec<std::ffi::CString>) -> Self {
+        let mut ptrs: Vec<*const libc::c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
+        ptrs.push(std::ptr::null());
+        Self {
+            _storage: cstrings,
+            ptrs,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            _storage: Vec::new(),
+            ptrs: vec![std::ptr::null()],
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const *const libc::c_char {
+        self.ptrs.as_ptr()
+    }
+}
+
 /// Helper to open a pidfd on Linux (syscall 434).
 fn pidfd_open(pid: i32) -> Result<i32, std::io::Error> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
@@ -181,18 +211,267 @@ pub fn execute_in_sandbox_with_stdio(
     let status_read_fd = status_pipe[0];
     let status_write_fd = status_pipe[1];
 
+    // Pre-calculate all resources, CStrings, and file system skeletons in the parent thread
+    // BEFORE fork, so the child running in pre_exec strictly executes async-signal-safe syscalls.
+    let real_uid = unsafe { libc::getuid() };
+    let real_gid = unsafe { libc::getgid() };
+    let uid_map_bytes = format!("0 {real_uid} 1\n");
+    let gid_map_bytes = format!("0 {real_gid} 1\n");
+    let cgroup_procs_cpath = cgroup_procs_file
+        .as_ref()
+        .and_then(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).ok());
+
+    let (
+        c_rootfs,
+        c_usr,
+        c_dev,
+        c_proc,
+        c_tmp,
+        c_box,
+        c_etc,
+        c_oldroot,
+        c_bin,
+        c_lib,
+        c_lib64,
+        c_workdir,
+        target_exe_pair,
+        ro_bind_pairs,
+        dev_pairs,
+        ld_so_pair,
+        alt_pair,
+        c_argv_ptrs,
+        c_env_ptrs,
+        c_exe,
+    ) = if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
+        let rootfs = if work_dir == Path::new("/tmp") || work_dir.starts_with("/tmp") {
+            if Path::new("/dev/shm").is_dir() {
+                PathBuf::from(format!("/dev/shm/.uj_rootfs_{}", std::process::id()))
+            } else {
+                PathBuf::from(format!("/run/.uj_rootfs_{}", std::process::id()))
+            }
+        } else {
+            work_dir.join(".uj_rootfs")
+        };
+        let _ = fs::create_dir_all(&rootfs);
+        for d in ["usr", "dev", "proc", "tmp", "box", "etc", "old_root"] {
+            let _ = fs::create_dir_all(rootfs.join(d));
+        }
+        for (link_name, target) in [
+            ("bin", "usr/bin"),
+            ("lib", "usr/lib"),
+            ("lib64", "usr/lib64"),
+        ] {
+            let link_path = rootfs.join(link_name);
+            if !link_path.exists() {
+                let _ = std::os::unix::fs::symlink(target, &link_path);
+            }
+        }
+
+        let c_rootfs = std::ffi::CString::new(rootfs.to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid rootfs path: {e}")))?;
+        let c_usr = std::ffi::CString::new(rootfs.join("usr").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid usr path: {e}")))?;
+        let c_dev = std::ffi::CString::new(rootfs.join("dev").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid dev path: {e}")))?;
+        let c_proc = std::ffi::CString::new(rootfs.join("proc").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid proc path: {e}")))?;
+        let c_tmp = std::ffi::CString::new(rootfs.join("tmp").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid tmp path: {e}")))?;
+        let c_box = std::ffi::CString::new(rootfs.join("box").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid box path: {e}")))?;
+        let c_etc = std::ffi::CString::new(rootfs.join("etc").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid etc path: {e}")))?;
+        let c_oldroot =
+            std::ffi::CString::new(rootfs.join("old_root").to_string_lossy().as_bytes())
+                .map_err(|e| SandboxError::Internal(format!("Invalid old_root path: {e}")))?;
+        let c_bin = std::ffi::CString::new(rootfs.join("bin").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid bin path: {e}")))?;
+        let c_lib = std::ffi::CString::new(rootfs.join("lib").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid lib path: {e}")))?;
+        let c_lib64 = std::ffi::CString::new(rootfs.join("lib64").to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid lib64 path: {e}")))?;
+        let c_workdir = std::ffi::CString::new(work_dir.to_string_lossy().as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid workdir path: {e}")))?;
+
+        let (jail_exe_path, target_exe_pair) =
+            if host_exe.starts_with("/usr") || host_exe.starts_with("/bin") {
+                (host_exe.to_string_lossy().to_string(), None)
+            } else {
+                let target_exe = rootfs.join("box").join("__uj_bin");
+                let c_target_exe = std::ffi::CString::new(target_exe.to_string_lossy().as_bytes())
+                    .map_err(|e| SandboxError::Internal(format!("Invalid target exe: {e}")))?;
+                let c_host_exe = std::ffi::CString::new(host_exe.to_string_lossy().as_bytes())
+                    .map_err(|e| SandboxError::Internal(format!("Invalid host exe: {e}")))?;
+                (
+                    "/box/__uj_bin".to_string(),
+                    Some((c_host_exe, c_target_exe)),
+                )
+            };
+
+        let mut ro_bind_pairs = Vec::new();
+        for ro_bind in &ro_binds {
+            if ro_bind.exists() {
+                let rel = ro_bind.strip_prefix("/").unwrap_or(ro_bind);
+                let target = rootfs.join(rel);
+                if let (Ok(c_src), Ok(c_dst)) = (
+                    std::ffi::CString::new(ro_bind.to_string_lossy().as_bytes()),
+                    std::ffi::CString::new(target.to_string_lossy().as_bytes()),
+                ) {
+                    ro_bind_pairs.push((c_src, c_dst, ro_bind.is_dir()));
+                }
+            }
+        }
+
+        let mut dev_pairs = Vec::new();
+        for dev in ["null", "zero", "urandom", "random"] {
+            let dst = rootfs.join("dev").join(dev);
+            if let (Ok(c_src), Ok(c_dst)) = (
+                std::ffi::CString::new(format!("/dev/{dev}")),
+                std::ffi::CString::new(dst.to_string_lossy().as_bytes()),
+            ) {
+                dev_pairs.push((c_src, c_dst));
+            }
+        }
+
+        let ld_so_pair = if Path::new("/etc/ld.so.cache").exists() {
+            let dst_ld = rootfs.join("etc").join("ld.so.cache");
+            if let (Ok(c_src), Ok(c_dst)) = (
+                std::ffi::CString::new("/etc/ld.so.cache"),
+                std::ffi::CString::new(dst_ld.to_string_lossy().as_bytes()),
+            ) {
+                Some((c_src, c_dst))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let alt_pair = if Path::new("/etc/alternatives").is_dir() {
+            let dst_alt = rootfs.join("etc").join("alternatives");
+            if let (Ok(c_src), Ok(c_dst)) = (
+                std::ffi::CString::new("/etc/alternatives"),
+                std::ffi::CString::new(dst_alt.to_string_lossy().as_bytes()),
+            ) {
+                Some((c_src, c_dst))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut jail_argv = Vec::new();
+        jail_argv.push(jail_exe_path.clone());
+        for arg in &jail_args {
+            jail_argv.push(arg.clone());
+        }
+        let c_argv: Vec<std::ffi::CString> = jail_argv
+            .iter()
+            .map(|s| std::ffi::CString::new(s.as_bytes()).unwrap_or_default())
+            .collect();
+        let c_argv_ptrs = SendSyncPtrs::new(c_argv);
+
+        let mut c_env: Vec<std::ffi::CString> = jail_env
+            .iter()
+            .map(|(k, v)| std::ffi::CString::new(format!("{k}={v}").as_bytes()).unwrap_or_default())
+            .collect();
+        if !jail_env.iter().any(|(k, _)| k == "PATH") {
+            c_env.push(std::ffi::CString::new("PATH=/usr/bin:/bin").unwrap());
+        }
+        let c_env_ptrs = SendSyncPtrs::new(c_env);
+
+        let c_exe = std::ffi::CString::new(jail_exe_path.as_bytes())
+            .map_err(|e| SandboxError::Internal(format!("Invalid jail exe: {e}")))?;
+
+        (
+            Some(c_rootfs),
+            Some(c_usr),
+            Some(c_dev),
+            Some(c_proc),
+            Some(c_tmp),
+            Some(c_box),
+            Some(c_etc),
+            Some(c_oldroot),
+            Some(c_bin),
+            Some(c_lib),
+            Some(c_lib64),
+            Some(c_workdir),
+            target_exe_pair,
+            ro_bind_pairs,
+            dev_pairs,
+            ld_so_pair,
+            alt_pair,
+            c_argv_ptrs,
+            c_env_ptrs,
+            Some(c_exe),
+        )
+    } else {
+        (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            SendSyncPtrs::empty(),
+            SendSyncPtrs::empty(),
+            None,
+        )
+    };
+
     unsafe {
         cmd.pre_exec(move || {
-            // Immediately join the cgroup v2 before unsharing or execing
-            if let Some(ref procs_file) = cgroup_procs_file {
-                fs::write(procs_file, b"0\n")?;
+            // Raw async-signal-safe file writer using direct libc syscalls
+            unsafe fn raw_write_all(
+                path: *const libc::c_char,
+                bytes: &[u8],
+            ) -> std::io::Result<()> {
+                let fd = unsafe { libc::open(path, libc::O_WRONLY) };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut written = 0;
+                while written < bytes.len() {
+                    let res = unsafe {
+                        libc::write(
+                            fd,
+                            bytes[written..].as_ptr() as *const libc::c_void,
+                            bytes.len() - written,
+                        )
+                    };
+                    if res < 0 {
+                        let err = std::io::Error::last_os_error();
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        return Err(err);
+                    }
+                    written += res as usize;
+                }
+                unsafe {
+                    libc::close(fd);
+                }
+                Ok(())
+            }
+
+            // 1. Immediately join cgroup v2 before unsharing
+            if let Some(ref procs_cpath) = cgroup_procs_cpath {
+                raw_write_all(procs_cpath.as_ptr(), b"0\n")?;
             }
 
             if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
-                // Get real UID and GID BEFORE unshare
-                let real_uid = libc::getuid();
-                let real_gid = libc::getgid();
-
                 // 1. Unshare user, pid, mount, net, ipc, uts namespaces
                 if libc::unshare(
                     libc::CLONE_NEWUSER
@@ -206,12 +485,12 @@ pub fn execute_in_sandbox_with_stdio(
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // 2. Setup user namespace UID/GID mapping
-                fs::write("/proc/self/setgroups", b"deny\n")?;
-                fs::write("/proc/self/uid_map", format!("0 {real_uid} 1\n").as_bytes())?;
-                fs::write("/proc/self/gid_map", format!("0 {real_gid} 1\n").as_bytes())?;
+                // 2. Setup user namespace UID/GID mapping via raw syscalls
+                raw_write_all(c"/proc/self/setgroups".as_ptr(), b"deny\n")?;
+                raw_write_all(c"/proc/self/uid_map".as_ptr(), uid_map_bytes.as_bytes())?;
+                raw_write_all(c"/proc/self/gid_map".as_ptr(), gid_map_bytes.as_bytes())?;
 
-                // 3. Make all mounts private so our rootfs mounts don't propagate to host
+                // 3. Make all mounts private so rootfs mounts don't propagate to host
                 if libc::mount(
                     std::ptr::null(),
                     c"/".as_ptr(),
@@ -223,22 +502,23 @@ pub fn execute_in_sandbox_with_stdio(
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // 4. Create minimal rootfs on a private tmpfs
-                let rootfs = if work_dir == Path::new("/tmp") || work_dir.starts_with("/tmp") {
-                    if Path::new("/dev/shm").is_dir() {
-                        PathBuf::from(format!("/dev/shm/.uj_rootfs_{}", std::process::id()))
-                    } else {
-                        PathBuf::from(format!("/run/.uj_rootfs_{}", std::process::id()))
-                    }
-                } else {
-                    work_dir.join(".uj_rootfs")
-                };
-                fs::create_dir_all(&rootfs)?;
-                let c_rootfs = std::ffi::CString::new(rootfs.to_string_lossy().as_bytes())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let c_rootfs_ptr = c_rootfs.as_ref().unwrap().as_ptr();
+                let c_usr_ptr = c_usr.as_ref().unwrap().as_ptr();
+                let c_dev_ptr = c_dev.as_ref().unwrap().as_ptr();
+                let c_proc_ptr = c_proc.as_ref().unwrap().as_ptr();
+                let c_tmp_ptr = c_tmp.as_ref().unwrap().as_ptr();
+                let c_box_ptr = c_box.as_ref().unwrap().as_ptr();
+                let c_etc_ptr = c_etc.as_ref().unwrap().as_ptr();
+                let c_oldroot_ptr = c_oldroot.as_ref().unwrap().as_ptr();
+                let c_bin_ptr = c_bin.as_ref().unwrap().as_ptr();
+                let c_lib_ptr = c_lib.as_ref().unwrap().as_ptr();
+                let c_lib64_ptr = c_lib64.as_ref().unwrap().as_ptr();
+                let c_workdir_ptr = c_workdir.as_ref().unwrap().as_ptr();
+
+                // 4. Mount private tmpfs rootfs
                 if libc::mount(
                     c"tmpfs".as_ptr(),
-                    c_rootfs.as_ptr(),
+                    c_rootfs_ptr,
                     c"tmpfs".as_ptr(),
                     0,
                     c"size=64m".as_ptr() as *const libc::c_void,
@@ -247,16 +527,32 @@ pub fn execute_in_sandbox_with_stdio(
                     return Err(std::io::Error::last_os_error());
                 }
 
-                for d in ["usr", "dev", "proc", "tmp", "box", "etc", "old_root"] {
-                    fs::create_dir_all(rootfs.join(d))?;
+                // Create directory skeleton on the fresh tmpfs using raw signal-safe mkdir syscalls
+                for ptr in [
+                    c_usr_ptr,
+                    c_dev_ptr,
+                    c_proc_ptr,
+                    c_tmp_ptr,
+                    c_box_ptr,
+                    c_etc_ptr,
+                    c_oldroot_ptr,
+                ] {
+                    if libc::mkdir(ptr, 0o755) != 0
+                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
 
+                // Symlinks on tmpfs
+                let _ = libc::symlink(c"usr/bin".as_ptr(), c_bin_ptr);
+                let _ = libc::symlink(c"usr/lib".as_ptr(), c_lib_ptr);
+                let _ = libc::symlink(c"usr/lib64".as_ptr(), c_lib64_ptr);
+
                 // Bind mount /usr (read-only)
-                let c_usr = std::ffi::CString::new(rootfs.join("usr").to_string_lossy().as_bytes())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 if libc::mount(
                     c"/usr".as_ptr(),
-                    c_usr.as_ptr(),
+                    c_usr_ptr,
                     std::ptr::null(),
                     libc::MS_BIND | libc::MS_REC,
                     std::ptr::null(),
@@ -266,7 +562,7 @@ pub fn execute_in_sandbox_with_stdio(
                 }
                 if libc::mount(
                     std::ptr::null(),
-                    c_usr.as_ptr(),
+                    c_usr_ptr,
                     std::ptr::null(),
                     libc::MS_BIND
                         | libc::MS_REMOUNT
@@ -279,24 +575,10 @@ pub fn execute_in_sandbox_with_stdio(
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // Symlink /bin, /lib, /lib64 to usr equivalents (standard Debian/Ubuntu)
-                for (link_name, target) in [
-                    ("bin", "usr/bin"),
-                    ("lib", "usr/lib"),
-                    ("lib64", "usr/lib64"),
-                ] {
-                    let link_path = rootfs.join(link_name);
-                    let _ = std::os::unix::fs::symlink(target, &link_path);
-                }
-
                 // Bind mount /box (work_dir) read-write
-                let c_box = std::ffi::CString::new(rootfs.join("box").to_string_lossy().as_bytes())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                let c_workdir = std::ffi::CString::new(work_dir.to_string_lossy().as_bytes())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 if libc::mount(
-                    c_workdir.as_ptr(),
-                    c_box.as_ptr(),
+                    c_workdir_ptr,
+                    c_box_ptr,
                     std::ptr::null(),
                     libc::MS_BIND,
                     std::ptr::null(),
@@ -306,18 +588,12 @@ pub fn execute_in_sandbox_with_stdio(
                 }
 
                 // Bind mount binary if outside /usr
-                let jail_exe_path = if host_exe.starts_with("/usr") || host_exe.starts_with("/bin")
-                {
-                    host_exe.to_string_lossy().to_string()
-                } else {
-                    let target_exe = rootfs.join("box").join("__uj_bin");
-                    File::create(&target_exe)?;
-                    let c_target_exe = std::ffi::CString::new(
-                        target_exe.to_string_lossy().as_bytes(),
-                    )
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                    let c_host_exe = std::ffi::CString::new(host_exe.to_string_lossy().as_bytes())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                if let Some((ref c_host_exe, ref c_target_exe)) = target_exe_pair {
+                    let fd =
+                        libc::open(c_target_exe.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o755);
+                    if fd >= 0 {
+                        libc::close(fd);
+                    }
                     if libc::mount(
                         c_host_exe.as_ptr(),
                         c_target_exe.as_ptr(),
@@ -335,51 +611,38 @@ pub fn execute_in_sandbox_with_stdio(
                         libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
                         std::ptr::null(),
                     );
-                    "/box/__uj_bin".to_string()
-                };
+                }
 
                 // Ro binds
-                for ro_bind in &ro_binds {
-                    if ro_bind.exists() {
-                        let rel = ro_bind.strip_prefix("/").unwrap_or(ro_bind);
-                        let target = rootfs.join(rel);
-                        if ro_bind.is_dir() {
-                            let _ = fs::create_dir_all(&target);
-                        } else {
-                            if let Some(parent) = target.parent() {
-                                let _ = fs::create_dir_all(parent);
-                            }
-                            let _ = File::create(&target);
-                        }
-                        if let Ok(c_src) =
-                            std::ffi::CString::new(ro_bind.to_string_lossy().as_bytes())
-                            && let Ok(c_dst) =
-                                std::ffi::CString::new(target.to_string_lossy().as_bytes())
-                        {
-                            let _ = libc::mount(
-                                c_src.as_ptr(),
-                                c_dst.as_ptr(),
-                                std::ptr::null(),
-                                libc::MS_BIND,
-                                std::ptr::null(),
-                            );
-                            let _ = libc::mount(
-                                std::ptr::null(),
-                                c_dst.as_ptr(),
-                                std::ptr::null(),
-                                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                                std::ptr::null(),
-                            );
+                for (c_src, c_dst, is_dir) in &ro_bind_pairs {
+                    if *is_dir {
+                        let _ = libc::mkdir(c_dst.as_ptr(), 0o755);
+                    } else {
+                        let fd = libc::open(c_dst.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644);
+                        if fd >= 0 {
+                            libc::close(fd);
                         }
                     }
+                    let _ = libc::mount(
+                        c_src.as_ptr(),
+                        c_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    );
+                    let _ = libc::mount(
+                        std::ptr::null(),
+                        c_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                        std::ptr::null(),
+                    );
                 }
 
                 // Private /tmp
-                let c_tmp = std::ffi::CString::new(rootfs.join("tmp").to_string_lossy().as_bytes())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 if libc::mount(
                     c"tmpfs".as_ptr(),
-                    c_tmp.as_ptr(),
+                    c_tmp_ptr,
                     c"tmpfs".as_ptr(),
                     libc::MS_NOSUID | libc::MS_NODEV,
                     c"size=16m,mode=1777".as_ptr() as *const libc::c_void,
@@ -389,11 +652,9 @@ pub fn execute_in_sandbox_with_stdio(
                 }
 
                 // Private /dev
-                let c_dev = std::ffi::CString::new(rootfs.join("dev").to_string_lossy().as_bytes())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 if libc::mount(
                     c"tmpfs".as_ptr(),
-                    c_dev.as_ptr(),
+                    c_dev_ptr,
                     c"tmpfs".as_ptr(),
                     libc::MS_NOSUID,
                     c"size=4m".as_ptr() as *const libc::c_void,
@@ -401,70 +662,62 @@ pub fn execute_in_sandbox_with_stdio(
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-                for dev in ["null", "zero", "urandom", "random"] {
-                    let dst = rootfs.join("dev").join(dev);
-                    let _ = File::create(&dst);
-                    if let Ok(c_dst) = std::ffi::CString::new(dst.to_string_lossy().as_bytes())
-                        && let Ok(c_src) = std::ffi::CString::new(format!("/dev/{dev}"))
-                    {
-                        let _ = libc::mount(
-                            c_src.as_ptr(),
-                            c_dst.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND,
-                            std::ptr::null(),
-                        );
-                        let _ = libc::mount(
-                            std::ptr::null(),
-                            c_dst.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                            std::ptr::null(),
-                        );
+
+                for (c_src, c_dst) in &dev_pairs {
+                    let fd = libc::open(c_dst.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o666);
+                    if fd >= 0 {
+                        libc::close(fd);
                     }
+                    let _ = libc::mount(
+                        c_src.as_ptr(),
+                        c_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    );
+                    let _ = libc::mount(
+                        std::ptr::null(),
+                        c_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                        std::ptr::null(),
+                    );
                 }
 
-                // /etc/ld.so.cache and alternatives
-                if Path::new("/etc/ld.so.cache").exists() {
-                    let dst_ld = rootfs.join("etc").join("ld.so.cache");
-                    let _ = File::create(&dst_ld);
-                    if let Ok(c_dst) = std::ffi::CString::new(dst_ld.to_string_lossy().as_bytes()) {
-                        let _ = libc::mount(
-                            c"/etc/ld.so.cache".as_ptr(),
-                            c_dst.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND,
-                            std::ptr::null(),
-                        );
-                        let _ = libc::mount(
-                            std::ptr::null(),
-                            c_dst.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                            std::ptr::null(),
-                        );
+                if let Some((ref c_src, ref c_dst)) = ld_so_pair {
+                    let fd = libc::open(c_dst.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644);
+                    if fd >= 0 {
+                        libc::close(fd);
                     }
+                    let _ = libc::mount(
+                        c_src.as_ptr(),
+                        c_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    );
+                    let _ = libc::mount(
+                        std::ptr::null(),
+                        c_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                        std::ptr::null(),
+                    );
                 }
-                if Path::new("/etc/alternatives").is_dir() {
-                    let dst_alt = rootfs.join("etc").join("alternatives");
-                    let _ = fs::create_dir_all(&dst_alt);
-                    if let Ok(c_dst) = std::ffi::CString::new(dst_alt.to_string_lossy().as_bytes())
-                    {
-                        let _ = libc::mount(
-                            c"/etc/alternatives".as_ptr(),
-                            c_dst.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND | libc::MS_RDONLY,
-                            std::ptr::null(),
-                        );
-                    }
+
+                if let Some((ref c_src, ref c_dst)) = alt_pair {
+                    let _ = libc::mkdir(c_dst.as_ptr(), 0o755);
+                    let _ = libc::mount(
+                        c_src.as_ptr(),
+                        c_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND | libc::MS_RDONLY,
+                        std::ptr::null(),
+                    );
                 }
 
                 // 5. pivot_root
-                let c_oldroot =
-                    std::ffi::CString::new(rootfs.join("old_root").to_string_lossy().as_bytes())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                if libc::syscall(libc::SYS_pivot_root, c_rootfs.as_ptr(), c_oldroot.as_ptr()) != 0 {
+                if libc::syscall(libc::SYS_pivot_root, c_rootfs_ptr, c_oldroot_ptr) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::chdir(c"/".as_ptr()) != 0 {
@@ -473,7 +726,7 @@ pub fn execute_in_sandbox_with_stdio(
                 if libc::umount2(c"/old_root".as_ptr(), libc::MNT_DETACH) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                let _ = fs::remove_dir("/old_root");
+                let _ = libc::rmdir(c"/old_root".as_ptr());
 
                 // Remount rootfs as read-only, ensuring only /box and /tmp are writable
                 let _ = libc::mount(
@@ -496,7 +749,6 @@ pub fn execute_in_sandbox_with_stdio(
 
                 if init_pid == 0 {
                     // Child is now PID 1 in the new PID namespace!
-                    // Automatically kill PID 1 if intermediate host process dies
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
 
                     let status_tx_fd = 3;
@@ -531,7 +783,7 @@ pub fn execute_in_sandbox_with_stdio(
                         );
                     }
 
-                    // Fork contestant process as PID 2 (normal process, standard signal semantics)
+                    // Fork contestant process as PID 2
                     let contestant_pid = libc::fork();
                     if contestant_pid < 0 {
                         libc::_exit(126);
@@ -588,35 +840,9 @@ pub fn execute_in_sandbox_with_stdio(
                             libc::_exit(125);
                         }
 
-                        let mut jail_argv = Vec::new();
-                        jail_argv.push(jail_exe_path.clone());
-                        for arg in &jail_args {
-                            jail_argv.push(arg.clone());
-                        }
-                        let c_argv: Vec<std::ffi::CString> = jail_argv
-                            .iter()
-                            .map(|s| std::ffi::CString::new(s.as_bytes()).unwrap_or_default())
-                            .collect();
-                        let mut c_argv_ptrs: Vec<*const libc::c_char> =
-                            c_argv.iter().map(|s| s.as_ptr()).collect();
-                        c_argv_ptrs.push(std::ptr::null());
-
-                        let mut c_env: Vec<std::ffi::CString> = jail_env
-                            .iter()
-                            .map(|(k, v)| {
-                                std::ffi::CString::new(format!("{k}={v}").as_bytes())
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-                        if !jail_env.iter().any(|(k, _)| k == "PATH") {
-                            c_env.push(std::ffi::CString::new("PATH=/usr/bin:/bin").unwrap());
-                        }
-                        let mut c_env_ptrs: Vec<*const libc::c_char> =
-                            c_env.iter().map(|s| s.as_ptr()).collect();
-                        c_env_ptrs.push(std::ptr::null());
-
-                        let c_exe = std::ffi::CString::new(jail_exe_path.as_bytes()).unwrap();
-                        libc::execve(c_exe.as_ptr(), c_argv_ptrs.as_ptr(), c_env_ptrs.as_ptr());
+                        // Pure async-signal-safe execve using precomputed argv/env pointers
+                        let c_exe_ptr = c_exe.as_ref().unwrap().as_ptr();
+                        libc::execve(c_exe_ptr, c_argv_ptrs.as_ptr(), c_env_ptrs.as_ptr());
                         libc::_exit(127);
                     } else {
                         // PID 1 init process: wait for contestant PID 2, then reap any zombies
@@ -795,12 +1021,11 @@ pub fn execute_in_sandbox_with_stdio(
                 if n == 0 {
                     break;
                 }
-                if buf.len() + n > stderr_limit {
-                    let take = stderr_limit.saturating_sub(buf.len());
+                if buf.len() < stderr_limit {
+                    let take = (stderr_limit - buf.len()).min(n);
                     buf.extend_from_slice(&chunk[..take]);
-                    break;
                 }
-                buf.extend_from_slice(&chunk[..n]);
+                // Continue reading to EOF to drain stderr so child writing to stderr never blocks on a full pipe
             }
             buf
         }))

@@ -15,10 +15,11 @@
 2. **确定性退出状态码 (Exit Codes)**：
    - Agent 可根据进程退出码快速判定评测宏观结论：
      - `0` (`EXIT_SUCCESS`)：所有测试点均通过（AC），或命令执行成功。
-     - `1` (`EXIT_NON_AC`)：评测完成，但存在测试点未通过（WA / TLE / MLE / RE / OLE / RF）。
-     - `2` (`EXIT_COMPILE_ERROR` / `EXIT_JUDGE_FAILED`)：编译失败或评测系统异常（校验器崩溃、沙盒报错等）。
-     - `3` (`EXIT_USAGE_OR_CONFIG`)：命令行参数错误、测试用例未找到或 `problem.toml` 语法非法。
-     - `4` (`EXIT_VERIFY_MISMATCH`)：`uj verify` 阶段解法的实际评测结果与声明的 `tag` 不符。
+     - `1` (`EXIT_NON_AC`)：评测完成，但存在测试点未通过（WA / TLE / MLE / RE / OLE / RF / PE）。
+     - `2` (`EXIT_USAGE_OR_CONFIG`)：命令行参数错误、测试用例未找到或 `problem.toml` 语法非法。
+     - `3` (`EXIT_JUDGE_FAILED`)：评测系统异常（校验器/交互器崩溃、沙盒报错等）。
+     - `4` (`EXIT_VERIFY_MISMATCH`)：`uj verify` 阶段解法的实际评测结果与声明的期望标签不符。
+     - `5` (`EXIT_COMPILE_ERROR`)：选手源码或辅助评测程序编译失败。
      - `130` (`EXIT_INTERRUPTED`)：被 SIGINT / Ctrl-C 中断。
 3. **机器可读的 JSON Schema 支持**：
    - 任何时刻均可运行 `uj schema result`、`uj schema config`、`uj schema events` 导出标准的 JSON Schema 定义文件，用于类型校验与代码生成。
@@ -168,6 +169,9 @@ tag = "wrong_answer"
 | **根目录** | `type` | `enum` | `"traditional"` | `"traditional"`, `"interactive"`, `"grader"`, `"communication"`, `"output_only"` |
 | **根目录** | `validator` | `path` | `None` | 输入校验器路径（如 `"validator.cpp"`） |
 | **根目录** | `interactor` | `path` | `None` | 交互题交互器路径（如 `"interactor.cpp"`） |
+| **根目录** | `manager` | `path` | `None` | 通信题评测管理器（如 `"manager.cpp"`） |
+| **根目录** | `processes` | `usize` | `1` | 通信题参赛选手进程数量 |
+| **根目录** | `communication_topology` | `string` | `None` | 当 `processes > 1` 时必填支持的拓扑结构（如 `"ring"` 或 `"pipeline"`） |
 | `[limits]` | `time` | `string` | **必填** | **带单位字符串**。如 `"1s"`, `"1.0s"`, `"500ms"`（底层由 `parse_time_ms` 解析） |
 | `[limits]` | `memory` | `string` | **必填** | **带单位字符串**。如 `"256MB"`, `"512MiB"`, `"1GiB"`（底层由 `parse_bytes` 解析） |
 | `[limits]` | `stack` | `string` | `"same"` | 栈空间限制。合法值：`"same"`, `"unlimited"`, 或带单位如 `"256MiB"` |

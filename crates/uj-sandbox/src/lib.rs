@@ -372,15 +372,20 @@ pub fn prepare_binary_content(
     if let Some(ref meta) = meta_opt {
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         let size = meta.len();
-        let key = (exe_path.to_path_buf(), base_dir.to_path_buf(), mtime, size);
-        let cache = PREPARED_BINARIES_CACHE.lock();
-        if let Some(cached_auth) = cache.get(&key)
-            && cached_auth.exists()
-            && std::fs::metadata(cached_auth)
-                .map(|m| m.len() == size)
-                .unwrap_or(false)
-        {
-            return Ok(cached_auth.clone());
+        // Sub-second jitter protection: if modified within the last 2 seconds, do not blindly
+        // trust mtime/size alone without content hash verification.
+        let is_recent = mtime.elapsed().map(|d| d.as_secs() < 2).unwrap_or(true);
+        if !is_recent {
+            let key = (exe_path.to_path_buf(), base_dir.to_path_buf(), mtime, size);
+            let cache = PREPARED_BINARIES_CACHE.lock();
+            if let Some(cached_auth) = cache.get(&key)
+                && cached_auth.exists()
+                && std::fs::metadata(cached_auth)
+                    .map(|m| m.len() == size)
+                    .unwrap_or(false)
+            {
+                return Ok(cached_auth.clone());
+            }
         }
     }
 

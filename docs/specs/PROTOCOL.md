@@ -78,16 +78,36 @@
 
 ## 4. NDJSON 事件流 (NDJSON Events)
 
-在评测执行期间，如果开启 `--format ndjson`，将依次推送以下事件：
+在评测执行期间，如果开启 `--format ndjson`，stdout 将按行实时推送 JSON 事件。典型事件序列如下：
 
-- `compile_start`
-- `compile_done`
-- `test_start`
-- `test_done`
-- `subtask_done`
-- `submission_done`
-- `warning`
-- `summary`
+1. `compile_start` / `compile_done`: 编译阶段通知。
+2. `test_start` / `test_done`: 单个测试点评测开始与结束，payload 为测试点结果。
+3. `subtask_done`: 子任务所有测试点完成后的结算事件：
+   ```json
+   {
+     "event": "subtask_done",
+     "data": {
+       "id": 1,
+       "verdict": "AC",
+       "score": 40.0,
+       "tests": ["1", "2"]
+     }
+   }
+   ```
+4. `submission_done`: 评测整体完成事件，payload 为完整的评测报告对象。
+5. `summary`: 最终汇总事件，位于流末尾，汇报真实最终结论与消耗：
+   ```json
+   {
+     "event": "summary",
+     "data": {
+       "total_time_ms": 132,
+       "peak_memory_kb": 10240,
+       "final_verdict": "AC",
+       "final_score": 100.0
+     }
+   }
+   ```
+6. `warning`: 运行时警告信息（如评测重试或环境提示）。
 
 ---
 

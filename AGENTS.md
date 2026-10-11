@@ -66,7 +66,7 @@ uj-cil/
 │   ├── evil/                  # 恶意对抗测试源码 (防作弊、防逃逸、防死锁、资源耗尽)
 │   ├── problems/              # 端到端测试题目套件 (传统、交互、通信、子任务依赖)
 │   └── *.rs                   # 各模块集成测试套件 (authoring, evil, pipeline, sandbox 等)
-└── docs/                      # 架构决策 (DECISIONS.md), 判题协议 (PROTOCOL.md), 评审记录
+└── docs/                      # 文档索引 (README.md) 与分类库 (specs/, plans/, reviews/, opt/)
 ```
 
 ---
@@ -159,14 +159,14 @@ uj schema events
 uj mcp
 ```
 MCP 服务端对外暴露的工具包含：
-- `doctor`: 诊断宿主环境能力。
-- `init_problem`: 快速生成题目骨架。
+- `doctor`: 诊断宿主环境与题目健康度。
 - `build`: 编译指定或全部题目组件。
-- `pipeline`: 执行完整出题流水线。
-- `judge`: 评测指定源码并回传详细指标。
+- `verify`: 批量校验题目中声明的各类解法结论。
+- `pipeline`: 一键执行出题全生命周期流水线。
+- `judge`: 评测指定源码并回传评测指标。
 - `stress`: 启动自动化对拍找反例。
-- `contest`: 批量运行比赛评测并生成完整排行榜。
+- `show`: 深入查看某次运行或特定测试点的输入输出差异。
+- `contest`: 批量运行比赛包评测并生成排行榜。
 
-> 📖 **进阶使用指南**：更详细的 Agent 实战工作流、解题/出题原子操作、JSON 字段解析范式与 Token 优化建议，请参阅：
-> 👉 [**docs/AGENT_GUIDE.md — uj AI Agent 详细使用与集成指南**](docs/AGENT_GUIDE.md)
+> 注：初始化题目目录骨架请使用 CLI 命令（`uj init <dir> --type <type>`）。详细 Agent 工作流与参数说明请参阅 [docs/specs/AGENT_GUIDE.md](docs/specs/AGENT_GUIDE.md)。
 

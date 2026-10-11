@@ -249,22 +249,18 @@ impl Scheduler {
             None
         };
 
-        // Sort tests by input file size descending (LPT heuristic)
+        // Sort test indices by input file size descending (LPT heuristic)
         use std::cmp::Reverse;
-        let mut sorted_tests = tests.clone();
-        sorted_tests.sort_by_cached_key(|test| {
-            Reverse(fs::metadata(&test.input_path).map(|m| m.len()).unwrap_or(0))
+        let mut sorted_indices: Vec<usize> = (0..tests.len()).collect();
+        sorted_indices.sort_by_cached_key(|&idx| {
+            Reverse(
+                fs::metadata(&tests[idx].input_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            )
         });
 
-        let total_tests = sorted_tests.len();
-        if let Some(ref tx) = event_sender {
-            let _ = tx.send(JudgeEvent::Summary {
-                total_time_ms: 0,
-                peak_memory_kb: 0,
-                final_verdict: Verdict::Accepted,
-                final_score: 0.0,
-            });
-        }
+        let total_tests = sorted_indices.len();
 
         // Shared state for fail-fast subtask tracking
         let failed_subtasks: Arc<Mutex<std::collections::HashSet<u32>>> =
@@ -299,6 +295,7 @@ impl Scheduler {
             let checker_clone = resolved_checker.clone();
             let problem_type = problem_config.problem_type;
             let num_processes = problem_config.processes.unwrap_or(1);
+            let comm_topology = problem_config.communication_topology.clone();
             let interactor_bin_clone = interactor_bin.clone();
             let manager_bin_clone = manager_bin.clone();
             let io_config = problem_config.io.clone();
@@ -450,6 +447,7 @@ impl Scheduler {
                                     &cancel_clone,
                                     custom_box_ref,
                                     num_processes,
+                                    comm_topology.as_deref(),
                                 )
                             } else {
                                 judge_single_test(
@@ -505,8 +503,8 @@ impl Scheduler {
         drop(result_tx); // Close original sender so result_rx terminates
 
         // Push tasks
-        for test in sorted_tests {
-            let _ = task_tx.send(test);
+        for idx in sorted_indices {
+            let _ = task_tx.send(tests[idx].clone());
         }
         drop(task_tx); // Close task sender so workers complete
 
@@ -522,6 +520,14 @@ impl Scheduler {
         }
 
         if test_results.is_empty() && total_tests > 0 {
+            if let Some(ref tx) = event_sender {
+                let _ = tx.send(JudgeEvent::Summary {
+                    total_time_ms: 0,
+                    peak_memory_kb: 0,
+                    final_verdict: Verdict::JudgeFailed,
+                    final_score: 0.0,
+                });
+            }
             return Err(SchedulerError::Sandbox(
                 "No test results collected: all sandbox executions failed".to_string(),
             ));
@@ -556,7 +562,7 @@ impl Scheduler {
                     &self.options.sandbox_mode,
                     self.options.require_tier,
                 ) {
-                    Ok(s) => s,
+                    Ok(s) => Some(s),
                     Err(e) => {
                         for &idx in &candidate_indices {
                             test_results[idx].verdict = Verdict::JudgeFailed;
@@ -564,126 +570,127 @@ impl Scheduler {
                                 "Precise rejudge failed: could not create exclusive sandbox: {e}"
                             ));
                         }
-                        return Ok(aggregate_submission_report(
-                            &problem_config.name,
-                            submission_name,
-                            problem_config,
-                            test_results,
-                        ));
+                        None
                     }
                 };
 
-                if let Some(ref p) = prepared_exe
-                    && let Err(e) = exclusive_sandbox.authorize_executable(p)
-                {
+                let authorized = if let Some(ref exclusive_sandbox) = exclusive_sandbox {
+                    if let Some(ref p) = prepared_exe
+                        && let Err(e) = exclusive_sandbox.authorize_executable(p)
+                    {
+                        for &idx in &candidate_indices {
+                            test_results[idx].verdict = Verdict::JudgeFailed;
+                            test_results[idx].message = Some(format!(
+                                "Precise rejudge failed: could not authorize executable: {e}"
+                            ));
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
+
+                if authorized && let Some(ref exclusive_sandbox) = exclusive_sandbox {
+                    let rejudge_slot_box =
+                        uj_sandbox::create_slot_box_dir(&base_dir_path, 9999).ok();
+                    let rejudge_box = rejudge_slot_box.as_ref().map(|sb| sb.box_dir.as_path());
+
                     for &idx in &candidate_indices {
-                        test_results[idx].verdict = Verdict::JudgeFailed;
-                        test_results[idx].message = Some(format!(
-                            "Precise rejudge failed: could not authorize executable: {e}"
-                        ));
-                    }
-                    return Ok(aggregate_submission_report(
-                        &problem_config.name,
-                        submission_name,
-                        problem_config,
-                        test_results,
-                    ));
-                }
-
-                let rejudge_slot_box = uj_sandbox::create_slot_box_dir(&base_dir_path, 9999).ok();
-                let rejudge_box = rejudge_slot_box.as_ref().map(|sb| sb.box_dir.as_path());
-
-                for &idx in &candidate_indices {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-
-                    let target_test_id = test_results[idx].id.clone();
-                    let Some(orig_test) = tests.iter().find(|t| t.name == target_test_id) else {
-                        continue;
-                    };
-
-                    let mut samples = vec![test_results[idx].time_ms];
-                    let mut best_result = test_results[idx].clone();
-
-                    // Rejudge up to 2 times in exclusive mode
-                    for _ in 0..2 {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        let rerun = match problem_config.problem_type {
-                            ProblemType::Interactive => {
-                                let int_exe = interactor_bin
-                                    .as_ref()
-                                    .expect("interactor binary must exist");
-                                judge_interactive_test(
-                                    exclusive_sandbox.as_ref(),
-                                    &compiled.binary_path,
-                                    compiled.interpreter_cmd.as_deref(),
-                                    prepared_exe.as_deref(),
-                                    int_exe,
-                                    orig_test,
-                                    &limits,
-                                    Some(&resolved_checker),
-                                    pe_as_wa,
-                                    cancel,
-                                    rejudge_box,
-                                )
-                            }
-                            ProblemType::Communication => {
-                                let mgr_exe = manager_bin
-                                    .as_ref()
-                                    .expect("manager binary must exist for communication problem");
-                                judge_communication_test(
-                                    exclusive_sandbox.as_ref(),
-                                    mgr_exe,
-                                    &compiled.binary_path,
-                                    compiled.interpreter_cmd.as_deref(),
-                                    prepared_exe.as_deref(),
-                                    orig_test,
-                                    &limits,
-                                    cancel,
-                                    rejudge_box,
-                                    problem_config.processes.unwrap_or(1),
-                                )
-                            }
-                            ProblemType::OutputOnly => unreachable!(),
-                            _ => judge_single_test(
-                                exclusive_sandbox.as_ref(),
-                                &compiled.binary_path,
-                                compiled.interpreter_cmd.as_deref(),
-                                prepared_exe.as_deref(),
-                                orig_test,
-                                &limits,
-                                &resolved_checker,
-                                pe_as_wa,
-                                topology.slots.first().and_then(|s| s.cpu_core),
-                                Some(&problem_config.io),
-                                cancel,
-                                rejudge_box,
-                            ),
+
+                        let target_test_id = test_results[idx].id.clone();
+                        let Some(orig_test) = tests.iter().find(|t| t.name == target_test_id)
+                        else {
+                            continue;
                         };
-                        samples.push(rerun.time_ms);
-                        if rerun.time_ms < best_result.time_ms {
-                            best_result = rerun;
+
+                        let mut samples = vec![test_results[idx].time_ms];
+                        let mut best_result = test_results[idx].clone();
+
+                        // Rejudge up to 2 times in exclusive mode
+                        for _ in 0..2 {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            let rerun = match problem_config.problem_type {
+                                ProblemType::Interactive => {
+                                    let int_exe = interactor_bin
+                                        .as_ref()
+                                        .expect("interactor binary must exist");
+                                    judge_interactive_test(
+                                        exclusive_sandbox.as_ref(),
+                                        &compiled.binary_path,
+                                        compiled.interpreter_cmd.as_deref(),
+                                        prepared_exe.as_deref(),
+                                        int_exe,
+                                        orig_test,
+                                        &limits,
+                                        Some(&resolved_checker),
+                                        pe_as_wa,
+                                        cancel,
+                                        rejudge_box,
+                                    )
+                                }
+                                ProblemType::Communication => {
+                                    let mgr_exe = manager_bin.as_ref().expect(
+                                        "manager binary must exist for communication problem",
+                                    );
+                                    judge_communication_test(
+                                        exclusive_sandbox.as_ref(),
+                                        mgr_exe,
+                                        &compiled.binary_path,
+                                        compiled.interpreter_cmd.as_deref(),
+                                        prepared_exe.as_deref(),
+                                        orig_test,
+                                        &limits,
+                                        cancel,
+                                        rejudge_box,
+                                        problem_config.processes.unwrap_or(1),
+                                        problem_config.communication_topology.as_deref(),
+                                    )
+                                }
+                                ProblemType::OutputOnly => unreachable!(),
+                                _ => judge_single_test(
+                                    exclusive_sandbox.as_ref(),
+                                    &compiled.binary_path,
+                                    compiled.interpreter_cmd.as_deref(),
+                                    prepared_exe.as_deref(),
+                                    orig_test,
+                                    &limits,
+                                    &resolved_checker,
+                                    pe_as_wa,
+                                    topology.slots.first().and_then(|s| s.cpu_core),
+                                    Some(&problem_config.io),
+                                    cancel,
+                                    rejudge_box,
+                                ),
+                            };
+                            samples.push(rerun.time_ms);
+                            if rerun.time_ms < best_result.time_ms {
+                                best_result = rerun;
+                            }
                         }
+
+                        let min_sample = samples.iter().copied().min().unwrap_or(1).max(1);
+                        let max_sample = samples.iter().copied().max().unwrap_or(1);
+                        let variance = (max_sample - min_sample) as f64 / min_sample as f64;
+
+                        let confidence = if variance > 0.10 {
+                            "low".to_string()
+                        } else {
+                            "medium".to_string()
+                        };
+
+                        best_result.timing.rejudged = true;
+                        best_result.timing.confidence = confidence;
+                        best_result.timing.samples_ms = samples;
+
+                        test_results[idx] = best_result;
                     }
-
-                    let min_sample = samples.iter().copied().min().unwrap_or(1).max(1);
-                    let max_sample = samples.iter().copied().max().unwrap_or(1);
-                    let variance = (max_sample - min_sample) as f64 / min_sample as f64;
-
-                    let confidence = if variance > 0.10 {
-                        "low".to_string()
-                    } else {
-                        "medium".to_string()
-                    };
-
-                    best_result.timing.rejudged = true;
-                    best_result.timing.confidence = confidence;
-                    best_result.timing.samples_ms = samples;
-
-                    test_results[idx] = best_result;
                 }
             }
         }
@@ -696,7 +703,16 @@ impl Scheduler {
         );
 
         if let Some(ref tx) = event_sender {
+            for st in &report.subtasks {
+                let _ = tx.send(JudgeEvent::SubtaskDone(st.clone()));
+            }
             let _ = tx.send(JudgeEvent::SubmissionDone(report.clone()));
+            let _ = tx.send(JudgeEvent::Summary {
+                total_time_ms: report.max_time_ms,
+                peak_memory_kb: report.max_memory_kb,
+                final_verdict: report.verdict,
+                final_score: report.score,
+            });
         }
 
         Ok(report)

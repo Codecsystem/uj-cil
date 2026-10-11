@@ -180,16 +180,11 @@ impl NoneSandbox {
                     if n == 0 {
                         break;
                     }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.len() > stderr_limit * 2 {
-                        let excess = buf.len() - stderr_limit;
-                        buf.drain(0..excess);
+                    if buf.len() < stderr_limit {
+                        let take = (stderr_limit - buf.len()).min(n);
+                        buf.extend_from_slice(&chunk[..take]);
                     }
                 }
-            }
-            if buf.len() > stderr_limit {
-                let excess = buf.len() - stderr_limit;
-                buf.drain(0..excess);
             }
             buf
         });

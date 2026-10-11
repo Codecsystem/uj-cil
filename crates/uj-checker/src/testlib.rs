@@ -161,12 +161,37 @@ pub fn parse_testlib_exit_code(code: i32, stderr: &str, pe_as_wa: bool) -> Check
             diff: None,
         },
         7 => {
-            // Points exit code, try to parse score from stderr if available
-            CheckResult {
-                verdict: Verdict::PartiallyCorrect,
-                score_ratio: 0.5,
-                message,
-                diff: None,
+            // First check if stderr itself contains -appes XML
+            if stderr.contains("<result")
+                && let Some(res) = parse_appes_xml(stderr, pe_as_wa)
+            {
+                return res;
+            }
+
+            if let Some((ratio, parsed_msg)) = parse_points_from_stderr(stderr) {
+                let verdict = if (ratio - 1.0).abs() < 1e-6 {
+                    Verdict::Accepted
+                } else if ratio <= 0.0 {
+                    Verdict::WrongAnswer
+                } else {
+                    Verdict::PartiallyCorrect
+                };
+                CheckResult {
+                    verdict,
+                    score_ratio: ratio,
+                    message: parsed_msg.or(message),
+                    diff: None,
+                }
+            } else {
+                CheckResult {
+                    verdict: Verdict::JudgeFailed,
+                    score_ratio: 0.0,
+                    message: Some(format!(
+                        "Checker exited with code 7 (points) but failed to parse points from output: {}",
+                        stderr.trim()
+                    )),
+                    diff: None,
+                }
             }
         }
         8 => CheckResult {
@@ -324,6 +349,63 @@ fn unescape_xml(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+fn parse_points_from_stderr(stderr: &str) -> Option<(f64, Option<String>)> {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        let lower = word.to_ascii_lowercase();
+        let stripped = lower.trim_end_matches([':', '=']);
+        if stripped == "points" || stripped == "point" {
+            let num_str = if let Some(pos) = word.find([':', '=']) {
+                let rest = &word[pos + 1..];
+                if !rest.is_empty() {
+                    Some(rest)
+                } else {
+                    words.get(i + 1).copied()
+                }
+            } else {
+                words.get(i + 1).copied()
+            };
+
+            if let Some(candidate) = num_str {
+                let cleaned = candidate.trim_end_matches(['%', ',', ';']);
+                if let Ok(val) = cleaned.parse::<f64>()
+                    && val.is_finite()
+                    && val >= 0.0
+                {
+                    let ratio = if val > 1.0 && val <= 100.0 {
+                        val / 100.0
+                    } else {
+                        val.clamp(0.0, 1.0)
+                    };
+                    return Some((ratio, Some(trimmed.to_string())));
+                }
+            }
+        }
+    }
+
+    if let Some(first_word) = words.first() {
+        let cleaned = first_word.trim_end_matches(['%', ',', ';', ':']);
+        if let Ok(val) = cleaned.parse::<f64>()
+            && val.is_finite()
+            && val >= 0.0
+        {
+            let ratio = if val > 1.0 && val <= 100.0 {
+                val / 100.0
+            } else {
+                val.clamp(0.0, 1.0)
+            };
+            return Some((ratio, Some(trimmed.to_string())));
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +502,34 @@ mod tests {
         let pc_res = parse_testlib_exit_code(66, "66 pts", true);
         assert_eq!(pc_res.verdict, Verdict::PartiallyCorrect);
         assert_eq!(pc_res.score_ratio, 0.50); // (66 - 16) / 100 = 0.50
+
+        // Exit 7 with points keyword
+        let res7_kw = parse_testlib_exit_code(7, "points 0.75 Correct subset", true);
+        assert_eq!(res7_kw.verdict, Verdict::PartiallyCorrect);
+        assert_eq!(res7_kw.score_ratio, 0.75);
+
+        // Exit 7 with points percentage
+        let res7_pct = parse_testlib_exit_code(7, "points: 40 40%", true);
+        assert_eq!(res7_pct.verdict, Verdict::PartiallyCorrect);
+        assert_eq!(res7_pct.score_ratio, 0.40);
+
+        // Exit 7 with leading float
+        let res7_float = parse_testlib_exit_code(7, "0.85 Good answer", true);
+        assert_eq!(res7_float.verdict, Verdict::PartiallyCorrect);
+        assert_eq!(res7_float.score_ratio, 0.85);
+
+        // Exit 7 with embedded XML in stderr
+        let res7_xml = parse_testlib_exit_code(
+            7,
+            "<result outcome=\"points\" points=\"0.65\">xml in stderr</result>",
+            true,
+        );
+        assert_eq!(res7_xml.verdict, Verdict::PartiallyCorrect);
+        assert_eq!(res7_xml.score_ratio, 0.65);
+
+        // Exit 7 with unparseable points -> JudgeFailed
+        let res7_fail = parse_testlib_exit_code(7, "something crashed without points", true);
+        assert_eq!(res7_fail.verdict, Verdict::JudgeFailed);
+        assert_eq!(res7_fail.score_ratio, 0.0);
     }
 }

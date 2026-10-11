@@ -94,9 +94,14 @@ impl CgroupV2 {
                 if let Some(rel) = line.strip_prefix("0::") {
                     let rel_clean = rel.trim_start_matches('/');
                     let mut candidate = cgroup_mount.join(rel_clean);
-                    // If candidate is inside runner or uj, ascend to its scope
+                    // If candidate is inside runner, uj, or proc_<pid>, ascend to its scope
                     while candidate.file_name() == Some(std::ffi::OsStr::new("runner"))
                         || candidate.file_name() == Some(std::ffi::OsStr::new("uj"))
+                        || candidate
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.starts_with("proc_"))
+                            .unwrap_or(false)
                     {
                         if let Some(parent) = candidate.parent() {
                             candidate = parent.to_path_buf();
@@ -109,7 +114,11 @@ impl CgroupV2 {
                         if fs::create_dir(&test_dir).is_ok() {
                             let _ = fs::remove_dir(&test_dir);
                             enable_subtree_controllers(&candidate);
-                            let uj_base = candidate.join("uj");
+                            let pid = std::process::id();
+                            let uj_parent = candidate.join("uj");
+                            let _ = fs::create_dir_all(&uj_parent);
+                            enable_subtree_controllers(&uj_parent);
+                            let uj_base = uj_parent.join(format!("proc_{pid}"));
                             let _ = fs::create_dir_all(&uj_base);
                             enable_subtree_controllers(&uj_base);
                             return Ok(uj_base);
@@ -119,11 +128,15 @@ impl CgroupV2 {
             }
         }
 
-        // 2. Fallback to /sys/fs/cgroup/uj (if running as root)
+        // 2. Fallback to /sys/fs/cgroup/uj/proc_<pid> (if running as root)
         if unsafe { libc::getuid() } == 0 {
-            let root_uj = cgroup_mount.join("uj");
-            let _ = fs::create_dir_all(&root_uj);
+            let pid = std::process::id();
+            let root_uj_parent = cgroup_mount.join("uj");
+            let _ = fs::create_dir_all(&root_uj_parent);
             enable_subtree_controllers(cgroup_mount);
+            enable_subtree_controllers(&root_uj_parent);
+            let root_uj = root_uj_parent.join(format!("proc_{pid}"));
+            let _ = fs::create_dir_all(&root_uj);
             enable_subtree_controllers(&root_uj);
             let test_dir = root_uj.join(&test_name);
             if fs::create_dir(&test_dir).is_ok() {

@@ -13,6 +13,34 @@ pub struct Topology {
     pub slots: Vec<Slot>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HostCapabilities {
+    pub logical_cores: usize,
+    pub p_cores: Vec<usize>,
+    pub available_worker_cores: Vec<usize>,
+    pub available_mem_bytes: u64,
+}
+
+static HOST_CAPABILITIES: std::sync::LazyLock<parking_lot::Mutex<HostCapabilities>> =
+    std::sync::LazyLock::new(|| {
+        let logical_cores = num_cpus::get();
+        let p_cores = uj_sandbox::detect_p_core_primary_cpus();
+        let available_worker_cores = if p_cores.len() > 1 {
+            p_cores[1..].to_vec()
+        } else {
+            p_cores.clone()
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let available_mem_bytes = sys.available_memory();
+        parking_lot::Mutex::new(HostCapabilities {
+            logical_cores,
+            p_cores,
+            available_worker_cores,
+            available_mem_bytes,
+        })
+    });
+
 impl Topology {
     /// Detect host CPU topology and compute optimal judging slots.
     ///
@@ -21,27 +49,17 @@ impl Topology {
     /// - slots = min(physical_cores - 1, floor(available_mem * 0.8 / memory_limit))
     /// - slots minimum is always 1.
     pub fn detect(memory_limit_bytes: u64, user_jobs: Option<usize>) -> Self {
-        let logical_cores = num_cpus::get();
-        let p_cores = uj_sandbox::detect_p_core_primary_cpus();
-        let physical_p_cores = p_cores.len().max(1);
-
-        // Reserve p_cores[0] for uj, allocate worker cores from p_cores[1..]
-        let available_worker_cores = if p_cores.len() > 1 {
-            p_cores[1..].to_vec()
-        } else {
-            p_cores.clone()
-        };
-
+        let caps = HOST_CAPABILITIES.lock().clone();
+        let logical_cores = caps.logical_cores;
+        let physical_p_cores = caps.p_cores.len().max(1);
+        let available_worker_cores = caps.available_worker_cores;
         let default_slots = available_worker_cores.len().max(1);
 
         // Determine available memory constraint
         let memory_constrained_slots = if memory_limit_bytes == 0 {
             default_slots
         } else {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            let available_mem = sys.available_memory(); // in bytes
-            let usable_mem = (available_mem as f64 * 0.8) as u64;
+            let usable_mem = (caps.available_mem_bytes as f64 * 0.8) as u64;
             let count = usable_mem.checked_div(memory_limit_bytes).unwrap_or(0);
             (count as usize).max(1)
         };

@@ -670,6 +670,86 @@ fn test_reg_cache_002_corrupted_binary_recovery() {
     );
 }
 
+/// REG-CACHE-003: Transitive and nested header modifications trigger recompilation.
+/// Solution includes a subfolder header which includes a nested header.
+/// Editing the deeply nested header must invalidate compilation cache.
+#[test]
+fn test_reg_cache_003_nested_header_recompiles() {
+    let _guard = lock_test();
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    let fixture = get_workspace_root().join("tests/problems/aplusb");
+    copy_dir_all(&fixture, root).unwrap();
+
+    let sub_dir = root.join("sub");
+    let inner_dir = sub_dir.join("inner");
+    fs::create_dir_all(&inner_dir).unwrap();
+
+    let inner_header = inner_dir.join("inner.hpp");
+    fs::write(&inner_header, "#pragma once\n#define BONUS 0\n").unwrap();
+
+    let outer_header = sub_dir.join("outer.hpp");
+    fs::write(
+        &outer_header,
+        "#pragma once\n#include \"inner/inner.hpp\"\n#define VAL BONUS\n",
+    )
+    .unwrap();
+
+    let sol = root.join("nested_sol.cpp");
+    fs::write(
+        &sol,
+        r#"
+#include <iostream>
+#include "sub/outer.hpp"
+
+int main() {
+    int a, b;
+    if (std::cin >> a >> b) {
+        std::cout << (a + b + VAL) << std::endl;
+    }
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    // 1. Initial run with BONUS 0 -> AC
+    let out1 = Command::new(uj_bin())
+        .arg("judge")
+        .arg(&sol)
+        .arg("-p")
+        .arg(root)
+        .arg("--format")
+        .arg("json")
+        .current_dir(root)
+        .output()
+        .expect("failed to execute uj judge");
+    let rep1: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out1.stdout)).unwrap();
+    assert_eq!(rep1["verdict"], "AC");
+
+    // 2. Modify deeply nested header -> BONUS 999 -> Recompile and WA
+    fs::write(&inner_header, "#pragma once\n#define BONUS 999\n").unwrap();
+
+    let out2 = Command::new(uj_bin())
+        .arg("judge")
+        .arg(&sol)
+        .arg("-p")
+        .arg(root)
+        .arg("--format")
+        .arg("json")
+        .current_dir(root)
+        .output()
+        .expect("failed to execute uj judge");
+    let rep2: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out2.stdout)).unwrap();
+    assert_eq!(
+        rep2["verdict"], "WA",
+        "Nested header modification was not detected! Stale binary was incorrectly reused."
+    );
+}
+
 /// REG-CHECK-001: UTF-8 multi-byte long tokens and NaN/Infinity checker scores.
 /// Solution outputs multibyte UTF-8 characters (e.g. Chinese characters) to trigger WA diff snippet.
 /// Slicing must not panic on byte boundary, and the judge report must be valid JSON with WA.
@@ -953,6 +1033,7 @@ title = "Ring Communication Problem"
 type = "communication"
 manager = "manager.cpp"
 processes = 2
+communication_topology = "ring"
 
 [limits]
 time = "3000ms"
@@ -1121,6 +1202,37 @@ int main() {
         bad_verdict
     );
     assert_ne!(bad_rep["score"], 100.0);
+}
+
+/// REG-COMM-002: Multi-participant communication without explicit topology must be rejected
+#[test]
+fn test_reg_comm_002_multi_process_requires_explicit_topology() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let problem_toml = r#"
+schema = 1
+name = "unsupported_comm"
+title = "Unsupported Comm Problem"
+type = "communication"
+manager = "manager.cpp"
+processes = 3
+
+[limits]
+time = "1000ms"
+memory = "256MB"
+
+[[subtasks]]
+id = 1
+score = 100.0
+tests = ["1"]
+"#;
+    let err = uj_core::config::ProblemConfig::from_toml_str(problem_toml, Some(root)).unwrap_err();
+    assert!(
+        err.message.contains("Multi-participant communication"),
+        "Error message must explain requirement for explicit topology: {}",
+        err.message
+    );
 }
 
 /// REG-MCP-001: MCP failure semantics, fail-closed pipeline/contest, and cancellation
@@ -1369,4 +1481,62 @@ name = "wcmp"
         found_history,
         "Monotonic run-*.json history file must be created"
     );
+}
+
+/// REG-NDJSON-001: NDJSON event stream must not have premature summary,
+/// must emit subtask_done, submission_done, and final summary with actual verdict/score.
+#[test]
+fn test_reg_ndjson_001_event_sequence_and_final_summary() {
+    let _guard = lock_test();
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    let fixture = get_workspace_root().join("tests/problems/aplusb");
+    copy_dir_all(&fixture, root).unwrap();
+
+    let sol = root.join("solutions/ac.cpp");
+
+    let out = Command::new(uj_bin())
+        .arg("judge")
+        .arg(&sol)
+        .arg("-p")
+        .arg(root)
+        .arg("--format")
+        .arg("ndjson")
+        .output()
+        .expect("failed to execute uj judge with ndjson");
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty(), "NDJSON output must contain lines");
+
+    let mut events = Vec::new();
+    for line in &lines {
+        let val: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|_| {
+            panic!("Invalid NDJSON line: {line}");
+        });
+        let ev = val["event"].as_str().unwrap().to_string();
+        events.push((ev, val));
+    }
+
+    // Verify first event is NOT summary
+    assert_ne!(
+        events[0].0, "summary",
+        "First NDJSON event must not be a premature summary!"
+    );
+
+    // Verify subtask_done is emitted
+    let has_subtask_done = events.iter().any(|(ev, _)| ev == "subtask_done");
+    assert!(has_subtask_done, "NDJSON stream must emit subtask_done");
+
+    // Verify submission_done is emitted
+    let has_sub_done = events.iter().any(|(ev, _)| ev == "submission_done");
+    assert!(has_sub_done, "NDJSON stream must emit submission_done");
+
+    // Verify final event is summary
+    let last = events.last().unwrap();
+    assert_eq!(last.0, "summary", "Final NDJSON event must be summary");
+    assert_eq!(last.1["data"]["final_verdict"], "AC");
+    assert_eq!(last.1["data"]["final_score"], 100.0);
 }

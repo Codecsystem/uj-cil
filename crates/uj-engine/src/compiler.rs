@@ -79,6 +79,8 @@ pub struct CompileSession {
 
 type FastCompileKey = String;
 type FastCompileValue = CompileResult;
+type PrecheckKey = (PathBuf, Vec<PathBuf>, Vec<PathBuf>);
+type PrecheckValue = (std::time::SystemTime, u64, CompileResult);
 
 #[derive(Default)]
 struct CompileSessionInner {
@@ -89,6 +91,167 @@ struct CompileSessionInner {
     >,
     problem_limits: parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, u64, u64)>>,
     fast_results: parking_lot::Mutex<std::collections::HashMap<FastCompileKey, FastCompileValue>>,
+    mtime_precheck: parking_lot::Mutex<std::collections::HashMap<PrecheckKey, PrecheckValue>>,
+}
+
+fn run_command_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), CompileError> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let start = Instant::now();
+
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+
+    let stdout_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stdout_pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if buf.len() < 1024 * 1024 {
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+        buf
+    });
+
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stderr_pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if buf.len() < 1024 * 1024 {
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+        buf
+    });
+
+    let mut timed_out = false;
+    let mut exit_status = None;
+
+    loop {
+        match child.try_wait()? {
+            Some(st) => {
+                exit_status = Some(st);
+                break;
+            }
+            None => {
+                if start.elapsed() > timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+
+    if timed_out {
+        return Err(CompileError::Failed(format!(
+            "Command timed out ({}s limit exceeded)",
+            timeout.as_secs()
+        )));
+    }
+
+    let status = exit_status.unwrap_or_else(|| child.wait().unwrap());
+    Ok((status, stdout_bytes, stderr_bytes))
+}
+
+fn scan_directory_recursive(
+    dir: &Path,
+    extensions: &[&str],
+    max_depth: usize,
+    out: &mut std::collections::BTreeSet<PathBuf>,
+) {
+    if max_depth == 0 || !dir.is_dir() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    && extensions
+                        .iter()
+                        .any(|&target| ext.eq_ignore_ascii_case(target))
+                {
+                    out.insert(path);
+                }
+            } else if path.is_dir() {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                    scan_directory_recursive(&path, extensions, max_depth - 1, out);
+                }
+            }
+        }
+    }
+}
+
+fn scan_includes_transitive(
+    initial_bytes: &[u8],
+    source_dir: Option<&Path>,
+    include_dirs: &[PathBuf],
+    out: &mut std::collections::BTreeSet<PathBuf>,
+    max_depth: usize,
+) {
+    if max_depth == 0 {
+        return;
+    }
+    let text = String::from_utf8_lossy(initial_bytes);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("#include") {
+            continue;
+        }
+        let rest = trimmed.strip_prefix("#include").unwrap().trim();
+        let target = if rest.starts_with('"') && rest.contains('"') {
+            rest.split('"').nth(1)
+        } else if rest.starts_with('<') && rest.contains('>') {
+            rest.split(['<', '>']).nth(1)
+        } else {
+            None
+        };
+
+        if let Some(inc_rel) = target {
+            let rel_path = Path::new(inc_rel);
+            let mut resolved = None;
+            if let Some(sd) = source_dir {
+                let p = sd.join(rel_path);
+                if p.is_file() {
+                    resolved = Some(p);
+                }
+            }
+            if resolved.is_none() {
+                for inc_dir in include_dirs {
+                    let p = inc_dir.join(rel_path);
+                    if p.is_file() {
+                        resolved = Some(p);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(p) = resolved
+                && out.insert(p.clone())
+                && let Ok(content) = fs::read(&p)
+            {
+                scan_includes_transitive(&content, p.parent(), include_dirs, out, max_depth - 1);
+            }
+        }
+    }
 }
 
 impl CompileSession {
@@ -167,16 +330,15 @@ impl CompileSession {
         if let Some(ver) = cache.get(bin) {
             return ver.clone();
         }
-        let version_output = Command::new(bin)
-            .arg("--version")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        let version_line = version_output
-            .lines()
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
+        let mut cmd = Command::new(bin);
+        cmd.arg("--version");
+        let version_line = match run_command_with_timeout(cmd, Duration::from_secs(5)) {
+            Ok((_, stdout, _)) => {
+                let text = String::from_utf8_lossy(&stdout);
+                text.lines().next().unwrap_or("unknown").to_string()
+            }
+            Err(_) => "unknown".to_string(),
+        };
         cache.insert(bin.to_path_buf(), version_line.clone());
         version_line
     }
@@ -230,6 +392,35 @@ impl CompileSession {
         no_cache: bool,
     ) -> Result<CompileResult, CompileError> {
         let start = Instant::now();
+
+        // Cheap mtime/size precheck before reading source or scanning dependencies
+        if !no_cache {
+            let key = (
+                source_path.to_path_buf(),
+                extra_sources.to_vec(),
+                include_dirs.to_vec(),
+            );
+            if let Ok(meta) = fs::metadata(source_path)
+                && let Ok(mtime) = meta.modified()
+            {
+                let size = meta.len();
+                let precheck = self.inner.mtime_precheck.lock();
+                if let Some((cached_mtime, cached_size, cached_res)) = precheck.get(&key)
+                    && *cached_mtime == mtime
+                    && *cached_size == size
+                    && cached_res.binary_path.exists()
+                    && fs::metadata(&cached_res.binary_path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                {
+                    let mut res = cached_res.clone();
+                    res.cached = true;
+                    res.duration_ms = start.elapsed().as_millis() as u64;
+                    return Ok(res);
+                }
+            }
+        }
+
         let source_bytes = fs::read(source_path)?;
 
         let problem_dir = source_path
@@ -254,14 +445,14 @@ impl CompileSession {
                 .or_else(|_| self.resolve_compiler_bin("python"))
                 .map_err(|_| CompileError::CompilerNotFound("python3/python".to_string()))?;
 
-            let py_compile = Command::new(&python_bin)
-                .arg("-m")
-                .arg("py_compile")
-                .arg(source_path)
-                .output()?;
+            let mut py_cmd = Command::new(&python_bin);
+            py_cmd.arg("-m").arg("py_compile").arg(source_path);
 
-            if !py_compile.status.success() {
-                let err_msg = truncate_10k(&String::from_utf8_lossy(&py_compile.stderr));
+            let (status, _stdout, stderr) =
+                run_command_with_timeout(py_cmd, Duration::from_secs(10))?;
+
+            if !status.success() {
+                let err_msg = truncate_10k(&String::from_utf8_lossy(&stderr));
                 return Err(CompileError::Failed(err_msg));
             }
 
@@ -317,36 +508,46 @@ impl CompileSession {
             }
         }
 
-        // Include headers in include dirs and problem dir
-        for inc in include_dirs {
-            hasher.update(inc.to_string_lossy().as_bytes());
-            if inc.is_dir()
-                && let Ok(entries) = fs::read_dir(inc)
-            {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "h" || e == "hpp")
-                        && let Ok(bytes) = fs::read(&path)
-                    {
-                        hasher.update(path.to_string_lossy().as_bytes());
-                        hasher.update(&bytes);
-                    }
+        // Include all dependencies (headers, nested includes, Rust mod, Go imports)
+        let mut dep_files = std::collections::BTreeSet::new();
+        let header_exts = &["h", "hpp", "hh", "hxx", "h++", "inc", "cuh", "inl", "tpp"];
+        let is_cpp_or_c = lang_id.starts_with("cpp") || lang_id.starts_with("c");
+        let is_rust = lang_id.starts_with("rust");
+        let is_go = lang_id.starts_with("go");
+
+        if is_cpp_or_c {
+            // 1. Transitive #include parsing
+            scan_includes_transitive(
+                &source_bytes,
+                source_path.parent(),
+                include_dirs,
+                &mut dep_files,
+                10,
+            );
+            // 2. Recursive scan of include dirs & source dir for headers
+            if let Some(p) = source_path.parent() {
+                scan_directory_recursive(p, header_exts, 5, &mut dep_files);
+            }
+            for inc in include_dirs {
+                scan_directory_recursive(inc, header_exts, 5, &mut dep_files);
+            }
+        } else if is_rust {
+            if let Some(p) = source_path.parent() {
+                scan_directory_recursive(p, &["rs"], 5, &mut dep_files);
+                if p.file_name().is_some_and(|n| n == "src")
+                    && let Some(grandparent) = p.parent()
+                {
+                    scan_directory_recursive(grandparent, &["rs"], 5, &mut dep_files);
                 }
             }
+        } else if is_go && let Some(p) = source_path.parent() {
+            scan_directory_recursive(p, &["go"], 5, &mut dep_files);
         }
 
-        if let Some(src_parent) = source_path.parent()
-            && src_parent.is_dir()
-            && let Ok(entries) = fs::read_dir(src_parent)
-        {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "h" || e == "hpp")
-                    && let Ok(bytes) = fs::read(&path)
-                {
-                    hasher.update(path.to_string_lossy().as_bytes());
-                    hasher.update(&bytes);
-                }
+        for dep in dep_files {
+            if let Ok(bytes) = fs::read(&dep) {
+                hasher.update(dep.to_string_lossy().as_bytes());
+                hasher.update(&bytes);
             }
         }
 
@@ -363,6 +564,19 @@ impl CompileSession {
                 let mut res = cached_res.clone();
                 res.cached = true;
                 res.duration_ms = start.elapsed().as_millis() as u64;
+
+                let key = (
+                    source_path.to_path_buf(),
+                    extra_sources.to_vec(),
+                    include_dirs.to_vec(),
+                );
+                if let Ok(meta) = fs::metadata(source_path)
+                    && let Ok(mtime) = meta.modified()
+                {
+                    let mut precheck = self.inner.mtime_precheck.lock();
+                    precheck.insert(key, (mtime, meta.len(), res.clone()));
+                }
+
                 return Ok(res);
             }
         }
@@ -418,6 +632,19 @@ impl CompileSession {
             };
             let mut fast_cache = self.inner.fast_results.lock();
             fast_cache.insert(cache_hash, res.clone());
+
+            let key = (
+                source_path.to_path_buf(),
+                extra_sources.to_vec(),
+                include_dirs.to_vec(),
+            );
+            if let Ok(meta) = fs::metadata(source_path)
+                && let Ok(mtime) = meta.modified()
+            {
+                let mut precheck = self.inner.mtime_precheck.lock();
+                precheck.insert(key, (mtime, meta.len(), res.clone()));
+            }
+
             return Ok(res);
         }
 
@@ -460,79 +687,11 @@ impl CompileSession {
             }
         }
 
-        // 6. Spawn compiler process with concurrent reader threads to prevent pipe buffer deadlock
+        // 6. Spawn compiler process with timeout and concurrent reader protection
         let mut cmd = Command::new(&compiler_bin);
         cmd.args(&final_args);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let mut child = cmd.spawn()?;
-        let timeout = Duration::from_secs(30);
-
-        let mut stdout_pipe = child.stdout.take().unwrap();
-        let mut stderr_pipe = child.stderr.take().unwrap();
-
-        let stdout_thread = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = stdout_pipe.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                if buf.len() < 1024 * 1024 {
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-            }
-            buf
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = stderr_pipe.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                if buf.len() < 1024 * 1024 {
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-            }
-            buf
-        });
-
-        let mut timed_out = false;
-        let mut exit_status = None;
-
-        loop {
-            match child.try_wait()? {
-                Some(st) => {
-                    exit_status = Some(st);
-                    break;
-                }
-                None => {
-                    if start.elapsed() > timeout {
-                        timed_out = true;
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-
-        let stdout_bytes = stdout_thread.join().unwrap_or_default();
-        let stderr_bytes = stderr_thread.join().unwrap_or_default();
-
-        if timed_out {
-            return Err(CompileError::Failed(
-                "Compilation timed out (30s limit exceeded)".to_string(),
-            ));
-        }
-
-        let status = exit_status.unwrap_or_else(|| child.wait().unwrap());
+        let (status, stdout_bytes, stderr_bytes) =
+            run_command_with_timeout(cmd, Duration::from_secs(30))?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let combined_output = format!(
@@ -584,6 +743,18 @@ impl CompileSession {
         if !no_cache {
             let mut fast_cache = self.inner.fast_results.lock();
             fast_cache.insert(cache_hash, res.clone());
+
+            let key = (
+                source_path.to_path_buf(),
+                extra_sources.to_vec(),
+                include_dirs.to_vec(),
+            );
+            if let Ok(meta) = fs::metadata(source_path)
+                && let Ok(mtime) = meta.modified()
+            {
+                let mut precheck = self.inner.mtime_precheck.lock();
+                precheck.insert(key, (mtime, meta.len(), res.clone()));
+            }
         }
 
         Ok(res)
