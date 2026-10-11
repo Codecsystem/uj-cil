@@ -1825,7 +1825,8 @@ pub fn run_tl_with_session(
     let mut t_main = 0u64;
     let mut t_slowest_ac = 0u64;
 
-    for sol in target_solutions {
+    let total_sols = target_solutions.len();
+    for (sol_idx, sol) in target_solutions.into_iter().enumerate() {
         if cancel.is_cancelled() {
             return ExitCode::from(EXIT_INTERRUPTED);
         }
@@ -1839,11 +1840,70 @@ pub fn run_tl_with_session(
         };
 
         let sol_name = sol.path.file_name().unwrap_or_default().to_string_lossy();
+        let sol_disp = sol.path.display().to_string();
+        let sol_num = sol_idx + 1;
+
         // Run 3 times in exclusive mode (jobs = 1)
-        for _ in 0..3 {
+        for run_idx in 0..3 {
             if cancel.is_cancelled() {
                 return ExitCode::from(EXIT_INTERRUPTED);
             }
+
+            let round_num = run_idx + 1;
+            let sub_name = format!("{sol_disp} [calibrating {round_num}/3]");
+
+            let (event_sender, event_thread) = if cli.tui {
+                let (tx, rx) = crossbeam_channel::unbounded::<uj_report::result::JudgeEvent>();
+                let prob_name = cfg.name.clone();
+                let cancel_clone = cancel.clone();
+                let test_names: Vec<String> = tests.iter().map(|t| t.name.clone()).collect();
+                let cur_sub = sub_name.clone();
+                let handle = std::thread::spawn(move || {
+                    let _ = uj_tui::run_tui(
+                        &prob_name,
+                        &cur_sub,
+                        &test_names,
+                        1, // 1 exclusive core for calibration
+                        rx,
+                        cancel_clone,
+                        true,
+                    );
+                });
+                (Some(tx), Some(handle))
+            } else if format == OutputFormat::Human && !cli.quiet {
+                let (tx, rx) = crossbeam_channel::unbounded::<uj_report::result::JudgeEvent>();
+                let total_cnt = tests.len() as u64;
+                let cur_sub = sub_name.clone();
+                let handle = std::thread::spawn(move || {
+                    let pb = ProgressBar::new(total_cnt);
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template(&format!(
+                                "{{spinner:.green}} [{sol_num}/{total_sols}] {cur_sub} ({{msg}}) [{{bar:25.cyan/blue}}] {{pos}}/{{len}}"
+                            ))
+                            .unwrap_or_else(|_| ProgressStyle::default_bar())
+                            .progress_chars("=>-"),
+                    );
+                    pb.set_message("calibrating...");
+                    for ev in rx {
+                        match ev {
+                            uj_report::result::JudgeEvent::TestDone(ref res) => {
+                                pb.inc(1);
+                                pb.set_message(format!("{}: {} ({}ms)", res.id, res.verdict.short_code(), res.time_ms));
+                            }
+                            uj_report::result::JudgeEvent::SubmissionDone(_) => {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    pb.finish_and_clear();
+                });
+                (Some(tx), Some(handle))
+            } else {
+                (None, None)
+            };
+
             match scheduler.judge_submission(
                 problem_dir,
                 &cfg,
@@ -1851,10 +1911,13 @@ pub fn run_tl_with_session(
                 &sol_name,
                 tests.clone(),
                 Some(1),
-                None,
+                event_sender,
                 cancel,
             ) {
                 Ok(report) => {
+                    if let Some(h) = event_thread {
+                        let _ = h.join();
+                    }
                     if !report.verdict.is_accepted() {
                         if format == OutputFormat::Json {
                             let err = serde_json::json!({
@@ -1880,6 +1943,9 @@ pub fn run_tl_with_session(
                     t_slowest_ac = t_slowest_ac.max(max_ms);
                 }
                 Err(e) => {
+                    if let Some(h) = event_thread {
+                        let _ = h.join();
+                    }
                     if format == OutputFormat::Json {
                         let err = serde_json::json!({
                             "ok": false,
