@@ -11,6 +11,7 @@ use uj_sandbox::CancelToken;
 #[derive(Default)]
 struct BudgetState {
     used: u64,
+    peak: u64,
     next_ticket: u64,
     serving: u64,
     cancelled_tickets: HashSet<u64>,
@@ -49,6 +50,10 @@ impl MemoryBudget {
         self.state.lock().used
     }
 
+    pub fn peak(&self) -> u64 {
+        self.state.lock().peak
+    }
+
     /// Block until memory budget is acquired.
     /// If `want` exceeds total budget, it is capped to total (running exclusively).
     /// Checks cancellation every 100ms; returns None if cancelled.
@@ -81,6 +86,7 @@ impl MemoryBudget {
             // It is our turn if serving == my_ticket and we can fit into total budget.
             if st.serving == my_ticket && st.used + effective_want <= self.total {
                 st.used += effective_want;
+                st.peak = st.peak.max(st.used);
                 st.advance_serving();
                 self.cv.notify_all();
                 return Some(BudgetLease {
@@ -250,5 +256,43 @@ mod tests {
         drop(l1);
         let l2 = budget.acquire(50, &cancel);
         assert!(l2.is_some());
+    }
+
+    #[test]
+    fn test_budget_peak_never_exceeds_total() {
+        let total = 1000u64;
+        let budget = Arc::new(MemoryBudget::new(total));
+        let cancel = CancelToken::new();
+
+        let mut handles = Vec::new();
+        for seed in 0..16u64 {
+            let b = Arc::clone(&budget);
+            let c = cancel.clone();
+            handles.push(thread::spawn(move || {
+                let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                for _ in 0..50 {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let want = 1 + (rng % total);
+                    let lease = b.acquire(want, &c).unwrap();
+                    let sleep_us = (rng >> 16) % 2000;
+                    if sleep_us > 0 {
+                        thread::sleep(Duration::from_micros(sleep_us));
+                    }
+                    drop(lease);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            budget.peak() <= budget.total(),
+            "Peak {} exceeded total {}",
+            budget.peak(),
+            budget.total()
+        );
+        assert_eq!(budget.used(), 0);
     }
 }

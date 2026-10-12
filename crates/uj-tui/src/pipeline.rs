@@ -21,7 +21,7 @@ use ratatui::{
 };
 use uj_sandbox::CancelToken;
 
-use crate::TerminalGuard;
+use crate::{SystemMonitor, TerminalGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -93,6 +93,7 @@ pub struct PipelineApp {
     pub val_done: usize,
     pub ans_done: usize,
     pub ans_cached: usize,
+    pub sys_monitor: SystemMonitor,
 }
 
 impl PipelineApp {
@@ -136,6 +137,7 @@ impl PipelineApp {
             val_done: 0,
             ans_done: 0,
             ans_cached: 0,
+            sys_monitor: SystemMonitor::new(),
         }
     }
 
@@ -254,6 +256,9 @@ pub fn run_pipeline_tui(
     let mut exit_time: Option<Instant> = None;
 
     loop {
+        // Refresh system monitor periodically
+        app.sys_monitor.tick();
+
         // Drain events
         let mut disconnected = false;
         loop {
@@ -286,6 +291,9 @@ pub fn run_pipeline_tui(
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
+            if key.kind == crossterm::event::KeyEventKind::Release {
+                continue;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 app.cancel.cancel();
                 break;
@@ -544,6 +552,11 @@ fn draw_pipeline_ui(f: &mut Frame, app: &mut PipelineApp) {
         ]);
         f.render_widget(Paragraph::new(footer_text), chunks[3]);
     } else {
+        let help_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(30), Constraint::Length(38)])
+            .split(chunks[3]);
+
         let help_text = Line::from(vec![
             Span::styled(" ↑↓/jk", Style::default().fg(Color::Yellow)),
             Span::styled(" 滚动  ", Style::default().fg(Color::DarkGray)),
@@ -552,7 +565,16 @@ fn draw_pipeline_ui(f: &mut Frame, app: &mut PipelineApp) {
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::styled(" 取消", Style::default().fg(Color::DarkGray)),
         ]);
-        f.render_widget(Paragraph::new(help_text), chunks[3]);
+        f.render_widget(Paragraph::new(help_text), help_chunks[0]);
+
+        let stats_line = Line::from(vec![Span::styled(
+            app.sys_monitor.format_stats(),
+            Style::default().fg(Color::Cyan),
+        )]);
+        let stats_p = Paragraph::new(stats_line)
+            .alignment(ratatui::layout::Alignment::Right)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(stats_p, help_chunks[1]);
     }
 }
 

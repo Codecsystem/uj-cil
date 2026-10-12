@@ -511,3 +511,78 @@ fn contest_ndjson_stream() {
         "Must have streamed pool events before contest_finished"
     );
 }
+
+#[test]
+fn test_contest_fail_fast_skips() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let uj = uj_bin();
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    // 1. Copy tests/contests/tail to tempdir
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tail_dir = manifest_dir.join("../../tests/contests/tail");
+    let contest_dir = root.join("tail");
+    copy_dir_all(&tail_dir, &contest_dir).unwrap();
+
+    // 2. Append subtask min scoring to problems/slowsum/problem.toml in the copy
+    let p_toml = contest_dir.join("problems/slowsum/problem.toml");
+    let subtask_cfg = "\n[[subtasks]]\nid = 1\nscore = 100.0\nscoring = \"min\"\ntests = [\"*\"]\n";
+    let mut cur = fs::read_to_string(&p_toml).unwrap();
+    cur.push_str(subtask_cfg);
+    fs::write(&p_toml, cur).unwrap();
+
+    // 3. Execute uj --fail-fast --jobs 1 --format json contest <dir>
+    let out = Command::new(&uj)
+        .arg("--fail-fast")
+        .arg("--jobs")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("contest")
+        .arg(&contest_dir)
+        .output()
+        .expect("failed to execute uj contest");
+
+    assert!(
+        out.status.success(),
+        "Contest failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let val: serde_json::Value = serde_json::from_str(&stdout_str)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}, stdout: {stdout_str}"));
+
+    let reports = val["reports"].as_array().expect("expected reports array");
+    let tle1_report = reports
+        .iter()
+        .find(|r| {
+            r["submission"]
+                .as_str()
+                .map(|s| s.contains("tle1") && s.contains("slowsum"))
+                .unwrap_or(false)
+        })
+        .expect("could not find tle1 - slowsum report");
+
+    let tests = tle1_report["tests"]
+        .as_array()
+        .expect("expected tests array");
+    assert_eq!(tests.len(), 20);
+
+    let skipped_count = tests
+        .iter()
+        .filter(|t| t["verdict"].as_str() == Some("SKIPPED"))
+        .count();
+    let tle_count = tests
+        .iter()
+        .filter(|t| t["verdict"].as_str() == Some("TLE"))
+        .count();
+
+    assert_eq!(
+        skipped_count, 19,
+        "Expected 19 skipped tests, got {skipped_count}"
+    );
+    assert_eq!(tle_count, 1, "Expected 1 TLE test, got {tle_count}");
+}

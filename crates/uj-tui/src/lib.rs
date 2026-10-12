@@ -30,6 +30,9 @@ pub use multi::{SubmissionMeta, run_multi_tui};
 pub mod pipeline;
 pub use pipeline::{CaseStageEvent, Stage, run_pipeline_tui};
 
+pub mod monitor;
+pub use monitor::SystemMonitor;
+
 /// Test case execution status in the live UI.
 #[derive(Debug, Clone)]
 pub enum TestCaseStatus {
@@ -60,6 +63,7 @@ pub struct TuiApp {
     pub selected_idx: usize,
     pub scroll_offset: std::cell::Cell<usize>,
     pub cancel_token: CancelToken,
+    pub sys_monitor: SystemMonitor,
 }
 
 impl TuiApp {
@@ -99,6 +103,7 @@ impl TuiApp {
             selected_idx: 0,
             scroll_offset: std::cell::Cell::new(0),
             cancel_token,
+            sys_monitor: SystemMonitor::new(),
         }
     }
 
@@ -284,6 +289,9 @@ pub fn run_tui(
         } else if !app.slots.iter().all(|s| s.active_test.is_none()) {
             all_done_time = None;
         }
+
+        // Tick system monitor
+        app.sys_monitor.tick();
 
         // Draw UI
         terminal.draw(|f| draw_ui(f, &app))?;
@@ -771,7 +779,20 @@ fn draw_right_panel(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(logs_widget, right_split[2]);
 }
 
-fn draw_footer(f: &mut Frame, _app: &TuiApp, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let footer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = footer_block.inner(area);
+    f.render_widget(footer_block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(40), Constraint::Length(38)])
+        .split(inner);
+
     let help_line = Line::from(vec![
         Span::styled(
             " [q/Esc] ",
@@ -796,13 +817,16 @@ fn draw_footer(f: &mut Frame, _app: &TuiApp, area: Rect) {
         Span::raw("Dismiss when done"),
     ]);
 
-    let footer = Paragraph::new(help_line).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
+    f.render_widget(Paragraph::new(help_line), chunks[0]);
+
+    let stats_line = Line::from(vec![Span::styled(
+        app.sys_monitor.format_stats(),
+        Style::default().fg(Color::Cyan),
+    )]);
+    f.render_widget(
+        Paragraph::new(stats_line).alignment(ratatui::layout::Alignment::Right),
+        chunks[1],
     );
-    f.render_widget(footer, area);
 }
 
 #[cfg(test)]

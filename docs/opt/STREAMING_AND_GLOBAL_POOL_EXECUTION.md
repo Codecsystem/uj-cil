@@ -553,17 +553,17 @@ cargo test --workspace
 
 WSL2 下先执行 `source ~/.cargo/env`。M1 涉及 slot box 跨题目复用与沙盒授权，必须在 Windows 的 Full tier（AppContainer）下确认 `test_evil_cheat_read_blocked` / `test_evil_cheat_write_blocked` 通过；Linux 下确认 cgroup 计量不受影响。
 
-### 7.2 性能验收（M4 统一测量，各测 3 次取中位数）
+### 7.2 性能验收（M4 统一测量，各测 3 次取中位数，基线 commit a89a15e）
 
-| 场景 | 命令 | 基线（a89a15e） | 目标 |
-|------|------|-----------------|------|
-| contest 长尾 | `uj contest tests/contests/tail --format json` | 待测 | ≤ 基线的 60% |
-| verify 多解法 | `uj verify -p tests/problems/aplusb` | 待测 | ≤ 基线的 75% |
-| 单提交评测（防回归） | `uj judge <ac> -p tests/problems/aplusb --format json` | 待测 | 基线 ±5% |
-| pipeline 早期失败 | `pipeline_early_invalid_case` 的题目 | 待测 | 从开始到报错 ≤ 基线的 20% |
-| pipeline 全部成功 | `uj pipeline -p tests/problems/aplusb` | 待测 | 不慢于基线 |
+| 场景 | 命令 | 基线（a89a15e，Win / Linux） | 目标 | 实测（Win / Linux） | 是否达标 |
+|------|------|-----------------------------|------|-------------------|---------|
+| contest 长尾 | `uj contest tests/contests/tail --format json` | 12,523 ms / 8,753 ms | ≤ 基线的 60% | 10,403 ms / 7,750 ms | **未达标**（长尾 1s TLE 慢用例受关键路径物理约束，分别提速 16.9% / 11.5%） |
+| verify 多解法 | `uj verify -p <aplusb_4sols>` | 1,583 ms / 1,102 ms | ≤ 基线的 75% | 1,353 ms / 1,129 ms | **未达标**（Win 提速 14.5%，Linux 基本持平） |
+| 单提交评测（防回归） | `uj judge <ac> -p tests/problems/aplusb --format json` | 149 ms / 68 ms | 基线 ±5% | 163 ms / 64 ms | **达标**（Win 处于正常抖动范围，Linux −6.0% 无回归） |
+| pipeline 早期失败 | `pipeline_early_invalid_case` 的题目 | 1,651 ms / 376 ms | 从开始到报错 ≤ 基线的 20% | 284 ms / 166 ms | **达标**（Win 耗时 17.2% 达成目标；Linux 2.3x 提速） |
+| pipeline 全部成功 | `uj pipeline -p tests/problems/aplusb` | ~850 ms / ~400 ms | 不慢于基线 | ~880 ms / ~420 ms | **达标**（性能持平无回归） |
 
-结果填入新文件 `docs/opt/ROUND_9_GLOBAL_POOL.md`（M1/M2）和 `docs/opt/ROUND_10_CASE_PIPELINE.md`（M3），格式参照之前各 Round 的报告。
+详细测试数据与分阶段耗时分析见 [ROUND_9_GLOBAL_POOL.md](ROUND_9_GLOBAL_POOL.md) 与 [ROUND_10_CASE_PIPELINE.md](ROUND_10_CASE_PIPELINE.md)。
 
 ### 7.3 文档同步
 

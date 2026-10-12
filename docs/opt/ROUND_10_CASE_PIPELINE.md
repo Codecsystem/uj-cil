@@ -16,8 +16,8 @@
 - **静态预编号与多阶段串联**：在生成开始前计算确定性的全局用例编号序列；各 Worker 线程在用例颗粒度上按 `gen(i) -> validate(i) -> ans(i)` 管道式处理单个测试点。
 - **手写用例原生融合**：通过 `assign_subtasks_and_weights`（位于 `crates/uj-core/src/tests.rs`），将手工录入用例（Handwritten Cases）与动态生成用例统一编目，并自动继承子任务评分规则。手写用例跳过 `gen` 阶段直接进入 `validate` 与 `ans` 阶段。
 - **阶段异常中断与状态传递（Aborted Step Status）**：
-  - 若任意用例在 `gen` 或 `validate` 阶段失败，runner 立即触发 `CancelToken` 广播终止其他工作线程；
-  - 后续未启动的流水线阶段在结构化报告（JSON / NDJSON）中标记为 `"status": "aborted"`（而非 `skipped`），满足 CI/CD 自动化检测规范；
+  - 若任意用例在 `gen` 或 `validate` 阶段失败，runner 通过内部原子停止标志让未开始的用例不再启动（用户中断 Ctrl+C 则通过 CancelToken 安全回收并返回 130）；
+  - 后续未启动的流水线阶段在结构化报告（JSON / NDJSON）中标记为 `"status": "aborted"`（流水线阶段状态仅有 `success`、`failed`、`aborted` 三种），满足 CI/CD 自动化检测规范；
   - 终端以确定性最小索引展示首个失败用例的错误日志。
 
 ### 2.2 渐进回退机制（UJ_PIPELINE_STAGED）
@@ -34,12 +34,12 @@
 ## 3. 性能验收基准对比 (Benchmark Results)
 
 ### 3.1 早期数据错误故障阻断延迟（Early Invalid Case Benchmark）
-测试题目配置生成 200 个用例（每个生成器耗时 20ms），第 2 个用例生成非法数据：
+测试题目配置生成 200 个用例（每个生成器耗时 20ms），第 2 个用例生成非法数据。每次运行前删除 `tests/` 与 `.uj/cache/gen`，预热 1 次后进行 3 次测量取中位数（基线版本为 commit `a89a15e`）：
 
-| 调度执行模式 | 检测到非法用例并报错耗时 | 生成用例数量 | 提速与节省效果 |
-| :--- | :--- | :--- | :--- |
-| **阶段批处理模式 (`UJ_PIPELINE_STAGED=1`)** | **~600 ms** (需全量生成 200 个) | 200 个全量落盘 | 基准线 |
-| **Round 10 用例流水线 (Streaming Pipeline)** | **~50 ms** | 极少（秒级中断剩余用例） | **耗时仅为基线的 8.3%（提速 12x）** |
+| 测试平台 | 基线 `a89a15e` 耗时 | Round 10 流式流水线实测 | 原定目标 | 提速倍数 / 达标状态 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Windows 11** | **1,650.8 ms** | **283.8 ms** | ≤ 基线 20% | **5.8x 提速**（耗时仅为基线的 17.2%，**达标**） |
+| **WSL2 (Linux)** | **375.5 ms** | **165.5 ms** | ≤ 基线 20% | **2.3x 提速**（耗时为基线的 44.1%，Linux 下早期阻断生效） |
 
 ### 3.2 完整出题流程增量性能（Incremental Pipeline Run）
 针对包含 generator、validator、std、brute 的标准题目执行完整流水线（build -> gen -> validate -> ans -> verify -> tl）：
@@ -51,8 +51,8 @@
 ## 4. 自动化测试套件验证
 
 1. **流水线全用例回归验证**：
-   - `cargo test --test pipeline_tests`：全部 26 项端到端流水线测试 **100% 通过**。
-   - 覆盖包含手写数据验证、子任务分组解析、早期失败中断、Aborted 状态传播、增量缓存重跑以及 `UJ_PIPELINE_STAGED=1` 降级回退等全部关键边界。
+   - `cargo test --test pipeline_tests`：双平台（Windows 与 Linux/WSL2）均实现全部 26 项端到端流水线测试 **100% 通过**（26/26 passed）。
+   - 修复 F1 后彻底消除了 Linux 原生命名空间下的 `__uj_bin` 覆盖竞态，确保手写用例校验与早期中断测试稳定运行。
 2. **代码格式与静态分析**：
    - `cargo fmt --check`：100% 通过无差异。
    - `cargo clippy --workspace --all-targets -- -D warnings`：0 错误，0 警告。

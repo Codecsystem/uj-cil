@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use uj_core::config::ProblemConfig;
 use uj_core::tests::TestCase;
 use uj_core::verdict::Verdict;
@@ -311,6 +312,10 @@ pub fn run_contest(
         Failed(usize, String, String, String),
     }
 
+    let trace_phases = std::env::var("UJ_TRACE_PHASES")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let phase_a_start = Instant::now();
     let compile_threads = (Topology::detect(0, None).logical_cores / 2).clamp(1, 8);
     let (cand_tx, cand_rx) = unbounded::<SubCandidate>();
     let (prep_tx, prep_rx) = unbounded::<PreparedCandidate>();
@@ -322,6 +327,7 @@ pub fn run_contest(
         let session = compile_session.clone();
         let no_cache = cli.no_cache;
         let precise = cli.precise;
+        let fail_fast = cli.fail_fast;
         let problem_contexts = problem_contexts.clone();
         let problems_meta: Vec<(String, Vec<TestCase>)> = problems
             .iter()
@@ -379,7 +385,7 @@ pub fn run_contest(
                             p_ctx,
                             &compiled,
                             tests,
-                            false,
+                            fail_fast,
                         ) {
                             Ok(sub_ctx) => {
                                 let _ = tx.send(PreparedCandidate::Ready(
@@ -422,6 +428,12 @@ pub fn run_contest(
     for h in compile_workers {
         let _ = h.join();
     }
+    if trace_phases {
+        eprintln!(
+            "[TRACE] Phase A (Compile): {} ms",
+            phase_a_start.elapsed().as_millis()
+        );
+    }
 
     if cancel.is_cancelled() {
         return ExitCode::from(EXIT_INTERRUPTED);
@@ -445,11 +457,12 @@ pub fn run_contest(
         .sum();
 
     let (pool_event_tx, pool_event_rx) = unbounded::<PoolEvent>();
-    let pool_events_opt = if cli.tui || format == OutputFormat::Ndjson {
-        Some(pool_event_tx.clone())
-    } else {
-        None
-    };
+    let pool_events_opt =
+        if cli.tui || format == OutputFormat::Ndjson || format == OutputFormat::Human {
+            Some(pool_event_tx.clone())
+        } else {
+            None
+        };
 
     let pb = if format == OutputFormat::Human && !cli.tui {
         let p = indicatif::ProgressBar::new(total_test_points as u64);
@@ -465,13 +478,13 @@ pub fn run_contest(
         None
     };
 
-    let (event_hub_tx, event_hub_rx) = unbounded::<(String, String, JudgeEvent)>();
     let listener_handle = if format == OutputFormat::Human && !cli.tui {
         let pb = pb.clone();
         let completed_counter = Arc::clone(&completed_submissions_count);
+        let rx = pool_event_rx.clone();
         Some(std::thread::spawn(move || {
-            while let Ok((player, prob_name, event)) = event_hub_rx.recv() {
-                match event {
+            while let Ok(pe) = rx.recv() {
+                match pe.inner {
                     JudgeEvent::TestDone(_) => {
                         if let Some(ref p) = pb {
                             p.inc(1);
@@ -480,8 +493,8 @@ pub fn run_contest(
                     JudgeEvent::SubmissionDone(ref report) => {
                         let done = completed_counter.fetch_add(1, Ordering::SeqCst) + 1;
                         let msg = format!(
-                            "[{done}/{total_submissions_count}] {player} / {prob_name} -> {} {:.1}",
-                            report.verdict, report.score
+                            "[{done}/{total_submissions_count}] {} -> {} {:.1}",
+                            pe.submission.name, report.verdict, report.score
                         );
                         if let Some(ref p) = pb {
                             p.println(msg);
@@ -528,7 +541,9 @@ pub fn run_contest(
                         println!("{msg}");
                     }
                 }
-                if let Some(ref ptx) = pool_events_opt {
+                if (cli.tui || format == OutputFormat::Ndjson)
+                    && let Some(ref ptx) = pool_events_opt
+                {
                     let _ = ptx.send(PoolEvent {
                         submission: SubmissionRef {
                             id: sub_id,
@@ -563,7 +578,9 @@ pub fn run_contest(
                     subtasks: vec![],
                     tests: vec![],
                 };
-                if let Some(ref ptx) = pool_events_opt {
+                if (cli.tui || format == OutputFormat::Ndjson)
+                    && let Some(ref ptx) = pool_events_opt
+                {
                     let _ = ptx.send(PoolEvent {
                         submission: SubmissionRef {
                             id: sub_id,
@@ -576,16 +593,7 @@ pub fn run_contest(
                 final_reports.insert(sub_id, fail_report);
             }
             PreparedCandidate::Ready(sub_id, player, prob_name, mut pool_sub) => {
-                let hub_tx = event_hub_tx.clone();
-                let (ev_tx, ev_rx) = unbounded::<JudgeEvent>();
-                pool_sub.events = Some(ev_tx);
-                let p_name = player.clone();
-                let pr_name = prob_name.clone();
-                std::thread::spawn(move || {
-                    while let Ok(ev) = ev_rx.recv() {
-                        let _ = hub_tx.send((p_name.clone(), pr_name.clone(), ev));
-                    }
-                });
+                pool_sub.events = None;
                 pool_submissions.push(pool_sub);
                 pool_sub_meta.push((sub_id, player, prob_name));
             }
@@ -645,10 +653,10 @@ pub fn run_contest(
         pool_events: pool_events_opt,
     });
 
+    let phase_bc_start = Instant::now();
     let reports = pool.run(pool_submissions, cancel);
     drop(pool);
     drop(pool_event_tx);
-    drop(event_hub_tx);
 
     if let Some(h) = listener_handle {
         let _ = h.join();
@@ -658,6 +666,12 @@ pub fn run_contest(
     }
     if let Some(h) = ndjson_handle {
         let _ = h.join();
+    }
+    if trace_phases {
+        eprintln!(
+            "[TRACE] Phase B/C (Judge/Precise): {} ms",
+            phase_bc_start.elapsed().as_millis()
+        );
     }
 
     if let Some(p) = pb {

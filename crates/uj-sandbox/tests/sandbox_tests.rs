@@ -427,3 +427,57 @@ fn test_windows_sandbox_memory_limit() {
         res.memory_peak_bytes / (1024 * 1024)
     );
 }
+
+/// 多个线程以同一个 work_dir 并发运行非可信程序，不得出现 Exited(127)，
+/// 且 work_dir 中不得残留沙盒内部的挂载点文件。
+#[cfg(target_os = "linux")]
+#[test]
+fn test_concurrent_untrusted_runs_share_work_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    // 可执行文件必须位于 /usr、/bin 之外，才会走 bind 挂载路径
+    let prog = dir.path().join("prog");
+    std::fs::copy("/usr/bin/true", &prog).unwrap();
+
+    let probe = uj_sandbox::create_sandbox("auto", false).unwrap();
+    if probe.tier() == uj_core::run::Tier::None {
+        eprintln!("skip: sandbox tier None, rootfs path not exercised");
+        return;
+    }
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let prog = prog.clone();
+            let work_dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let sb = uj_sandbox::create_sandbox("auto", false).unwrap();
+                let cancel = uj_sandbox::CancelToken::new();
+                for _ in 0..20 {
+                    let spec = RunSpec {
+                        argv: vec![prog.clone().into_os_string()],
+                        env: vec![],
+                        work_dir: work_dir.clone(),
+                        ro_binds: vec![],
+                        stdin: Stdio::Null,
+                        stdout: Stdio::Null,
+                        stderr: Stdio::Null,
+                        extra_fds: vec![],
+                        limits: Limits::new(1000, 256 * 1024 * 1024),
+                        cpu_affinity: None,
+                        seccomp_profile: Default::default(),
+                        trusted: false,
+                    };
+                    let res = sb.run(&spec, &cancel).unwrap();
+                    assert!(
+                        res.status.is_success(),
+                        "untrusted run failed: {:?}",
+                        res.status
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert!(!dir.path().join("__uj_bin").exists());
+}

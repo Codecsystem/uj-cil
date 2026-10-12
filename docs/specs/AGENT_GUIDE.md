@@ -584,9 +584,9 @@ Agent 只需直接读取 `stress/fail-142.in` 文件，即可立即进入断点�
 在 `uj pipeline` 中，出题准备已由传统阶段化批处理升级为用例级串联模式（`gen(i) -> validate(i) -> ans(i)`）：
 
 1. **早期中断与 `aborted` 状态**：
-   - 当某个用例在生成（gen）或校验（validate）阶段发生异常时，流水线会立即通过 `CancelToken` 广播熔断；
-   - 熔断发生时，已启动并失败的阶段标记为 `"status": "failed"`；
-   - **由于前序步骤失败而被迫未启动的阶段，在 JSON / NDJSON 中明确标记为 `"status": "aborted"`**（区别于因无需执行而跳过的 `"skipped"`）；
-   - CI/CD 与 Agent 可根据 `"aborted"` 准确识别出被阻断的下游阶段。
+   - 当某个用例在生成（gen）或校验（validate）阶段发生异常时，流水线通过内部停止标志让未开始的用例不再启动；用户中断（Ctrl+C）返回 130；
+   - 异常发生时，已启动并失败的阶段标记为 `"status": "failed"`；正常执行完毕的阶段标记为 `"status": "success"`；
+   - **由于前序步骤失败而被迫未启动的阶段，在 JSON / NDJSON 中明确标记为 `"status": "aborted"`**；
+   - CI/CD 与 Agent 可根据 `"aborted"` 准确识别出被阻断的下游阶段（流水线阶段状态仅有 `success`、`failed`、`aborted` 三种）。
 2. **渐进回退与调试降级（`UJ_PIPELINE_STAGED`）**：
    - 若遇到特殊测试场景或旧版脚本兼容需求，可通过设置环境变量 `UJ_PIPELINE_STAGED=1` 强制回退到分阶段批处理模式（阶段 1 全量 gen ➡️ 阶段 2 全量 validate ➡️ 阶段 3 全量 ans）。

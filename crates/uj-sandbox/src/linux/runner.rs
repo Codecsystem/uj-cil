@@ -268,7 +268,7 @@ pub fn execute_in_sandbox_with_stdio(
         c_env_ptrs,
         c_exe,
     ) = if let Some(ref rootfs) = jail_rootfs_path {
-        let _ = fs::create_dir_all(&rootfs);
+        let _ = fs::create_dir_all(rootfs);
         for d in ["usr", "dev", "proc", "tmp", "box", "etc", "old_root"] {
             let _ = fs::create_dir_all(rootfs.join(d));
         }
@@ -313,15 +313,12 @@ pub fn execute_in_sandbox_with_stdio(
             if host_exe.starts_with("/usr") || host_exe.starts_with("/bin") {
                 (host_exe.to_string_lossy().to_string(), None)
             } else {
-                let target_exe = rootfs.join("box").join("__uj_bin");
+                let target_exe = rootfs.join("__uj_bin");
                 let c_target_exe = std::ffi::CString::new(target_exe.to_string_lossy().as_bytes())
                     .map_err(|e| SandboxError::Internal(format!("Invalid target exe: {e}")))?;
                 let c_host_exe = std::ffi::CString::new(host_exe.to_string_lossy().as_bytes())
                     .map_err(|e| SandboxError::Internal(format!("Invalid host exe: {e}")))?;
-                (
-                    "/box/__uj_bin".to_string(),
-                    Some((c_host_exe, c_target_exe)),
-                )
+                ("/__uj_bin".to_string(), Some((c_host_exe, c_target_exe)))
             };
 
         let mut ro_bind_pairs = Vec::new();
@@ -1204,10 +1201,6 @@ pub fn execute_in_sandbox_with_stdio(
     }
     if let Some(ref rootfs) = jail_rootfs_path {
         let _ = fs::remove_dir_all(rootfs);
-    }
-    let stray_bin = work_dir.join("__uj_bin");
-    if stray_bin.exists() {
-        let _ = fs::remove_file(stray_bin);
     }
 
     let exit_status = if let Some(ref pkt) = status_from_packet {

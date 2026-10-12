@@ -24,7 +24,29 @@ use uj_core::verdict::Verdict;
 use uj_report::result::{JudgeEvent, PoolEvent};
 use uj_sandbox::CancelToken;
 
-use crate::{TerminalGuard, TestCaseStatus, draw_tests_table};
+use crate::{SystemMonitor, TerminalGuard, TestCaseStatus, draw_tests_table};
+
+pub fn format_time_ms(ms: u64) -> String {
+    if ms == 0 {
+        "-".to_string()
+    } else if ms >= 1000 {
+        format!("{:.2}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+pub fn format_memory_kb(kb: u64) -> String {
+    if kb == 0 {
+        "-".to_string()
+    } else if kb >= 1024 * 1024 {
+        format!("{:.2}GB", kb as f64 / (1024.0 * 1024.0))
+    } else if kb >= 1024 {
+        format!("{:.1}MB", kb as f64 / 1024.0)
+    } else {
+        format!("{kb}KB")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SubmissionMeta {
@@ -45,6 +67,9 @@ pub struct SubState {
     pub meta: SubmissionMeta,
     pub status: SubStatus,
     pub tests: Vec<(String, TestCaseStatus)>,
+    pub max_time_ms: u64,
+    pub max_memory_kb: u64,
+    pub score: Option<f64>,
 }
 
 pub struct MultiApp {
@@ -58,11 +83,13 @@ pub struct MultiApp {
     pub test_scroll_offset: Cell<usize>,
     pub selected_test_idx: usize,
     pub fullscreen_sub_idx: Option<usize>,
+    pub entered_fullscreen_at: Option<Instant>,
     pub start_time: Instant,
     pub total_tests: usize,
     pub completed_tests: usize,
     pub is_completed: bool,
     pub cancel_token: CancelToken,
+    pub sys_monitor: SystemMonitor,
 }
 
 impl MultiApp {
@@ -85,6 +112,9 @@ impl MultiApp {
                     meta: m.clone(),
                     status: SubStatus::Pending,
                     tests,
+                    max_time_ms: 0,
+                    max_memory_kb: 0,
+                    score: None,
                 }
             })
             .collect();
@@ -103,11 +133,13 @@ impl MultiApp {
             test_scroll_offset: Cell::new(0),
             selected_test_idx: 0,
             fullscreen_sub_idx: None,
+            entered_fullscreen_at: None,
             start_time: Instant::now(),
             total_tests,
             completed_tests: 0,
             is_completed: metas.is_empty(),
             cancel_token,
+            sys_monitor: SystemMonitor::new(),
         }
     }
 
@@ -141,8 +173,35 @@ impl MultiApp {
             JudgeEvent::TestDone(res) => {
                 let id = res.id.clone();
                 let sub = &mut self.subs[s_idx];
+                sub.max_time_ms = sub.max_time_ms.max(res.time_ms);
+                sub.max_memory_kb = sub.max_memory_kb.max(res.memory_kb);
                 if let Some(entry) = sub.tests.iter_mut().find(|(name, _)| *name == id) {
                     entry.1 = TestCaseStatus::Done(Box::new(res));
+                }
+                let all_done = sub
+                    .tests
+                    .iter()
+                    .all(|(_, st)| matches!(st, TestCaseStatus::Done(..)));
+                if all_done && matches!(sub.status, SubStatus::Running | SubStatus::Pending) {
+                    let mut agg_verdict = Verdict::Accepted;
+                    let mut total_score = 0.0;
+                    for (_, st) in &sub.tests {
+                        if let TestCaseStatus::Done(r) = st {
+                            agg_verdict = agg_verdict.merge(r.verdict);
+                            total_score += r.score;
+                        }
+                    }
+                    sub.status = SubStatus::Done(agg_verdict, total_score);
+                    if sub.score.is_none() {
+                        sub.score = Some(total_score);
+                    }
+                    if self
+                        .subs
+                        .iter()
+                        .all(|s| matches!(s.status, SubStatus::Done(..)))
+                    {
+                        self.is_completed = true;
+                    }
                 }
                 self.completed_tests += 1;
                 let now = Instant::now();
@@ -167,6 +226,9 @@ impl MultiApp {
             JudgeEvent::SubmissionDone(report) => {
                 let sub = &mut self.subs[s_idx];
                 sub.status = SubStatus::Done(report.verdict, report.score);
+                sub.max_time_ms = sub.max_time_ms.max(report.max_time_ms);
+                sub.max_memory_kb = sub.max_memory_kb.max(report.max_memory_kb);
+                sub.score = Some(report.score);
                 if self
                     .subs
                     .iter()
@@ -178,9 +240,12 @@ impl MultiApp {
             JudgeEvent::Summary {
                 final_verdict,
                 final_score,
+                peak_memory_kb,
                 ..
             } => {
                 let sub = &mut self.subs[s_idx];
+                sub.max_memory_kb = sub.max_memory_kb.max(peak_memory_kb);
+                sub.score = Some(final_score);
                 if !matches!(sub.status, SubStatus::Done(..)) {
                     sub.status = SubStatus::Done(final_verdict, final_score);
                 }
@@ -228,6 +293,9 @@ pub fn run_multi_tui(
     let mut exit_time: Option<Instant> = None;
 
     loop {
+        // Refresh system monitor periodically
+        app.sys_monitor.tick();
+
         // Drain events
         let mut disconnected = false;
         loop {
@@ -256,6 +324,9 @@ pub fn run_multi_tui(
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
+            if key.kind == crossterm::event::KeyEventKind::Release {
+                continue;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 app.cancel_token.cancel();
                 break;
@@ -265,7 +336,7 @@ pub fn run_multi_tui(
                     app.cancel_token.cancel();
                     break;
                 }
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Backspace => {
                     if app.fullscreen_sub_idx.is_some() {
                         app.fullscreen_sub_idx = None;
                     } else {
@@ -274,9 +345,15 @@ pub fn run_multi_tui(
                 }
                 KeyCode::Enter => {
                     if app.fullscreen_sub_idx.is_some() {
-                        app.fullscreen_sub_idx = None;
+                        if app
+                            .entered_fullscreen_at
+                            .is_some_and(|t| t.elapsed() > Duration::from_millis(250))
+                        {
+                            app.fullscreen_sub_idx = None;
+                        }
                     } else if !app.subs.is_empty() {
                         app.fullscreen_sub_idx = Some(app.selected_sub_idx);
+                        app.entered_fullscreen_at = Some(Instant::now());
                         app.selected_test_idx = 0;
                         app.test_scroll_offset.set(0);
                     }
@@ -335,25 +412,23 @@ fn draw_multi_ui(f: &mut Frame, app: &mut MultiApp) {
     {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(3), // Header stats
+                Constraint::Min(3),    // Tests table
+                Constraint::Length(1), // Footer help & CPU/Mem stats
+            ])
             .split(area);
 
         let sub = &app.subs[fs_idx];
+        draw_fullscreen_header(f, sub, chunks[0]);
         draw_tests_table(
             f,
             &sub.tests,
             app.selected_test_idx,
             &app.test_scroll_offset,
-            chunks[0],
-        );
-
-        let help = Line::from(vec![Span::raw(
-            " [Esc/Enter] Back to Overview  [↑↓/jk] Select Test  [q] Cancel ",
-        )]);
-        f.render_widget(
-            Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
             chunks[1],
         );
+        draw_fullscreen_footer(f, &app.sys_monitor, chunks[2]);
         return;
     }
 
@@ -363,7 +438,7 @@ fn draw_multi_ui(f: &mut Frame, app: &mut MultiApp) {
             Constraint::Length(3), // Header stats
             Constraint::Min(8),    // Body: Submissions (left) + Slots (right)
             Constraint::Length(4), // Selected submission tests chip preview
-            Constraint::Length(1), // Footer keybindings
+            Constraint::Length(1), // Footer keybindings & CPU/Mem stats
         ])
         .split(area);
 
@@ -371,22 +446,26 @@ fn draw_multi_ui(f: &mut Frame, app: &mut MultiApp) {
     draw_header(f, app, chunks[0]);
 
     // 2. Middle Body
-    let body_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(55), // Submissions list
-            Constraint::Percentage(45), // Slots list
-        ])
-        .split(chunks[1]);
+    if area.width < 100 {
+        draw_submissions_list(f, app, chunks[1]);
+    } else {
+        let body_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(62), // Submissions list
+                Constraint::Percentage(38), // Slots list
+            ])
+            .split(chunks[1]);
 
-    draw_submissions_list(f, app, body_chunks[0]);
-    draw_slots_list(f, app, body_chunks[1]);
+        draw_submissions_list(f, app, body_chunks[0]);
+        draw_slots_list(f, app, body_chunks[1]);
+    }
 
     // 3. Detail Preview (bottom chip view)
     draw_detail_preview(f, app, chunks[2]);
 
-    // 4. Footer Help
-    draw_footer(f, chunks[3]);
+    // 4. Footer Help & System monitor
+    draw_footer(f, &app.sys_monitor, chunks[3]);
 }
 
 fn draw_header(f: &mut Frame, app: &MultiApp, area: Rect) {
@@ -397,7 +476,13 @@ fn draw_header(f: &mut Frame, app: &MultiApp, area: Rect) {
     let done_subs = app
         .subs
         .iter()
-        .filter(|s| matches!(s.status, SubStatus::Done(..)))
+        .filter(|s| {
+            matches!(s.status, SubStatus::Done(..))
+                || (!s.tests.is_empty()
+                    && s.tests
+                        .iter()
+                        .all(|(_, st)| matches!(st, TestCaseStatus::Done(..))))
+        })
         .count();
     let total_subs = app.subs.len();
 
@@ -446,6 +531,9 @@ fn draw_submissions_list(f: &mut Frame, app: &MultiApp, area: Rect) {
         TableCell::from("Status").style(Style::default().add_modifier(Modifier::BOLD)),
         TableCell::from("Contestant").style(Style::default().add_modifier(Modifier::BOLD)),
         TableCell::from("Problem").style(Style::default().add_modifier(Modifier::BOLD)),
+        TableCell::from("Time").style(Style::default().add_modifier(Modifier::BOLD)),
+        TableCell::from("Memory").style(Style::default().add_modifier(Modifier::BOLD)),
+        TableCell::from("Score").style(Style::default().add_modifier(Modifier::BOLD)),
         TableCell::from("Progress").style(Style::default().add_modifier(Modifier::BOLD)),
         TableCell::from("Done").style(Style::default().add_modifier(Modifier::BOLD)),
     ])
@@ -467,20 +555,52 @@ fn draw_submissions_list(f: &mut Frame, app: &MultiApp, area: Rect) {
         .skip(offset)
         .take(visible_count)
         .map(|(idx, sub)| {
+            let total_t = sub.tests.len();
+            let done_t = sub
+                .tests
+                .iter()
+                .filter(|(_, st)| matches!(st, TestCaseStatus::Done(..)))
+                .count();
+
             let (status_cell, verd_color) = match sub.status {
                 SubStatus::Pending => (
                     TableCell::from(Span::styled("PEND", Style::default().fg(Color::DarkGray))),
                     Color::DarkGray,
                 ),
-                SubStatus::Running => (
-                    TableCell::from(Span::styled(
-                        "RUN ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Color::Cyan,
-                ),
+                SubStatus::Running => {
+                    if done_t == total_t && total_t > 0 {
+                        let mut agg_verdict = Verdict::Accepted;
+                        for (_, st) in &sub.tests {
+                            if let TestCaseStatus::Done(r) = st {
+                                agg_verdict = agg_verdict.merge(r.verdict);
+                            }
+                        }
+                        let color = match agg_verdict {
+                            Verdict::Accepted => Color::Green,
+                            Verdict::WrongAnswer => Color::Red,
+                            Verdict::TimeLimitExceeded => Color::Yellow,
+                            Verdict::MemoryLimitExceeded => Color::Magenta,
+                            _ => Color::LightRed,
+                        };
+                        (
+                            TableCell::from(Span::styled(
+                                format!("{:<4}", agg_verdict.short_code()),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            )),
+                            color,
+                        )
+                    } else {
+                        (
+                            TableCell::from(Span::styled(
+                                "RUN ",
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            Color::Cyan,
+                        )
+                    }
+                }
                 SubStatus::Done(v, _) => {
                     let color = match v {
                         Verdict::Accepted => Color::Green,
@@ -499,20 +619,36 @@ fn draw_submissions_list(f: &mut Frame, app: &MultiApp, area: Rect) {
                 }
             };
 
-            let total_t = sub.tests.len();
-            let done_t = sub
-                .tests
-                .iter()
-                .filter(|(_, st)| matches!(st, TestCaseStatus::Done(..)))
-                .count();
+            let time_str = format_time_ms(sub.max_time_ms);
+            let mem_str = format_memory_kb(sub.max_memory_kb);
+            let score_str = match sub.score {
+                Some(s) => format!("{:.1}", s),
+                None => match sub.status {
+                    SubStatus::Done(_, s) => format!("{:.1}", s),
+                    _ => {
+                        if done_t == total_t && total_t > 0 {
+                            let total_score: f64 = sub
+                                .tests
+                                .iter()
+                                .filter_map(|(_, st)| {
+                                    if let TestCaseStatus::Done(r) = st {
+                                        Some(r.score)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .sum();
+                            format!("{:.1}", total_score)
+                        } else {
+                            "-".to_string()
+                        }
+                    }
+                },
+            };
 
             // Progress bar
-            let bar_len = 10;
-            let filled = if total_t == 0 {
-                bar_len
-            } else {
-                (done_t * bar_len) / total_t
-            };
+            let bar_len = 8;
+            let filled = (done_t * bar_len).checked_div(total_t).unwrap_or(bar_len);
             let bar_str = format!("[{}{}]", "█".repeat(filled), "░".repeat(bar_len - filled));
             let bar_cell = TableCell::from(Span::styled(bar_str, Style::default().fg(verd_color)));
 
@@ -531,6 +667,9 @@ fn draw_submissions_list(f: &mut Frame, app: &MultiApp, area: Rect) {
                 status_cell,
                 TableCell::from(sub.meta.name.as_str()),
                 TableCell::from(sub.meta.problem.as_str()),
+                TableCell::from(Span::styled(time_str, Style::default().fg(Color::Cyan))),
+                TableCell::from(Span::styled(mem_str, Style::default().fg(Color::Magenta))),
+                TableCell::from(Span::styled(score_str, Style::default().fg(Color::Yellow))),
                 bar_cell,
                 TableCell::from(done_str),
             ])
@@ -540,10 +679,13 @@ fn draw_submissions_list(f: &mut Frame, app: &MultiApp, area: Rect) {
 
     let widths = [
         Constraint::Length(6),
-        Constraint::Min(12),
         Constraint::Min(10),
-        Constraint::Length(14),
+        Constraint::Min(8),
         Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Length(7),
     ];
 
     let title = format!(
@@ -634,9 +776,15 @@ fn draw_detail_preview(f: &mut Frame, app: &MultiApp, area: Rect) {
         .filter(|(_, st)| matches!(st, TestCaseStatus::Done(..)))
         .count();
 
+    let time_str = format_time_ms(sub.max_time_ms);
+    let mem_str = format_memory_kb(sub.max_memory_kb);
+    let score_info = match sub.status {
+        SubStatus::Done(v, s) => format!("Score: {:.1} ({}) | ", s, v.short_code()),
+        _ => String::new(),
+    };
     let title = format!(
-        " {} / {} — {}/{} done ",
-        sub.meta.name, sub.meta.problem, done_t, total_t
+        " {} / {} — {}{}/{} done | Max: {}, {} ",
+        sub.meta.name, sub.meta.problem, score_info, done_t, total_t, time_str, mem_str
     );
 
     let mut spans = Vec::new();
@@ -679,21 +827,168 @@ fn draw_detail_preview(f: &mut Frame, app: &MultiApp, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
+fn draw_fullscreen_header(f: &mut Frame, sub: &SubState, area: Rect) {
+    let (status_text, status_color) = match sub.status {
+        SubStatus::Pending => ("PENDING", Color::DarkGray),
+        SubStatus::Running => ("RUNNING", Color::Cyan),
+        SubStatus::Done(v, _) => (
+            v.short_code(),
+            match v {
+                Verdict::Accepted => Color::Green,
+                Verdict::WrongAnswer => Color::Red,
+                Verdict::TimeLimitExceeded => Color::Yellow,
+                Verdict::MemoryLimitExceeded => Color::Magenta,
+                _ => Color::LightRed,
+            },
+        ),
+    };
+
+    let done_t = sub
+        .tests
+        .iter()
+        .filter(|(_, st)| matches!(st, TestCaseStatus::Done(..)))
+        .count();
+    let total_t = sub.tests.len();
+
+    let mut spans = vec![
+        Span::styled(
+            " uj ",
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Contestant: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            &sub.meta.name,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" | Problem: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            &sub.meta.problem,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" | Status: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            status_text,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if let Some(score) = sub.score {
+        spans.push(Span::styled(
+            " | Score: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("{:.1}", score),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let time_str = format_time_ms(sub.max_time_ms);
+    let mem_str = format_memory_kb(sub.max_memory_kb);
+    spans.push(Span::styled(
+        " | Max Time: ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(time_str, Style::default().fg(Color::Cyan)));
+    spans.push(Span::styled(
+        " | Max Mem: ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(mem_str, Style::default().fg(Color::Magenta)));
+    spans.push(Span::styled(
+        " | Tests: ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(
+        format!("{}/{}", done_t, total_t),
+        Style::default().fg(Color::White),
+    ));
+
+    let block = Block::default()
+        .title(" Submission Detail ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+fn draw_fullscreen_footer(f: &mut Frame, sys_monitor: &SystemMonitor, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(40), Constraint::Length(38)])
+        .split(area);
+
+    let help = Line::from(vec![
+        Span::styled(
+            " [Esc/Backspace]",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Back to Overview  "),
+        Span::styled("[↑↓/jk]", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" Select Test  "),
+        Span::styled("[PgUp/PgDn]", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" Page  "),
+        Span::styled("[q]", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" Cancel"),
+    ]);
+    f.render_widget(
+        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
+        chunks[0],
+    );
+
+    let stats = Line::from(vec![Span::styled(
+        sys_monitor.format_stats(),
+        Style::default().fg(Color::Cyan),
+    )]);
+    f.render_widget(
+        Paragraph::new(stats)
+            .alignment(ratatui::layout::Alignment::Right)
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_footer(f: &mut Frame, sys_monitor: &SystemMonitor, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(40), Constraint::Length(38)])
+        .split(area);
+
     let line = Line::from(vec![
         Span::styled(" ↑↓/jk", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" Select  "),
         Span::styled("PgUp/PgDn", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" Page  "),
         Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" Fullscreen Detail  "),
+        Span::raw(" Detail  "),
         Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" Exit  "),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" Cancel"),
     ]);
     let p = Paragraph::new(line).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(p, area);
+    f.render_widget(p, chunks[0]);
+
+    let stats_line = Line::from(vec![Span::styled(
+        sys_monitor.format_stats(),
+        Style::default().fg(Color::Cyan),
+    )]);
+    let stats_p = Paragraph::new(stats_line)
+        .alignment(ratatui::layout::Alignment::Right)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(stats_p, chunks[1]);
 }
 
 #[cfg(test)]
@@ -773,6 +1068,8 @@ mod tests {
         // Slot 0 freed
         assert!(app.slots[0].is_none());
         assert_eq!(app.completed_tests, 1);
+        assert_eq!(app.subs[0].max_time_ms, 10);
+        assert_eq!(app.subs[0].max_memory_kb, 1024);
 
         // 3. SubmissionDone on sub 1
         app.handle_event(PoolEvent {
@@ -783,7 +1080,7 @@ mod tests {
             },
             inner: JudgeEvent::Summary {
                 total_time_ms: 20,
-                peak_memory_kb: 1024,
+                peak_memory_kb: 2048,
                 final_verdict: Verdict::Accepted,
                 final_score: 100.0,
             },
@@ -793,6 +1090,8 @@ mod tests {
             app.subs[0].status,
             SubStatus::Done(Verdict::Accepted, 100.0)
         );
+        assert_eq!(app.subs[0].max_memory_kb, 2048);
+        assert_eq!(app.subs[0].score, Some(100.0));
         assert!(!app.is_completed); // sub 2 still pending
 
         // 4. Sub 2 finishes
@@ -814,6 +1113,62 @@ mod tests {
             app.subs[1].status,
             SubStatus::Done(Verdict::WrongAnswer, 50.0)
         );
+        assert_eq!(app.subs[1].score, Some(50.0));
         assert!(app.is_completed);
+    }
+
+    #[test]
+    fn test_format_helpers() {
+        assert_eq!(format_time_ms(0), "-");
+        assert_eq!(format_time_ms(45), "45ms");
+        assert_eq!(format_time_ms(1500), "1.50s");
+
+        assert_eq!(format_memory_kb(0), "-");
+        assert_eq!(format_memory_kb(512), "512KB");
+        assert_eq!(format_memory_kb(2048), "2.0MB");
+        assert_eq!(format_memory_kb(2 * 1024 * 1024), "2.00GB");
+    }
+
+    #[test]
+    fn test_sysinfo_api() {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+        let _cpu = sys.global_cpu_usage();
+        let _used = sys.used_memory();
+        let _total = sys.total_memory();
+    }
+
+    #[test]
+    fn test_narrow_terminal_degradation() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let metas = vec![SubmissionMeta {
+            id: 1,
+            problem: "aplusb".to_string(),
+            name: "alice".to_string(),
+            test_names: vec!["1".to_string()],
+        }];
+        let cancel = CancelToken::new();
+        let mut app = MultiApp::new("narrow_test", &metas, 2, vec![Some(0), Some(1)], cancel);
+
+        terminal
+            .draw(|f| {
+                draw_multi_ui(f, &mut app);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(!content.contains("Slots (2)"));
     }
 }

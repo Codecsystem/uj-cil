@@ -433,6 +433,21 @@ impl JudgePool {
             if list.len() >= exp_count && !completed_sub_ids.contains(&sub_id) {
                 completed_sub_ids.insert(sub_id);
                 let _ = done_tx.send(sub_id);
+
+                if let Some(p_sub) = prepared_subs.iter().find(|p| p.sub.submission_id == sub_id)
+                    && (!p_sub.precise
+                        || p_sub.sub.problem.config.problem_type == ProblemType::OutputOnly)
+                {
+                    let mut test_results = results_by_sub.remove(&sub_id).unwrap_or_default();
+                    test_results.sort_by(|a, b| uj_core::tests::natural_cmp(&a.id, &b.id));
+                    let report = aggregate_and_dispatch(
+                        &p_sub.sub,
+                        test_results,
+                        p_sub.event_tx.as_ref(),
+                        self.opts.pool_events.as_ref(),
+                    );
+                    final_reports.insert(sub_id, Ok(report));
+                }
             }
         }
 
@@ -446,6 +461,9 @@ impl JudgePool {
         // Process completed results or categorize into precise / non-precise
         for p_sub in prepared_subs.iter() {
             let sub_id = p_sub.sub.submission_id;
+            if final_reports.contains_key(&sub_id) {
+                continue;
+            }
             let mut test_results = results_by_sub.remove(&sub_id).unwrap_or_default();
             let exp_count = *expected_tests_count.get(&sub_id).unwrap_or(&0);
 
@@ -764,23 +782,20 @@ mod tests {
         Ok(())
     }
 
+    /// 将 aplusb fixture 复制到独立临时目录，避免测试之间、测试与仓库之间共享 .uj 状态。
+    fn temp_aplusb() -> (tempfile::TempDir, PathBuf) {
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/problems/aplusb");
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("aplusb");
+        copy_dir_all(&src, &dst).unwrap();
+        let _ = fs::remove_dir_all(dst.join(".uj"));
+        (tmp, dst)
+    }
+
     #[test]
     fn test_pool_results_match_serial() {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let aplusb_dir = manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("tests")
-            .join("problems")
-            .join("aplusb");
-
+        let (_tmp, aplusb_dir) = temp_aplusb();
         let p_toml = aplusb_dir.join("problem.toml");
-        if !p_toml.exists() {
-            return;
-        }
-
         let p_content = fs::read_to_string(&p_toml).unwrap();
         let cfg = ProblemConfig::from_toml_str(&p_content, Some(&p_toml)).unwrap();
 
@@ -864,30 +879,14 @@ mod tests {
 
     #[test]
     fn test_pool_fail_fast_is_per_submission() {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let aplusb_dir = manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("tests")
-            .join("problems")
-            .join("aplusb");
-
+        let (_tmp, aplusb_dir) = temp_aplusb();
         let p_toml = aplusb_dir.join("problem.toml");
-        if !p_toml.exists() {
-            return;
-        }
-
         let p_content = fs::read_to_string(&p_toml).unwrap();
         let cfg = ProblemConfig::from_toml_str(&p_content, Some(&p_toml)).unwrap();
 
         let session = crate::compiler::CompileSession::new();
         let sol_ac = aplusb_dir.join("solutions").join("ac.cpp");
         let sol_wa = aplusb_dir.join("solutions").join("wa.cpp");
-        if !sol_wa.exists() {
-            return;
-        }
 
         let comp_ac = session.compile(&sol_ac, false).unwrap();
         let comp_wa = session.compile(&sol_wa, false).unwrap();
@@ -952,21 +951,8 @@ mod tests {
 
     #[test]
     fn test_pool_cancel_no_orphans() {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let aplusb_dir = manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("tests")
-            .join("problems")
-            .join("aplusb");
-
+        let (_tmp, aplusb_dir) = temp_aplusb();
         let p_toml = aplusb_dir.join("problem.toml");
-        if !p_toml.exists() {
-            return;
-        }
-
         let p_content = fs::read_to_string(&p_toml).unwrap();
         let cfg = ProblemConfig::from_toml_str(&p_content, Some(&p_toml)).unwrap();
 
@@ -1045,55 +1031,64 @@ mod tests {
 
     #[test]
     fn test_pool_slot_box_cross_problem_clean() {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let aplusb_dir = manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("tests")
-            .join("problems")
-            .join("aplusb");
+        let (_tmp1, aplusb_dir1) = temp_aplusb();
+        let (_tmp2, aplusb_dir2) = temp_aplusb();
 
-        let p_toml = aplusb_dir.join("problem.toml");
-        if !p_toml.exists() {
-            return;
-        }
-
-        let p_content = fs::read_to_string(&p_toml).unwrap();
-        let cfg = ProblemConfig::from_toml_str(&p_content, Some(&p_toml)).unwrap();
-
-        let session = crate::compiler::CompileSession::new();
-        let sol_ac = aplusb_dir.join("solutions").join("ac.cpp");
-        let comp_ac = session.compile(&sol_ac, false).unwrap();
-
-        // Create two separate problem contexts (problem_id 1 and problem_id 2)
-        let temp_b = tempfile::tempdir().unwrap();
-        let b_dir = temp_b.path().join("aplusb_b");
-        copy_dir_all(&aplusb_dir, &b_dir).unwrap();
-        let p_toml_b = b_dir.join("problem.toml");
-        let cfg_b =
-            ProblemConfig::from_toml_str(&fs::read_to_string(&p_toml_b).unwrap(), Some(&p_toml_b))
+        let p_toml1 = aplusb_dir1.join("problem.toml");
+        let cfg1 =
+            ProblemConfig::from_toml_str(&fs::read_to_string(&p_toml1).unwrap(), Some(&p_toml1))
+                .unwrap();
+        let p_toml2 = aplusb_dir2.join("problem.toml");
+        let cfg2 =
+            ProblemConfig::from_toml_str(&fs::read_to_string(&p_toml2).unwrap(), Some(&p_toml2))
                 .unwrap();
 
-        let p_ctx1 = Arc::new(ProblemContext::prepare(1, &aplusb_dir, &cfg, &session).unwrap());
-        let p_ctx2 = Arc::new(ProblemContext::prepare(2, &b_dir, &cfg_b, &session).unwrap());
+        let session = crate::compiler::CompileSession::new();
 
-        let tests1 = uj_core::tests::discover_tests(&aplusb_dir, &cfg).unwrap();
-        let tests2 = uj_core::tests::discover_tests(&b_dir, &cfg_b).unwrap();
+        // Write marker test solution that checks for leftover marker files
+        let marker_cpp = r#"
+#include <iostream>
+#include <fstream>
+using namespace std;
+int main() {
+    ifstream check("marker");
+    if (check.is_open()) {
+        cout << "LEAK\n";
+        return 0;
+    }
+    ofstream create("marker");
+    create << "1\n";
+    create.close();
+    long long a, b;
+    if (cin >> a >> b) {
+        cout << (a + b) << "\n";
+    }
+    return 0;
+}
+"#;
+        let sol_marker = aplusb_dir1.join("solutions").join("marker.cpp");
+        fs::write(&sol_marker, marker_cpp).unwrap();
+        let comp_marker = session.compile(&sol_marker, false).unwrap();
+
+        let p_ctx1 = Arc::new(ProblemContext::prepare(1, &aplusb_dir1, &cfg1, &session).unwrap());
+        let p_ctx2 = Arc::new(ProblemContext::prepare(2, &aplusb_dir2, &cfg2, &session).unwrap());
+
+        let tests1 = uj_core::tests::discover_tests(&aplusb_dir1, &cfg1).unwrap();
+        let tests2 = uj_core::tests::discover_tests(&aplusb_dir2, &cfg2).unwrap();
 
         let sub1 = Arc::new(
-            SubmissionContext::prepare(1, "sub1", p_ctx1, &comp_ac, tests1, false).unwrap(),
+            SubmissionContext::prepare(1, "sub1", p_ctx1, &comp_marker, tests1, false).unwrap(),
         );
 
         let sub2 = Arc::new(
-            SubmissionContext::prepare(2, "sub2", p_ctx2, &comp_ac, tests2, false).unwrap(),
+            SubmissionContext::prepare(2, "sub2", p_ctx2, &comp_marker, tests2, false).unwrap(),
         );
 
+        // slots: 1, window: 2 to ensure the same worker processes both problems sequentially
         let pool = JudgePool::new(PoolOptions {
             sandbox_mode: "none".to_string(),
             require_tier: false,
-            slots: 4,
+            slots: 1,
             window: 2,
             memory_budget: 1024 * 1024 * 1024,
             pool_events: None,
@@ -1117,32 +1112,36 @@ mod tests {
         );
 
         assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].as_ref().unwrap().verdict, Verdict::Accepted);
-        assert_eq!(reports[1].as_ref().unwrap().verdict, Verdict::Accepted);
+        let rep1 = reports[0].as_ref().unwrap();
+        let rep2 = reports[1].as_ref().unwrap();
+        assert_eq!(rep1.verdict, Verdict::Accepted);
+        assert_eq!(rep2.verdict, Verdict::Accepted);
 
-        // Verify that problem 1's slot boxes are under aplusb_dir and problem 2's slot boxes are under b_dir
-        let runs_1 = aplusb_dir.join(".uj").join("tmp").join("runs");
-        let runs_2 = b_dir.join(".uj").join("tmp").join("runs");
-        assert_ne!(runs_1, runs_2);
+        // Ensure none of the test cases produced LEAK (which would cause WA)
+        for t in &rep1.tests {
+            assert_eq!(
+                t.verdict,
+                Verdict::Accepted,
+                "Problem 1 test {} leaked: {:?}",
+                t.id,
+                t.verdict
+            );
+        }
+        for t in &rep2.tests {
+            assert_eq!(
+                t.verdict,
+                Verdict::Accepted,
+                "Problem 2 test {} leaked: {:?}",
+                t.id,
+                t.verdict
+            );
+        }
     }
 
     #[test]
-    fn test_pool_memory_budget_respected() {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let aplusb_dir = manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("tests")
-            .join("problems")
-            .join("aplusb");
-
+    fn test_pool_oversized_task_runs_exclusively() {
+        let (_tmp, aplusb_dir) = temp_aplusb();
         let p_toml = aplusb_dir.join("problem.toml");
-        if !p_toml.exists() {
-            return;
-        }
-
         let p_content = fs::read_to_string(&p_toml).unwrap();
         let cfg = ProblemConfig::from_toml_str(&p_content, Some(&p_toml)).unwrap();
 
@@ -1157,7 +1156,7 @@ mod tests {
             SubmissionContext::prepare(1, "budget_sub", p_ctx, &comp_ac, tests, false).unwrap(),
         );
 
-        // Test with tight memory budget
+        // Test with tight memory budget (128MiB < aplusb's 512MiB memory limit)
         let pool = JudgePool::new(PoolOptions {
             sandbox_mode: "none".to_string(),
             require_tier: false,
