@@ -2,6 +2,10 @@
 /target
 *.pdb
 *.exe
+bench_bins/
+
+# Scratch & benchmark runs
+scratch/
 
 # uj runtime & cache directories
 .uj/
