@@ -7,15 +7,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use uj_checker::builtin::BuiltinCheckerType;
-use uj_core::config::{ProblemConfig, SolutionTag};
-use uj_core::run::{KillReason, Limits, RunSpec, Stdio};
+use uj_core::config::{ProblemConfig, SolutionConfig, SolutionTag};
+use uj_core::run::{Limits, RunSpec, Stdio};
 use uj_core::verdict::Verdict;
 use uj_engine::compiler::CompileSession;
+use uj_engine::context::{ProblemContext, SubmissionContext};
 use uj_engine::judge::JudgeOptions;
+use uj_engine::pool::{JudgePool, PoolOptions, PoolSubmission};
 use uj_engine::scheduler::Scheduler;
+use uj_report::result::{JudgeEvent, PoolEvent, SubmissionJudgeReport, SubmissionRef};
 use uj_sandbox::{CancelToken, create_sandbox};
+use uj_tui::multi::{SubmissionMeta, run_multi_tui};
 
 use crate::cli::{Cli, OutputFormat, SandboxMode};
 use crate::error::{
@@ -25,7 +29,7 @@ use crate::error::{
 
 const VENDORED_TESTLIB_H: &str = include_str!("../../../assets/testlib.h");
 
-fn safe_write_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub(crate) fn safe_write_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -497,31 +501,24 @@ pub fn run_gen_with_session(
     }
 
     let tests_dir = problem_dir.join(&cfg.tests.dir);
-    let _ = fs::create_dir_all(&tests_dir);
+    let jobs =
+        match crate::author_steps::plan_gen_jobs(problem_dir, &cfg, force, append, session, cancel)
+        {
+            Ok(j) => j,
+            Err(code) => return code,
+        };
 
-    // Find starting test index: only scan existing tests if append is requested
-    let mut max_idx = 0u32;
-    if append && let Ok(entries) = fs::read_dir(&tests_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "in")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                && let Ok(num) = stem.parse::<u32>()
-            {
-                max_idx = max_idx.max(num);
-            }
+    if jobs.is_empty() {
+        if format == OutputFormat::Json {
+            let res = serde_json::json!({ "ok": true, "generated": 0 });
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        } else if format == OutputFormat::Human {
+            println!("All tests already generated or cached");
         }
+        return ExitCode::from(EXIT_SUCCESS);
     }
 
-    struct GenJob {
-        idx: u32,
-        gen_name: String,
-        gen_args: String,
-        argv: Vec<std::ffi::OsString>,
-        target_in: PathBuf,
-        cache_meta: PathBuf,
-        hash: String,
-    }
+    use crate::author_steps::{GenJob, StepError, exec_gen};
 
     enum GenResult {
         Generated,
@@ -534,67 +531,6 @@ pub fn run_gen_with_session(
         Error {
             err: String,
         },
-    }
-
-    let mut jobs = Vec::new();
-    for gen_spec in &cfg.tests.generators {
-        if cancel.is_cancelled() {
-            return ExitCode::from(EXIT_INTERRUPTED);
-        }
-        let gen_path = problem_dir.join(&gen_spec.generator);
-        let compiled_gen = match session.compile(&gen_path, false) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to compile generator '{}': {e}", gen_path.display());
-                return ExitCode::from(EXIT_COMPILE_ERROR);
-            }
-        };
-
-        let mut base_hasher = blake3::Hasher::new();
-        if let Ok(b) = fs::read(&compiled_gen.binary_path) {
-            base_hasher.update(&b);
-        }
-        base_hasher.update(gen_spec.args.as_bytes());
-
-        for i in 0..gen_spec.count {
-            if cancel.is_cancelled() {
-                return ExitCode::from(EXIT_INTERRUPTED);
-            }
-            max_idx += 1;
-            let target_in = tests_dir.join(format!("{max_idx}.in"));
-
-            // Blake3 cache check using cloned base hasher
-            let mut cache_hasher = base_hasher.clone();
-            cache_hasher.update(&i.to_le_bytes());
-            let hash = cache_hasher.finalize().to_hex().to_string();
-
-            let cache_meta = problem_dir
-                .join(".uj")
-                .join("cache")
-                .join("gen")
-                .join(format!("{hash}.hash"));
-            if !force && target_in.exists() && cache_meta.exists() {
-                continue;
-            }
-
-            let mut argv = vec![compiled_gen.binary_path.as_os_str().to_os_string()];
-            for arg in gen_spec.args.split_whitespace() {
-                argv.push(std::ffi::OsString::from(arg));
-            }
-            if gen_spec.count > 1 {
-                argv.push(std::ffi::OsString::from(format!("{}", i + 1)));
-            }
-
-            jobs.push(GenJob {
-                idx: max_idx,
-                gen_name: gen_spec.generator.clone(),
-                gen_args: gen_spec.args.clone(),
-                argv,
-                target_in,
-                cache_meta,
-                hash,
-            });
-        }
     }
 
     let num_workers = std::thread::available_parallelism()
@@ -639,55 +575,26 @@ pub fn run_gen_with_session(
                     break;
                 }
 
-                let limits = Limits::new(5000, 512 * 1024 * 1024);
-                let spec = RunSpec {
-                    argv: job.argv,
-                    env: vec![],
-                    work_dir: work_dir.clone(),
-                    ro_binds: vec![],
-                    stdin: Stdio::Null,
-                    stdout: Stdio::Pipe,
-                    stderr: Stdio::Pipe,
-                    extra_fds: vec![],
-                    limits,
-                    cpu_affinity: None,
-                    seccomp_profile: Default::default(),
-                    trusted: true,
-                };
-
-                let res = match sandbox.run(&spec, &cancel) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = res_tx.send(GenResult::Error {
-                            err: format!("Generator execution error: {e}"),
+                match exec_gen(sandbox.as_ref(), &job, &work_dir, &cancel) {
+                    Ok(_) => {
+                        let _ = res_tx.send(GenResult::Generated);
+                    }
+                    Err(StepError::Failed(msg)) => {
+                        let _ = res_tx.send(GenResult::Failed {
+                            idx: job.idx,
+                            gen_name: job.gen_name,
+                            gen_args: job.gen_args,
+                            msg,
                         });
                         stop.store(true, Ordering::Relaxed);
                         break;
                     }
-                };
-
-                if !res.status.is_success() {
-                    let err_tail = String::from_utf8_lossy(&res.stderr_tail).to_string();
-                    let _ = res_tx.send(GenResult::Failed {
-                        idx: job.idx,
-                        gen_name: job.gen_name,
-                        gen_args: job.gen_args,
-                        msg: err_tail,
-                    });
-                    stop.store(true, Ordering::Relaxed);
-                    break;
+                    Err(StepError::Runtime(err)) => {
+                        let _ = res_tx.send(GenResult::Error { err });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
-
-                let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
-                if let Err(e) = safe_write_file(&job.target_in, &stdout_bytes) {
-                    let _ = res_tx.send(GenResult::Error {
-                        err: format!("Failed to write {}: {e}", job.target_in.display()),
-                    });
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-                let _ = safe_write_file(&job.cache_meta, job.hash.as_bytes());
-                let _ = res_tx.send(GenResult::Generated);
             }
         });
         handles.push(handle);
@@ -909,50 +816,31 @@ pub fn run_validate_with_session(
                     break;
                 }
 
-                let mut argv = vec![val_bin.as_os_str().to_os_string()];
-                if let Some(st_id) = job.subtask_id {
-                    argv.push(std::ffi::OsString::from("--group"));
-                    argv.push(std::ffi::OsString::from(format!("{st_id}")));
-                }
-
-                let limits = Limits::new(5000, 512 * 1024 * 1024);
-                let spec = RunSpec {
-                    argv,
-                    env: vec![],
-                    work_dir: p_dir.clone(),
-                    ro_binds: vec![],
-                    stdin: Stdio::File(job.input_path.clone()),
-                    stdout: Stdio::Pipe,
-                    stderr: Stdio::Pipe,
-                    extra_fds: vec![],
-                    limits,
-                    cpu_affinity: None,
-                    seccomp_profile: Default::default(),
-                    trusted: true,
-                };
-
-                let res = match sandbox.run(&spec, &cancel) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = res_tx.send(ValResult::Error {
-                            err: format!("Validator runtime error: {e}"),
+                match crate::author_steps::exec_validate(
+                    sandbox.as_ref(),
+                    &val_bin,
+                    &job.input_path,
+                    job.subtask_id,
+                    &p_dir,
+                    &cancel,
+                ) {
+                    Ok(_) => {
+                        let _ = res_tx.send(ValResult::Ok);
+                    }
+                    Err(crate::author_steps::StepError::Failed(msg)) => {
+                        let _ = res_tx.send(ValResult::Failed {
+                            idx: job.idx,
+                            name: job.name,
+                            msg,
                         });
                         stop.store(true, Ordering::Relaxed);
                         break;
                     }
-                };
-
-                if !res.status.is_success() {
-                    let msg = String::from_utf8_lossy(&res.stderr_tail).trim().to_string();
-                    let _ = res_tx.send(ValResult::Failed {
-                        idx: job.idx,
-                        name: job.name,
-                        msg,
-                    });
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                } else {
-                    let _ = res_tx.send(ValResult::Ok);
+                    Err(crate::author_steps::StepError::Runtime(err)) => {
+                        let _ = res_tx.send(ValResult::Error { err });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
         });
@@ -1118,25 +1006,7 @@ pub fn run_ans_with_session(
         }
     };
 
-    let hash_file_streaming = |path: &Path| -> std::io::Result<String> {
-        use std::io::Read;
-        let mut file = fs::File::open(path)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            match file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    hasher.update(&buf[..n]);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(hasher.finalize().to_hex().to_string())
-    };
-
-    let main_hash = match hash_file_streaming(&compiled.binary_path) {
+    let main_hash = match crate::author_steps::hash_file_streaming(&compiled.binary_path) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("Failed to read binary for hash: {e}");
@@ -1155,7 +1025,6 @@ pub fn run_ans_with_session(
         name: String,
         input_path: PathBuf,
         ans_path: PathBuf,
-        cache_meta: PathBuf,
     }
 
     enum AnsResult {
@@ -1179,7 +1048,7 @@ pub fn run_ans_with_session(
             return ExitCode::from(EXIT_INTERRUPTED);
         }
 
-        let in_hash = match hash_file_streaming(&test.input_path) {
+        let in_hash = match crate::author_steps::hash_file_streaming(&test.input_path) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!(
@@ -1207,7 +1076,6 @@ pub fn run_ans_with_session(
             name: test.name.clone(),
             input_path: test.input_path.clone(),
             ans_path,
-            cache_meta,
         });
     }
     drop(job_tx);
@@ -1225,6 +1093,7 @@ pub fn run_ans_with_session(
         let sol_bin = sol_binary.clone();
         let p_dir = prob_dir.clone();
         let limits = run_limits.clone();
+        let main_hash_w = main_hash.clone();
 
         let handle = std::thread::spawn(move || {
             let sandbox = match create_sandbox("auto", false) {
@@ -1244,68 +1113,35 @@ pub fn run_ans_with_session(
                     break;
                 }
 
-                let spec = RunSpec {
-                    argv: vec![sol_bin.as_os_str().to_os_string()],
-                    env: vec![],
-                    work_dir: p_dir.clone(),
-                    ro_binds: vec![],
-                    stdin: Stdio::File(job.input_path.clone()),
-                    stdout: Stdio::Pipe,
-                    stderr: Stdio::Pipe,
-                    extra_fds: vec![],
-                    limits: limits.clone(),
-                    cpu_affinity: None,
-                    seccomp_profile: Default::default(),
-                    trusted: false,
-                };
-
-                let mut res = match sandbox.run(&spec, &cancel) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = res_tx.send(AnsResult::Error {
-                            err: format!("Execution error: {e}"),
+                match crate::author_steps::exec_ans(
+                    sandbox.as_ref(),
+                    &sol_bin,
+                    &main_hash_w,
+                    &job.input_path,
+                    &job.ans_path,
+                    &p_dir,
+                    &limits,
+                    force,
+                    &cancel,
+                ) {
+                    Ok(_outcome) => {
+                        let _ = res_tx.send(AnsResult::Generated);
+                    }
+                    Err(crate::author_steps::StepError::Failed(reason)) => {
+                        let _ = res_tx.send(AnsResult::Failed {
+                            idx: job.idx,
+                            name: job.name,
+                            reason,
                         });
                         stop.store(true, Ordering::Relaxed);
                         break;
                     }
-                };
-
-                // Cold-start Defender / scheduling stall retry:
-                if res.killed_by == Some(KillReason::WallLimit)
-                    && !cancel.is_cancelled()
-                    && (res.cpu_time_us / 1000) < limits.cpu_time_ms
-                {
-                    let mut retry_spec = spec.clone();
-                    retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(15000);
-                    if let Ok(retry_res) = sandbox.run(&retry_spec, &cancel) {
-                        res = retry_res;
+                    Err(crate::author_steps::StepError::Runtime(err)) => {
+                        let _ = res_tx.send(AnsResult::Error { err });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
                     }
                 }
-
-                if !res.status.is_success() || res.killed_by.is_some() {
-                    let reason = res
-                        .killed_by
-                        .map(|k| format!("{k:?}"))
-                        .unwrap_or_else(|| format!("{:?}", res.status));
-                    let _ = res_tx.send(AnsResult::Failed {
-                        idx: job.idx,
-                        name: job.name,
-                        reason,
-                    });
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-
-                let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
-                if let Err(e) = safe_write_file(&job.ans_path, &stdout_bytes) {
-                    let _ = res_tx.send(AnsResult::Error {
-                        err: format!("Failed to write ans file {}: {e}", job.ans_path.display()),
-                    });
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-                let _ = safe_write_file(&job.cache_meta, &stdout_bytes);
-                let _ = res_tx.send(AnsResult::Generated);
             }
         });
         handles.push(handle);
@@ -1402,6 +1238,150 @@ pub fn run_verify(
     run_verify_with_session(problem_dir, cli, format, cancel, &session)
 }
 
+/// Pure function to verify whether a submission judge report satisfies the expected SolutionTag and subtasks.
+pub fn check_solution_tag(
+    sol: &SolutionConfig,
+    report: &SubmissionJudgeReport,
+    cfg: &ProblemConfig,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut matches_tag = true;
+
+    match sol.tag {
+        SolutionTag::Main | SolutionTag::Accepted => {
+            if report.verdict != Verdict::Accepted {
+                matches_tag = false;
+            }
+        }
+        SolutionTag::WrongAnswer => {
+            let has_wa = report
+                .tests
+                .iter()
+                .any(|t| t.verdict == Verdict::WrongAnswer);
+            let has_fatal = report.tests.iter().any(|t| {
+                matches!(
+                    t.verdict,
+                    Verdict::TimeLimitExceeded
+                        | Verdict::MemoryLimitExceeded
+                        | Verdict::RuntimeError
+                        | Verdict::OutputLimitExceeded
+                        | Verdict::RestrictedFunction
+                        | Verdict::JudgeFailed
+                )
+            });
+            if !has_wa || has_fatal {
+                matches_tag = false;
+            }
+        }
+        SolutionTag::TimeLimit => {
+            let has_tle = report
+                .tests
+                .iter()
+                .any(|t| t.verdict == Verdict::TimeLimitExceeded);
+            let has_other = report.tests.iter().any(|t| {
+                matches!(
+                    t.verdict,
+                    Verdict::WrongAnswer
+                        | Verdict::MemoryLimitExceeded
+                        | Verdict::RuntimeError
+                        | Verdict::OutputLimitExceeded
+                        | Verdict::RestrictedFunction
+                        | Verdict::JudgeFailed
+                )
+            });
+            if !has_tle || has_other {
+                matches_tag = false;
+            }
+        }
+        SolutionTag::MemoryLimit => {
+            let has_mle = report
+                .tests
+                .iter()
+                .any(|t| t.verdict == Verdict::MemoryLimitExceeded);
+            let has_other = report.tests.iter().any(|t| {
+                matches!(
+                    t.verdict,
+                    Verdict::WrongAnswer
+                        | Verdict::TimeLimitExceeded
+                        | Verdict::RuntimeError
+                        | Verdict::OutputLimitExceeded
+                        | Verdict::RestrictedFunction
+                        | Verdict::JudgeFailed
+                )
+            });
+            if !has_mle || has_other {
+                matches_tag = false;
+            }
+        }
+        SolutionTag::RuntimeError => {
+            let has_re = report
+                .tests
+                .iter()
+                .any(|t| t.verdict == Verdict::RuntimeError);
+            let has_other = report.tests.iter().any(|t| {
+                matches!(
+                    t.verdict,
+                    Verdict::WrongAnswer
+                        | Verdict::TimeLimitExceeded
+                        | Verdict::MemoryLimitExceeded
+                        | Verdict::OutputLimitExceeded
+                        | Verdict::RestrictedFunction
+                        | Verdict::JudgeFailed
+                )
+            });
+            if !has_re || has_other {
+                matches_tag = false;
+            }
+        }
+        SolutionTag::Rejected => {
+            if report.verdict == Verdict::Accepted || report.verdict == Verdict::JudgeFailed {
+                matches_tag = false;
+            }
+        }
+        SolutionTag::Partial => {
+            let max_score = cfg.max_score();
+            if report.score <= 0.0 || report.score >= max_score {
+                matches_tag = false;
+            }
+        }
+    }
+
+    if !matches_tag {
+        let msg = report
+            .tests
+            .iter()
+            .find_map(|t| t.message.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        failures.push(format!(
+            "{} expected tag '{:?}' but got verdict '{:?}' (score: {}, msg: {msg})",
+            sol.path.display(),
+            sol.tag,
+            report.verdict,
+            report.score
+        ));
+    }
+
+    // Subtask expectations check
+    if let Some(ref expect_subtasks) = sol.expect_subtasks {
+        for (st_id, expected_v) in expect_subtasks {
+            let actual_v = report
+                .subtasks
+                .iter()
+                .find(|s| s.id == *st_id)
+                .map(|s| s.verdict);
+            if actual_v != Some(*expected_v) {
+                failures.push(format!(
+                    "{} subtask {st_id} expected '{expected_v:?}' but got '{actual_v:?}'",
+                    sol.path.display()
+                ));
+            }
+        }
+    }
+
+    failures
+}
+
 pub fn run_verify_with_session(
     problem_dir: &Path,
     cli: &Cli,
@@ -1437,74 +1417,230 @@ pub fn run_verify_with_session(
         SandboxMode::None => "none",
     };
 
-    let mut verification_failures = Vec::new();
-
     let total_sols = cfg.solutions.len();
-    for (idx, sol) in cfg.solutions.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return ExitCode::from(EXIT_INTERRUPTED);
+    if total_sols == 0 {
+        if format == OutputFormat::Json {
+            let res = serde_json::json!({ "ok": true, "verified": 0 });
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        } else if format == OutputFormat::Human {
+            println!("All 0 solution(s) passed verification!");
         }
+        return ExitCode::from(EXIT_SUCCESS);
+    }
 
-        let is_positive = matches!(sol.tag, SolutionTag::Main | SolutionTag::Accepted);
-        let options = JudgeOptions {
-            sandbox_mode: sandbox_mode_str.to_string(),
-            require_tier: cli.require_tier,
-            fail_fast: cli.fail_fast,
-            precise: cli.precise && is_positive,
-        };
-        let scheduler = Scheduler::with_session(options, session.clone());
+    // Phase A: Parallel compilation & context preparation
+    let problem_ctx = match ProblemContext::prepare(0, problem_dir, &cfg, session) {
+        Ok(ctx) => Arc::new(ctx),
+        Err(e) => {
+            eprintln!("Problem setup error: {e}");
+            return ExitCode::from(EXIT_JUDGE_FAILED);
+        }
+    };
 
-        let sol_num = idx + 1;
-        let tag_name = format!("{:?}", sol.tag);
+    enum PreparedSol {
+        Ready(usize, Arc<SubmissionContext>),
+        CompileError(usize, String),
+        PrepareError(usize, String),
+    }
 
-        let sol_path = problem_dir.join(&sol.path);
-        let compiled = match session.compile(&sol_path, cli.no_cache) {
-            Ok(c) => c,
-            Err(e) => {
-                if format == OutputFormat::Human {
-                    eprintln!(
-                        "[{sol_num}/{total_sols}] {} ({tag_name}) -> COMPILATION FAILED: {e}",
-                        sol.path.display()
-                    );
+    let detected_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let compile_workers = (detected_cpus / 2).clamp(1, 8);
+    let (task_tx, task_rx) = crossbeam_channel::unbounded::<(usize, SolutionConfig)>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<PreparedSol>();
+
+    for _ in 0..compile_workers {
+        let rx = task_rx.clone();
+        let tx = res_tx.clone();
+        let cancel_w = cancel.clone();
+        let session_w = session.clone();
+        let p_ctx = Arc::clone(&problem_ctx);
+        let tests_w = tests.clone();
+        let problem_dir_w = problem_dir.to_path_buf();
+        let no_cache = cli.no_cache;
+        let fail_fast = cli.fail_fast;
+
+        std::thread::spawn(move || {
+            while let Ok((idx, sol)) = rx.recv() {
+                if cancel_w.is_cancelled() {
+                    break;
                 }
-                verification_failures
-                    .push(format!("{}: compilation failed: {e}", sol.path.display()));
-                continue;
+                let sol_path = problem_dir_w.join(&sol.path);
+                let compiled = match session_w.compile(&sol_path, no_cache) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(PreparedSol::CompileError(idx, e.to_string()));
+                        continue;
+                    }
+                };
+
+                let sol_name = sol.path.file_name().unwrap_or_default().to_string_lossy();
+                match SubmissionContext::prepare(
+                    idx,
+                    &sol_name,
+                    Arc::clone(&p_ctx),
+                    &compiled,
+                    tests_w.clone(),
+                    fail_fast,
+                ) {
+                    Ok(sub_ctx) => {
+                        let _ = tx.send(PreparedSol::Ready(idx, Arc::new(sub_ctx)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(PreparedSol::PrepareError(idx, e.to_string()));
+                    }
+                }
             }
-        };
+        });
+    }
+    drop(res_tx);
 
-        let sol_name = sol.path.file_name().unwrap_or_default().to_string_lossy();
-        let (event_sender, event_thread) = if cli.tui {
-            let (tx, rx) = crossbeam_channel::unbounded::<uj_report::result::JudgeEvent>();
-            let prob_name = cfg.name.clone();
-            let sub_name = format!("{} ({tag_name})", sol.path.display());
-            let cancel_clone = cancel.clone();
-            let test_names: Vec<String> = tests.iter().map(|t| t.name.clone()).collect();
-            let limits = cfg
-                .to_limits()
-                .unwrap_or_else(|_| Limits::new(1000, 256 * 1024 * 1024));
-            let slot_count = uj_engine::topology::Topology::detect(limits.memory_bytes, cli.jobs)
-                .slots
-                .len();
+    for (idx, sol) in cfg.solutions.iter().enumerate() {
+        let _ = task_tx.send((idx, sol.clone()));
+    }
+    drop(task_tx);
 
-            let handle = std::thread::spawn(move || {
-                let _ = uj_tui::run_tui(
-                    &prob_name,
-                    &sub_name,
-                    &test_names,
-                    slot_count,
-                    rx,
-                    cancel_clone,
-                    true,
-                );
-            });
-            (Some(tx), Some(handle))
-        } else if format == OutputFormat::Human && !cli.quiet {
-            let (tx, rx) = crossbeam_channel::unbounded::<uj_report::result::JudgeEvent>();
-            let total_cnt = tests.len() as u64;
+    let mut ready_map = std::collections::HashMap::new();
+    let mut compile_errors = std::collections::HashMap::new();
+    let mut prepare_errors = std::collections::HashMap::new();
+
+    while let Ok(res) = res_rx.recv() {
+        match res {
+            PreparedSol::Ready(idx, ctx) => {
+                ready_map.insert(idx, ctx);
+            }
+            PreparedSol::CompileError(idx, err) => {
+                compile_errors.insert(idx, err);
+            }
+            PreparedSol::PrepareError(idx, err) => {
+                prepare_errors.insert(idx, err);
+            }
+        }
+    }
+
+    if cancel.is_cancelled() {
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
+
+    // Phase B / C: JudgePool evaluation
+    let topology = uj_engine::topology::Topology::detect(0, cli.jobs);
+    let slots = topology.slots.len();
+    let window = std::cmp::max(2, slots / 2);
+    let memory_budget = uj_engine::topology::Topology::memory_budget_bytes();
+
+    let (ptx, prx) = crossbeam_channel::unbounded::<PoolEvent>();
+    let pool_events_opt = if cli.tui { Some(ptx.clone()) } else { None };
+
+    let test_names: Vec<String> = tests.iter().map(|t| t.name.clone()).collect();
+    let sub_metas: Vec<SubmissionMeta> = cfg
+        .solutions
+        .iter()
+        .enumerate()
+        .map(|(idx, sol)| {
             let sol_disp = sol.path.display().to_string();
-            let handle = std::thread::spawn(move || {
-                let pb = ProgressBar::new(total_cnt);
+            SubmissionMeta {
+                id: idx,
+                problem: cfg.name.clone(),
+                name: sol_disp,
+                test_names: test_names.clone(),
+            }
+        })
+        .collect();
+
+    if let Some(ref tx) = pool_events_opt {
+        for idx in compile_errors.keys() {
+            let sol = &cfg.solutions[*idx];
+            let fail_rep = SubmissionJudgeReport {
+                schema_version: 1,
+                problem: cfg.name.clone(),
+                submission: sol.path.display().to_string(),
+                verdict: Verdict::CompileError,
+                score: 0.0,
+                max_time_ms: 0,
+                max_memory_kb: 0,
+                subtasks: vec![],
+                tests: vec![],
+            };
+            let _ = tx.send(PoolEvent {
+                submission: SubmissionRef {
+                    id: *idx,
+                    problem: cfg.name.clone(),
+                    name: sol.path.display().to_string(),
+                },
+                inner: JudgeEvent::SubmissionDone(fail_rep),
+            });
+        }
+        for idx in prepare_errors.keys() {
+            let sol = &cfg.solutions[*idx];
+            let fail_rep = SubmissionJudgeReport {
+                schema_version: 1,
+                problem: cfg.name.clone(),
+                submission: sol.path.display().to_string(),
+                verdict: Verdict::JudgeFailed,
+                score: 0.0,
+                max_time_ms: 0,
+                max_memory_kb: 0,
+                subtasks: vec![],
+                tests: vec![],
+            };
+            let _ = tx.send(PoolEvent {
+                submission: SubmissionRef {
+                    id: *idx,
+                    problem: cfg.name.clone(),
+                    name: sol.path.display().to_string(),
+                },
+                inner: JudgeEvent::SubmissionDone(fail_rep),
+            });
+        }
+    }
+
+    let tui_handle = if cli.tui {
+        let slot_cpus: Vec<Option<usize>> = topology.slots.iter().map(|s| s.cpu_core).collect();
+        let title = format!("Verify: {}", cfg.name);
+        let cancel_tui = cancel.clone();
+        let rx = prx.clone();
+        Some(std::thread::spawn(move || {
+            let _ = run_multi_tui(&title, &sub_metas, slots, slot_cpus, rx, cancel_tui, true);
+        }))
+    } else {
+        None
+    };
+
+    let pool = JudgePool::new(PoolOptions {
+        sandbox_mode: sandbox_mode_str.to_string(),
+        require_tier: cli.require_tier,
+        slots,
+        window,
+        memory_budget,
+        pool_events: pool_events_opt,
+    });
+
+    let show_progress = format == OutputFormat::Human && !cli.quiet && !cli.tui;
+    let mp = if show_progress {
+        Some(MultiProgress::new())
+    } else {
+        None
+    };
+    let mut event_threads = Vec::new();
+    let mut pool_subs = Vec::new();
+    let mut sub_idx_to_sol_idx = Vec::new();
+    let total_cnt = tests.len() as u64;
+
+    for (idx, sol) in cfg.solutions.iter().enumerate() {
+        if let Some(sub_ctx) = ready_map.get(&idx) {
+            let is_positive = matches!(sol.tag, SolutionTag::Main | SolutionTag::Accepted);
+            let (tx, rx) = if show_progress {
+                let (tx, rx) = crossbeam_channel::unbounded::<JudgeEvent>();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+
+            if let (Some(mp_ref), Some(rx)) = (&mp, rx) {
+                let pb = mp_ref.add(ProgressBar::new(total_cnt));
+                let sol_num = idx + 1;
+                let sol_disp = sol.path.display().to_string();
                 pb.set_style(
                     ProgressStyle::default_bar()
                         .template(&format!(
@@ -1514,50 +1650,124 @@ pub fn run_verify_with_session(
                         .progress_chars("=>-"),
                 );
                 pb.set_message("testing...");
-                for ev in rx {
-                    match ev {
-                        uj_report::result::JudgeEvent::TestDone(ref res) => {
-                            pb.inc(1);
-                            let mem_str = if res.memory_kb > 1024 {
-                                format!("{:.1}M", res.memory_kb as f64 / 1024.0)
-                            } else {
-                                format!("{}K", res.memory_kb)
-                            };
-                            pb.set_message(format!(
-                                "{}: {} ({}ms, {mem_str})",
-                                res.id,
-                                res.verdict.short_code(),
-                                res.time_ms
-                            ));
+                let handle = std::thread::spawn(move || {
+                    for ev in rx {
+                        match ev {
+                            JudgeEvent::TestDone(ref res) => {
+                                pb.inc(1);
+                                let mem_str = if res.memory_kb > 1024 {
+                                    format!("{:.1}M", res.memory_kb as f64 / 1024.0)
+                                } else {
+                                    format!("{}K", res.memory_kb)
+                                };
+                                pb.set_message(format!(
+                                    "{}: {} ({}ms, {mem_str})",
+                                    res.id,
+                                    res.verdict.short_code(),
+                                    res.time_ms
+                                ));
+                            }
+                            JudgeEvent::SubmissionDone(_) => {
+                                break;
+                            }
+                            _ => {}
                         }
-                        uj_report::result::JudgeEvent::SubmissionDone(_) => {
-                            break;
-                        }
-                        _ => {}
                     }
-                }
-                pb.finish_and_clear();
-            });
-            (Some(tx), Some(handle))
-        } else {
-            (None, None)
-        };
+                    pb.finish_and_clear();
+                });
+                event_threads.push(handle);
+            }
 
-        let report = match scheduler.judge_submission(
-            problem_dir,
-            &cfg,
-            &compiled,
-            &sol_name,
-            tests.clone(),
-            cli.jobs,
-            event_sender,
-            cancel,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(h) = event_thread {
-                    let _ = h.join();
+            pool_subs.push(PoolSubmission {
+                ctx: Arc::clone(sub_ctx),
+                events: tx,
+                precise: cli.precise && is_positive,
+            });
+            sub_idx_to_sol_idx.push(idx);
+        }
+    }
+
+    let pool_reports = pool.run(pool_subs, cancel);
+    drop(pool);
+    drop(ptx);
+
+    for h in event_threads {
+        let _ = h.join();
+    }
+    if let Some(h) = tui_handle {
+        let _ = h.join();
+    }
+
+    if let Some(mp_ref) = mp {
+        let _ = mp_ref.clear();
+    }
+
+    let mut reports_by_sol_idx = std::collections::HashMap::new();
+    for (sub_res, sol_idx) in pool_reports.into_iter().zip(sub_idx_to_sol_idx) {
+        reports_by_sol_idx.insert(sol_idx, sub_res);
+    }
+
+    let mut verification_failures = Vec::new();
+
+    // Verification result reporting in deterministic cfg.solutions order
+    for (idx, sol) in cfg.solutions.iter().enumerate() {
+        let sol_num = idx + 1;
+        let tag_name = format!("{:?}", sol.tag);
+
+        if let Some(err) = compile_errors.get(&idx) {
+            if format == OutputFormat::Human {
+                eprintln!(
+                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> COMPILATION FAILED: {err}",
+                    sol.path.display()
+                );
+            }
+            verification_failures
+                .push(format!("{}: compilation failed: {err}", sol.path.display()));
+            continue;
+        }
+
+        if let Some(err) = prepare_errors.get(&idx) {
+            if format == OutputFormat::Human {
+                eprintln!(
+                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> PREPARE FAILED: {err}",
+                    sol.path.display()
+                );
+            }
+            verification_failures.push(format!("{}: prepare failed: {err}", sol.path.display()));
+            continue;
+        }
+
+        match reports_by_sol_idx.remove(&idx) {
+            Some(Ok(report)) => {
+                let sol_failures = check_solution_tag(sol, &report, &cfg);
+                let matches_tag = sol_failures.is_empty();
+                verification_failures.extend(sol_failures);
+
+                if format == OutputFormat::Human {
+                    let max_time = report.tests.iter().map(|t| t.time_ms).max().unwrap_or(0);
+                    let mem_str = if report.max_memory_kb > 1024 {
+                        format!("{:.1} MiB", report.max_memory_kb as f64 / 1024.0)
+                    } else {
+                        format!("{} KiB", report.max_memory_kb)
+                    };
+                    if matches_tag {
+                        println!(
+                            "[{sol_num}/{total_sols}] {} ({tag_name}) -> OK ({:?}, {max_time} ms, {mem_str})",
+                            sol.path.display(),
+                            report.verdict
+                        );
+                    } else {
+                        println!(
+                            "[{sol_num}/{total_sols}] {} ({tag_name}) -> FAILED (got {:?}, {max_time} ms, {mem_str})",
+                            sol.path.display(),
+                            report.verdict
+                        );
+                    }
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
                 }
+            }
+            Some(Err(e)) => {
                 if format == OutputFormat::Human {
                     eprintln!(
                         "[{sol_num}/{total_sols}] {} ({tag_name}) -> JUDGE FAILED: {e}",
@@ -1565,170 +1775,11 @@ pub fn run_verify_with_session(
                     );
                 }
                 verification_failures.push(format!("{}: judging failed: {e}", sol.path.display()));
-                continue;
             }
-        };
-
-        if let Some(h) = event_thread {
-            let _ = h.join();
-        }
-
-        // Check against expected SolutionTag
-        let mut matches_tag = true;
-        match sol.tag {
-            SolutionTag::Main | SolutionTag::Accepted => {
-                if report.verdict != Verdict::Accepted {
-                    matches_tag = false;
-                }
+            None => {
+                verification_failures
+                    .push(format!("{}: missing evaluation result", sol.path.display()));
             }
-            SolutionTag::WrongAnswer => {
-                let has_wa = report
-                    .tests
-                    .iter()
-                    .any(|t| t.verdict == Verdict::WrongAnswer);
-                let has_fatal = report.tests.iter().any(|t| {
-                    matches!(
-                        t.verdict,
-                        Verdict::TimeLimitExceeded
-                            | Verdict::MemoryLimitExceeded
-                            | Verdict::RuntimeError
-                            | Verdict::OutputLimitExceeded
-                            | Verdict::RestrictedFunction
-                            | Verdict::JudgeFailed
-                    )
-                });
-                if !has_wa || has_fatal {
-                    matches_tag = false;
-                }
-            }
-            SolutionTag::TimeLimit => {
-                let has_tle = report
-                    .tests
-                    .iter()
-                    .any(|t| t.verdict == Verdict::TimeLimitExceeded);
-                let has_other = report.tests.iter().any(|t| {
-                    matches!(
-                        t.verdict,
-                        Verdict::WrongAnswer
-                            | Verdict::MemoryLimitExceeded
-                            | Verdict::RuntimeError
-                            | Verdict::OutputLimitExceeded
-                            | Verdict::RestrictedFunction
-                            | Verdict::JudgeFailed
-                    )
-                });
-                if !has_tle || has_other {
-                    matches_tag = false;
-                }
-            }
-            SolutionTag::MemoryLimit => {
-                let has_mle = report
-                    .tests
-                    .iter()
-                    .any(|t| t.verdict == Verdict::MemoryLimitExceeded);
-                let has_other = report.tests.iter().any(|t| {
-                    matches!(
-                        t.verdict,
-                        Verdict::WrongAnswer
-                            | Verdict::TimeLimitExceeded
-                            | Verdict::RuntimeError
-                            | Verdict::OutputLimitExceeded
-                            | Verdict::RestrictedFunction
-                            | Verdict::JudgeFailed
-                    )
-                });
-                if !has_mle || has_other {
-                    matches_tag = false;
-                }
-            }
-            SolutionTag::RuntimeError => {
-                let has_re = report
-                    .tests
-                    .iter()
-                    .any(|t| t.verdict == Verdict::RuntimeError);
-                let has_other = report.tests.iter().any(|t| {
-                    matches!(
-                        t.verdict,
-                        Verdict::WrongAnswer
-                            | Verdict::TimeLimitExceeded
-                            | Verdict::MemoryLimitExceeded
-                            | Verdict::OutputLimitExceeded
-                            | Verdict::RestrictedFunction
-                            | Verdict::JudgeFailed
-                    )
-                });
-                if !has_re || has_other {
-                    matches_tag = false;
-                }
-            }
-            SolutionTag::Rejected => {
-                if report.verdict == Verdict::Accepted || report.verdict == Verdict::JudgeFailed {
-                    matches_tag = false;
-                }
-            }
-            SolutionTag::Partial => {
-                let max_score = cfg.max_score();
-                if report.score <= 0.0 || report.score >= max_score {
-                    matches_tag = false;
-                }
-            }
-        }
-
-        if !matches_tag {
-            let msg = report
-                .tests
-                .iter()
-                .find_map(|t| t.message.as_ref())
-                .cloned()
-                .unwrap_or_default();
-            verification_failures.push(format!(
-                "{} expected tag '{:?}' but got verdict '{:?}' (score: {}, msg: {msg})",
-                sol.path.display(),
-                sol.tag,
-                report.verdict,
-                report.score
-            ));
-        }
-
-        // Subtask expectations check
-        if let Some(ref expect_subtasks) = sol.expect_subtasks {
-            for (st_id, expected_v) in expect_subtasks {
-                let actual_v = report
-                    .subtasks
-                    .iter()
-                    .find(|s| s.id == *st_id)
-                    .map(|s| s.verdict);
-                if actual_v != Some(*expected_v) {
-                    verification_failures.push(format!(
-                        "{} subtask {st_id} expected '{expected_v:?}' but got '{actual_v:?}'",
-                        sol.path.display()
-                    ));
-                }
-            }
-        }
-
-        if format == OutputFormat::Human {
-            let max_time = report.tests.iter().map(|t| t.time_ms).max().unwrap_or(0);
-            let mem_str = if report.max_memory_kb > 1024 {
-                format!("{:.1} MiB", report.max_memory_kb as f64 / 1024.0)
-            } else {
-                format!("{} KiB", report.max_memory_kb)
-            };
-            if matches_tag {
-                println!(
-                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> OK ({:?}, {max_time} ms, {mem_str})",
-                    sol.path.display(),
-                    report.verdict
-                );
-            } else {
-                println!(
-                    "[{sol_num}/{total_sols}] {} ({tag_name}) -> FAILED (got {:?}, {max_time} ms, {mem_str})",
-                    sol.path.display(),
-                    report.verdict
-                );
-            }
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
         }
     }
 
@@ -2381,75 +2432,345 @@ pub fn run_pipeline(
         other => other,
     };
 
-    let mut step_records = Vec::new();
-    let mut failed_step: Option<String> = None;
-    let mut final_code = ExitCode::from(EXIT_SUCCESS);
+    struct PipelineRunner<'a> {
+        step_records: Vec<serde_json::Value>,
+        failed_step: Option<String>,
+        final_code: ExitCode,
+        cancel: &'a CancelToken,
+        format: OutputFormat,
+    }
 
-    let mut step = |name: &'static str, run_fn: &dyn Fn() -> ExitCode| -> bool {
-        if cancel.is_cancelled() {
-            final_code = ExitCode::from(EXIT_INTERRUPTED);
-            return false;
+    impl<'a> PipelineRunner<'a> {
+        fn new(cancel: &'a CancelToken, format: OutputFormat) -> Self {
+            Self {
+                step_records: Vec::new(),
+                failed_step: None,
+                final_code: ExitCode::from(EXIT_SUCCESS),
+                cancel,
+                format,
+            }
         }
-        if format == OutputFormat::Human {
-            println!("==> Step: uj {name}");
-        } else if format == OutputFormat::Ndjson {
-            println!(
-                "{}",
-                serde_json::json!({ "event": "step_started", "step": name })
-            );
+
+        fn step(&mut self, name: &'static str, run_fn: impl FnOnce() -> ExitCode) -> bool {
+            if self.cancel.is_cancelled() {
+                self.final_code = ExitCode::from(EXIT_INTERRUPTED);
+                return false;
+            }
+            if self.format == OutputFormat::Human {
+                println!("==> Step: uj {name}");
+            } else if self.format == OutputFormat::Ndjson {
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "step_started", "step": name })
+                );
+            }
+
+            let code = run_fn();
+            let success = code == ExitCode::from(EXIT_SUCCESS);
+            self.step_records.push(serde_json::json!({
+                "name": name,
+                "status": if success { "success" } else { "failed" }
+            }));
+
+            if self.format == OutputFormat::Ndjson {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "step_finished",
+                        "step": name,
+                        "status": if success { "success" } else { "failed" }
+                    })
+                );
+            }
+
+            if !success {
+                self.failed_step = Some(name.to_string());
+                self.final_code = code;
+                if self.format == OutputFormat::Human {
+                    eprintln!("Pipeline stopped: step 'uj {name}' failed with status {code:?}");
+                }
+                return false;
+            }
+            true
         }
 
-        let code = run_fn();
-        let success = code == ExitCode::from(EXIT_SUCCESS);
-        step_records.push(serde_json::json!({
-            "name": name,
-            "status": if success { "success" } else { "failed" }
-        }));
+        fn record_step(&mut self, name: &'static str, status: &'static str) {
+            self.step_records.push(serde_json::json!({
+                "name": name,
+                "status": status,
+            }));
+        }
+    }
 
+    let mut runner = PipelineRunner::new(cancel, format);
+
+    let use_staged = std::env::var("UJ_PIPELINE_STAGED").as_deref() == Ok("1");
+    if use_staged {
+        if runner.step("build", || {
+            run_build_with_session(problem_dir, &[], cli.no_cache, sub_format, &session)
+        }) && runner.step("gen", || {
+            run_gen_with_session(problem_dir, false, false, sub_format, cancel, &session)
+        }) && runner.step("validate", || {
+            run_validate_with_session(problem_dir, sub_format, cancel, &session)
+        }) && runner.step("ans", || {
+            run_ans_with_session(problem_dir, false, sub_format, cancel, &session)
+        }) && runner.step("verify", || {
+            run_verify_with_session(problem_dir, cli, sub_format, cancel, &session)
+        }) {
+            runner.step("tl", || {
+                run_tl_with_session(problem_dir, false, cli, sub_format, cancel, &session)
+            });
+        }
+    } else if runner.step("build", || {
+        run_build_with_session(problem_dir, &[], cli.no_cache, sub_format, &session)
+    }) {
         if format == OutputFormat::Ndjson {
             println!(
                 "{}",
-                serde_json::json!({
-                    "event": "step_finished",
-                    "step": name,
-                    "status": if success { "success" } else { "failed" }
-                })
+                serde_json::json!({ "event": "step_started", "step": "gen" })
             );
+            println!(
+                "{}",
+                serde_json::json!({ "event": "step_started", "step": "validate" })
+            );
+            println!(
+                "{}",
+                serde_json::json!({ "event": "step_started", "step": "ans" })
+            );
+        } else if format == OutputFormat::Human && !cli.tui {
+            println!("==> Step: uj pipeline (gen + validate + ans)");
         }
 
-        if !success {
-            failed_step = Some(name.to_string());
-            final_code = code;
-            if format == OutputFormat::Human {
-                eprintln!("Pipeline stopped: step 'uj {name}' failed with status {code:?}");
+        let outcome =
+            crate::author_steps::run_case_stages(problem_dir, cli, sub_format, cancel, &session);
+
+        match outcome {
+            crate::author_steps::CaseStagesOutcome::Success { .. } => {
+                runner.record_step("gen", "success");
+                runner.record_step("validate", "success");
+                runner.record_step("ans", "success");
+                if format == OutputFormat::Ndjson {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "event": "step_finished", "step": "gen", "status": "success" })
+                    );
+                    println!(
+                        "{}",
+                        serde_json::json!({ "event": "step_finished", "step": "validate", "status": "success" })
+                    );
+                    println!(
+                        "{}",
+                        serde_json::json!({ "event": "step_finished", "step": "ans", "status": "success" })
+                    );
+                }
+
+                if runner.step("verify", || {
+                    run_verify_with_session(problem_dir, cli, sub_format, cancel, &session)
+                }) {
+                    runner.step("tl", || {
+                        run_tl_with_session(problem_dir, false, cli, sub_format, cancel, &session)
+                    });
+                }
             }
-            return false;
+            crate::author_steps::CaseStagesOutcome::Failed {
+                stage,
+                message,
+                exit_code,
+                ..
+            } => {
+                runner.final_code = exit_code;
+                match stage {
+                    uj_tui::pipeline::Stage::Gen => {
+                        runner.failed_step = Some("gen".to_string());
+                        runner.record_step("gen", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "failed" })
+                            );
+                        }
+                        if format == OutputFormat::Human {
+                            eprintln!("{message}");
+                            eprintln!(
+                                "Pipeline stopped: step 'uj gen' failed with status {:?}",
+                                runner.final_code
+                            );
+                        }
+                    }
+                    uj_tui::pipeline::Stage::Validate => {
+                        runner.failed_step = Some("validate".to_string());
+                        runner.record_step("gen", "aborted");
+                        runner.record_step("validate", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "aborted" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "validate", "status": "failed" })
+                            );
+                        }
+                        if format == OutputFormat::Human {
+                            eprintln!("{message}");
+                            eprintln!(
+                                "Pipeline stopped: step 'uj validate' failed with status {:?}",
+                                runner.final_code
+                            );
+                        }
+                    }
+                    uj_tui::pipeline::Stage::Ans => {
+                        runner.failed_step = Some("ans".to_string());
+                        runner.record_step("gen", "aborted");
+                        runner.record_step("validate", "aborted");
+                        runner.record_step("ans", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "aborted" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "validate", "status": "aborted" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "ans", "status": "failed" })
+                            );
+                        }
+                        if format == OutputFormat::Human {
+                            eprintln!("{message}");
+                            eprintln!(
+                                "Pipeline stopped: step 'uj ans' failed with status {:?}",
+                                runner.final_code
+                            );
+                        }
+                    }
+                }
+            }
+            crate::author_steps::CaseStagesOutcome::RuntimeError { stage, message } => {
+                runner.final_code = ExitCode::from(EXIT_JUDGE_FAILED);
+                let s_name = stage.name();
+                runner.failed_step = Some(s_name.to_string());
+                match stage {
+                    uj_tui::pipeline::Stage::Gen => {
+                        runner.record_step("gen", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "failed" })
+                            );
+                        }
+                    }
+                    uj_tui::pipeline::Stage::Validate => {
+                        runner.record_step("gen", "aborted");
+                        runner.record_step("validate", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "aborted" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "validate", "status": "failed" })
+                            );
+                        }
+                    }
+                    uj_tui::pipeline::Stage::Ans => {
+                        runner.record_step("gen", "aborted");
+                        runner.record_step("validate", "aborted");
+                        runner.record_step("ans", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "aborted" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "validate", "status": "aborted" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "ans", "status": "failed" })
+                            );
+                        }
+                    }
+                }
+                if format == OutputFormat::Human {
+                    eprintln!("{message}");
+                    eprintln!(
+                        "Pipeline stopped: step 'uj {s_name}' failed with status {:?}",
+                        runner.final_code
+                    );
+                }
+            }
+            crate::author_steps::CaseStagesOutcome::ConfigOrCompileError { stage, exit_code } => {
+                runner.final_code = exit_code;
+                let s_name = stage.name();
+                runner.failed_step = Some(s_name.to_string());
+                match stage {
+                    uj_tui::pipeline::Stage::Gen => {
+                        runner.record_step("gen", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "failed" })
+                            );
+                        }
+                    }
+                    uj_tui::pipeline::Stage::Validate => {
+                        runner.record_step("gen", "success");
+                        runner.record_step("validate", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "success" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "validate", "status": "failed" })
+                            );
+                        }
+                    }
+                    uj_tui::pipeline::Stage::Ans => {
+                        runner.record_step("gen", "success");
+                        runner.record_step("validate", "success");
+                        runner.record_step("ans", "failed");
+                        if format == OutputFormat::Ndjson {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "gen", "status": "success" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "validate", "status": "success" })
+                            );
+                            println!(
+                                "{}",
+                                serde_json::json!({ "event": "step_finished", "step": "ans", "status": "failed" })
+                            );
+                        }
+                    }
+                }
+                if format == OutputFormat::Human {
+                    eprintln!(
+                        "Pipeline stopped: step 'uj {s_name}' failed with status {:?}",
+                        runner.final_code
+                    );
+                }
+            }
+            crate::author_steps::CaseStagesOutcome::Interrupted => {
+                runner.final_code = ExitCode::from(EXIT_INTERRUPTED);
+            }
         }
-        true
-    };
-
-    if step("build", &|| {
-        run_build_with_session(problem_dir, &[], cli.no_cache, sub_format, &session)
-    }) && step("gen", &|| {
-        run_gen_with_session(problem_dir, false, false, sub_format, cancel, &session)
-    }) && step("validate", &|| {
-        run_validate_with_session(problem_dir, sub_format, cancel, &session)
-    }) && step("ans", &|| {
-        run_ans_with_session(problem_dir, false, sub_format, cancel, &session)
-    }) && step("verify", &|| {
-        run_verify_with_session(problem_dir, cli, sub_format, cancel, &session)
-    }) {
-        step("tl", &|| {
-            run_tl_with_session(problem_dir, false, cli, sub_format, cancel, &session)
-        });
     }
 
     if format == OutputFormat::Json {
-        let is_ok = failed_step.is_none();
+        let is_ok = runner.failed_step.is_none();
         let res = serde_json::json!({
             "ok": is_ok,
-            "steps": step_records,
-            "failed_step": failed_step
+            "steps": runner.step_records,
+            "failed_step": runner.failed_step
         });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
     } else if format == OutputFormat::Ndjson {
@@ -2457,12 +2778,319 @@ pub fn run_pipeline(
             "{}",
             serde_json::json!({
                 "event": "pipeline_finished",
-                "ok": failed_step.is_none()
+                "ok": runner.failed_step.is_none()
             })
         );
-    } else if format == OutputFormat::Human && failed_step.is_none() {
+    } else if format == OutputFormat::Human && runner.failed_step.is_none() {
         println!("Pipeline completed successfully!");
     }
 
-    final_code
+    runner.final_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uj_core::config::{ProblemConfig, SolutionConfig, SolutionTag};
+    use uj_core::verdict::Verdict;
+    use uj_report::result::{SingleTestResult, SubmissionJudgeReport, SubtaskResult, TimingInfo};
+
+    fn make_cfg() -> ProblemConfig {
+        ProblemConfig::from_toml_str(
+            r#"
+            schema = 1
+            name = "test_prob"
+            type = "traditional"
+            [limits]
+            time = "1s"
+            memory = "256MiB"
+            "#,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn make_report(
+        verdict: Verdict,
+        score: f64,
+        tests: Vec<Verdict>,
+        subtasks: Vec<(u32, Verdict)>,
+    ) -> SubmissionJudgeReport {
+        SubmissionJudgeReport {
+            schema_version: 1,
+            problem: "test_prob".to_string(),
+            submission: "test_sol".to_string(),
+            verdict,
+            score,
+            max_time_ms: 10,
+            max_memory_kb: 1024,
+            subtasks: subtasks
+                .into_iter()
+                .map(|(id, v)| SubtaskResult {
+                    id,
+                    score: if v == Verdict::Accepted { 100.0 } else { 0.0 },
+                    max_score: 100.0,
+                    verdict: v,
+                    test_ids: vec![],
+                })
+                .collect(),
+            tests: tests
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| SingleTestResult {
+                    id: format!("{}", i + 1),
+                    subtask: None,
+                    verdict: v,
+                    time_ms: 10,
+                    wall_ms: 10,
+                    memory_kb: 1024,
+                    score: if v == Verdict::Accepted { 10.0 } else { 0.0 },
+                    exit: uj_report::result::ExitInfo {
+                        code: Some(0),
+                        signal: None,
+                        nt_status: None,
+                    },
+                    message: None,
+                    checker: None,
+                    diff: None,
+                    timing: TimingInfo::default(),
+                    sandbox_tier: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_tag_main_and_accepted() {
+        let cfg = make_cfg();
+        let sol_main = SolutionConfig {
+            path: PathBuf::from("main.cpp"),
+            tag: SolutionTag::Main,
+            expect_subtasks: None,
+        };
+        let sol_ac = SolutionConfig {
+            path: PathBuf::from("ac.cpp"),
+            tag: SolutionTag::Accepted,
+            expect_subtasks: None,
+        };
+
+        let rep_ac = make_report(Verdict::Accepted, 100.0, vec![Verdict::Accepted], vec![]);
+        let rep_wa = make_report(
+            Verdict::WrongAnswer,
+            0.0,
+            vec![Verdict::WrongAnswer],
+            vec![],
+        );
+
+        assert!(check_solution_tag(&sol_main, &rep_ac, &cfg).is_empty());
+        assert!(!check_solution_tag(&sol_main, &rep_wa, &cfg).is_empty());
+
+        assert!(check_solution_tag(&sol_ac, &rep_ac, &cfg).is_empty());
+        assert!(!check_solution_tag(&sol_ac, &rep_wa, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_tag_wrong_answer() {
+        let cfg = make_cfg();
+        let sol = SolutionConfig {
+            path: PathBuf::from("wa.cpp"),
+            tag: SolutionTag::WrongAnswer,
+            expect_subtasks: None,
+        };
+
+        // Passes when there's WA and no fatal
+        let rep_wa = make_report(
+            Verdict::WrongAnswer,
+            50.0,
+            vec![Verdict::Accepted, Verdict::WrongAnswer],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol, &rep_wa, &cfg).is_empty());
+
+        // Fails when pure AC
+        let rep_ac = make_report(Verdict::Accepted, 100.0, vec![Verdict::Accepted], vec![]);
+        assert!(!check_solution_tag(&sol, &rep_ac, &cfg).is_empty());
+
+        // Fails when fatal error (TLE) present
+        let rep_tle = make_report(
+            Verdict::TimeLimitExceeded,
+            0.0,
+            vec![Verdict::WrongAnswer, Verdict::TimeLimitExceeded],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol, &rep_tle, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_tag_time_limit() {
+        let cfg = make_cfg();
+        let sol = SolutionConfig {
+            path: PathBuf::from("tle.cpp"),
+            tag: SolutionTag::TimeLimit,
+            expect_subtasks: None,
+        };
+
+        let rep_tle = make_report(
+            Verdict::TimeLimitExceeded,
+            50.0,
+            vec![Verdict::Accepted, Verdict::TimeLimitExceeded],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol, &rep_tle, &cfg).is_empty());
+
+        // Fails if has WA
+        let rep_wa = make_report(
+            Verdict::WrongAnswer,
+            0.0,
+            vec![Verdict::WrongAnswer, Verdict::TimeLimitExceeded],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol, &rep_wa, &cfg).is_empty());
+
+        // Fails if AC
+        let rep_ac = make_report(Verdict::Accepted, 100.0, vec![Verdict::Accepted], vec![]);
+        assert!(!check_solution_tag(&sol, &rep_ac, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_tag_memory_limit() {
+        let cfg = make_cfg();
+        let sol = SolutionConfig {
+            path: PathBuf::from("mle.cpp"),
+            tag: SolutionTag::MemoryLimit,
+            expect_subtasks: None,
+        };
+
+        let rep_mle = make_report(
+            Verdict::MemoryLimitExceeded,
+            50.0,
+            vec![Verdict::Accepted, Verdict::MemoryLimitExceeded],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol, &rep_mle, &cfg).is_empty());
+
+        let rep_re = make_report(
+            Verdict::RuntimeError,
+            0.0,
+            vec![Verdict::MemoryLimitExceeded, Verdict::RuntimeError],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol, &rep_re, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_tag_runtime_error() {
+        let cfg = make_cfg();
+        let sol = SolutionConfig {
+            path: PathBuf::from("re.cpp"),
+            tag: SolutionTag::RuntimeError,
+            expect_subtasks: None,
+        };
+
+        let rep_re = make_report(
+            Verdict::RuntimeError,
+            50.0,
+            vec![Verdict::Accepted, Verdict::RuntimeError],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol, &rep_re, &cfg).is_empty());
+
+        let rep_wa = make_report(
+            Verdict::WrongAnswer,
+            0.0,
+            vec![Verdict::WrongAnswer, Verdict::RuntimeError],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol, &rep_wa, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_tag_rejected() {
+        let cfg = make_cfg();
+        let sol = SolutionConfig {
+            path: PathBuf::from("bad.cpp"),
+            tag: SolutionTag::Rejected,
+            expect_subtasks: None,
+        };
+
+        let rep_wa = make_report(
+            Verdict::WrongAnswer,
+            0.0,
+            vec![Verdict::WrongAnswer],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol, &rep_wa, &cfg).is_empty());
+
+        let rep_ac = make_report(Verdict::Accepted, 100.0, vec![Verdict::Accepted], vec![]);
+        assert!(!check_solution_tag(&sol, &rep_ac, &cfg).is_empty());
+
+        let rep_jf = make_report(
+            Verdict::JudgeFailed,
+            0.0,
+            vec![Verdict::JudgeFailed],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol, &rep_jf, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_tag_partial() {
+        let cfg = make_cfg();
+        let sol = SolutionConfig {
+            path: PathBuf::from("partial.cpp"),
+            tag: SolutionTag::Partial,
+            expect_subtasks: None,
+        };
+
+        let rep_part = make_report(
+            Verdict::PartiallyCorrect,
+            50.0,
+            vec![Verdict::Accepted, Verdict::WrongAnswer],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol, &rep_part, &cfg).is_empty());
+
+        let rep_zero = make_report(
+            Verdict::WrongAnswer,
+            0.0,
+            vec![Verdict::WrongAnswer],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol, &rep_zero, &cfg).is_empty());
+
+        let rep_full = make_report(Verdict::Accepted, 100.0, vec![Verdict::Accepted], vec![]);
+        assert!(!check_solution_tag(&sol, &rep_full, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_tag_subtask_expectations() {
+        let cfg = make_cfg();
+        let mut expect = std::collections::HashMap::new();
+        expect.insert(1, Verdict::Accepted);
+        expect.insert(2, Verdict::TimeLimitExceeded);
+
+        let sol = SolutionConfig {
+            path: PathBuf::from("subtasks.cpp"),
+            tag: SolutionTag::TimeLimit,
+            expect_subtasks: Some(expect),
+        };
+
+        let rep_ok = make_report(
+            Verdict::TimeLimitExceeded,
+            50.0,
+            vec![Verdict::Accepted, Verdict::TimeLimitExceeded],
+            vec![(1, Verdict::Accepted), (2, Verdict::TimeLimitExceeded)],
+        );
+        assert!(check_solution_tag(&sol, &rep_ok, &cfg).is_empty());
+
+        let rep_mismatch = make_report(
+            Verdict::TimeLimitExceeded,
+            50.0,
+            vec![Verdict::Accepted, Verdict::TimeLimitExceeded],
+            vec![(1, Verdict::Accepted), (2, Verdict::WrongAnswer)],
+        );
+        let failures = check_solution_tag(&sol, &rep_mismatch, &cfg);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("subtask 2 expected 'TimeLimitExceeded'"));
+    }
 }

@@ -10,6 +10,6 @@ pub use csv::{generate_csv, generate_multi_csv};
 pub use html::{generate_html, generate_multi_html};
 pub use human::{format_human_report, format_test_details};
 pub use result::{
-    DiffSummary, ExitInfo, JudgeEvent, SingleTestResult, SubmissionJudgeReport, SubtaskResult,
-    TimingInfo,
+    DiffSummary, ExitInfo, JudgeEvent, PoolEvent, SingleTestResult, SubmissionJudgeReport,
+    SubmissionRef, SubtaskResult, TimingInfo,
 };

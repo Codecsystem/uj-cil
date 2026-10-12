@@ -5,16 +5,22 @@
 
 use crate::cli::{Cli, OutputFormat, SandboxMode};
 use crate::error::{EXIT_INTERRUPTED, EXIT_SUCCESS, EXIT_USAGE_OR_CONFIG};
+use crossbeam_channel::unbounded;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uj_core::config::ProblemConfig;
 use uj_core::tests::TestCase;
 use uj_core::verdict::Verdict;
-use uj_engine::scheduler::{JudgeOptions, Scheduler};
-use uj_report::result::SubmissionJudgeReport;
+use uj_engine::context::{ProblemContext, SubmissionContext};
+use uj_engine::pool::{JudgePool, PoolOptions, PoolSubmission};
+use uj_engine::topology::Topology;
+use uj_report::result::{JudgeEvent, PoolEvent, SubmissionJudgeReport, SubmissionRef};
 use uj_sandbox::CancelToken;
+use uj_tui::multi::{SubmissionMeta, run_multi_tui};
 
 /// A problem discovered in a contest.
 struct ContestProblem {
@@ -89,6 +95,7 @@ fn discover_problems(contest_dir: &Path) -> Vec<ContestProblem> {
         }
     }
 
+    problems.sort_by(|a, b| a.name.cmp(&b.name));
     problems
 }
 
@@ -226,15 +233,7 @@ pub fn run_contest(
         SandboxMode::None => "none",
     };
 
-    let judge_options = JudgeOptions {
-        sandbox_mode: sandbox_mode_str.to_string(),
-        require_tier: cli.require_tier,
-        fail_fast: cli.fail_fast,
-        precise: cli.precise,
-    };
-
     let compile_session = uj_engine::compiler::CompileSession::new();
-    let scheduler = Scheduler::with_session(judge_options, compile_session.clone());
     let mut all_reports: Vec<SubmissionJudgeReport> = Vec::new();
     let mut standings_map: HashMap<String, ContestantStanding> = HashMap::new();
 
@@ -261,27 +260,101 @@ pub fn run_contest(
         );
     }
 
-    // Evaluate all (player, problem) pairs
-    for prob in &problems {
-        for (player, player_subs) in &submissions {
-            if cancel.is_cancelled() {
-                return ExitCode::from(EXIT_INTERRUPTED);
+    // -------------------------------------------------------------------------
+    // Phase A: Parallel Compilation & Submission Context Preparation
+    // -------------------------------------------------------------------------
+    let mut problem_contexts: Vec<Result<Arc<ProblemContext>, String>> =
+        Vec::with_capacity(problems.len());
+    for (idx, prob) in problems.iter().enumerate() {
+        match ProblemContext::prepare(idx, &prob.dir, &prob.config, &compile_session) {
+            Ok(ctx) => problem_contexts.push(Ok(Arc::new(ctx))),
+            Err(e) => {
+                eprintln!("Problem prepare failed for {}: {e}", prob.name);
+                problem_contexts.push(Err(e.to_string()));
             }
+        }
+    }
 
+    #[derive(Clone)]
+    struct SubCandidate {
+        sub_id: usize,
+        prob_idx: usize,
+        prob_name: String,
+        player: String,
+        source_path: PathBuf,
+    }
+
+    let mut candidates = Vec::new();
+    let mut sub_id_gen = 0;
+
+    for (prob_idx, prob) in problems.iter().enumerate() {
+        for (player, player_subs) in &submissions {
             if let Some(source_path) = player_subs.get(&prob.name) {
-                if format == OutputFormat::Human {
-                    println!("Evaluating {} / {} ...", player, prob.name);
+                candidates.push(SubCandidate {
+                    sub_id: sub_id_gen,
+                    prob_idx,
+                    prob_name: prob.name.clone(),
+                    player: player.clone(),
+                    source_path: source_path.clone(),
+                });
+                sub_id_gen += 1;
+            } else if let Some(st) = standings_map.get_mut(player) {
+                st.problem_results
+                    .insert(prob.name.clone(), (Verdict::Skipped, 0.0, 0));
+            }
+        }
+    }
+
+    enum PreparedCandidate {
+        Ready(usize, String, String, PoolSubmission),
+        CompileError(usize, String, String, SubmissionJudgeReport),
+        Failed(usize, String, String, String),
+    }
+
+    let compile_threads = (Topology::detect(0, None).logical_cores / 2).clamp(1, 8);
+    let (cand_tx, cand_rx) = unbounded::<SubCandidate>();
+    let (prep_tx, prep_rx) = unbounded::<PreparedCandidate>();
+
+    let mut compile_workers = Vec::with_capacity(compile_threads);
+    for _ in 0..compile_threads {
+        let rx = cand_rx.clone();
+        let tx = prep_tx.clone();
+        let session = compile_session.clone();
+        let no_cache = cli.no_cache;
+        let precise = cli.precise;
+        let problem_contexts = problem_contexts.clone();
+        let problems_meta: Vec<(String, Vec<TestCase>)> = problems
+            .iter()
+            .map(|p| (p.name.clone(), p.tests.clone()))
+            .collect();
+        let cancel = cancel.clone();
+
+        let handle = std::thread::spawn(move || {
+            while let Ok(candidate) = rx.recv() {
+                if cancel.is_cancelled() {
+                    break;
                 }
 
-                // Compile
-                let compile_res = compile_session.compile(source_path, cli.no_cache);
-                let compiled = match compile_res {
-                    Ok(c) => c,
+                let p_ctx = match &problem_contexts[candidate.prob_idx] {
+                    Ok(ctx) => Arc::clone(ctx),
                     Err(e) => {
+                        let _ = tx.send(PreparedCandidate::Failed(
+                            candidate.sub_id,
+                            candidate.player,
+                            candidate.prob_name,
+                            format!("Problem setup error: {e}"),
+                        ));
+                        continue;
+                    }
+                };
+
+                let compile_res = session.compile(&candidate.source_path, no_cache);
+                match compile_res {
+                    Err(_e) => {
                         let ce_report = SubmissionJudgeReport {
                             schema_version: 1,
-                            problem: prob.name.clone(),
-                            submission: format!("{player} - {}", prob.name),
+                            problem: candidate.prob_name.clone(),
+                            submission: format!("{} - {}", candidate.player, candidate.prob_name),
                             verdict: Verdict::CompileError,
                             score: 0.0,
                             max_time_ms: 0,
@@ -289,51 +362,346 @@ pub fn run_contest(
                             subtasks: vec![],
                             tests: vec![],
                         };
-                        all_reports.push(ce_report);
-                        if let Some(st) = standings_map.get_mut(player) {
-                            st.problem_results
-                                .insert(prob.name.clone(), (Verdict::CompileError, 0.0, 0));
-                        }
-                        if format == OutputFormat::Human {
-                            eprintln!("  -> Compile Error: {e}");
-                        }
-                        continue;
+                        let _ = tx.send(PreparedCandidate::CompileError(
+                            candidate.sub_id,
+                            candidate.player,
+                            candidate.prob_name,
+                            ce_report,
+                        ));
                     }
-                };
-
-                let sub_display_name = format!("{player} - {}", prob.name);
-                let report_res = scheduler.judge_submission(
-                    &prob.dir,
-                    &prob.config,
-                    &compiled,
-                    &sub_display_name,
-                    prob.tests.clone(),
-                    cli.jobs,
-                    None,
-                    cancel,
-                );
-
-                match report_res {
-                    Ok(report) => {
-                        if let Some(st) = standings_map.get_mut(player) {
-                            st.total_score += report.score;
-                            st.total_time_ms += report.max_time_ms;
-                            st.problem_results.insert(
-                                prob.name.clone(),
-                                (report.verdict, report.score, report.max_time_ms),
-                            );
+                    Ok(compiled) => {
+                        let sub_display_name =
+                            format!("{} - {}", candidate.player, candidate.prob_name);
+                        let tests = problems_meta[candidate.prob_idx].1.clone();
+                        match SubmissionContext::prepare(
+                            candidate.sub_id,
+                            &sub_display_name,
+                            p_ctx,
+                            &compiled,
+                            tests,
+                            false,
+                        ) {
+                            Ok(sub_ctx) => {
+                                let _ = tx.send(PreparedCandidate::Ready(
+                                    candidate.sub_id,
+                                    candidate.player,
+                                    candidate.prob_name,
+                                    PoolSubmission {
+                                        ctx: Arc::new(sub_ctx),
+                                        events: None,
+                                        precise,
+                                    },
+                                ));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(PreparedCandidate::Failed(
+                                    candidate.sub_id,
+                                    candidate.player,
+                                    candidate.prob_name,
+                                    e.to_string(),
+                                ));
+                            }
                         }
-                        all_reports.push(report);
-                    }
-                    Err(e) => {
-                        eprintln!("  -> Judging failed for {player} / {}: {e}", prob.name);
                     }
                 }
-            } else if let Some(st) = standings_map.get_mut(player) {
-                // Not submitted
-                st.problem_results
-                    .insert(prob.name.clone(), (Verdict::Skipped, 0.0, 0));
             }
+        });
+        compile_workers.push(handle);
+    }
+
+    drop(prep_tx);
+    for cand in candidates.iter().cloned() {
+        let _ = cand_tx.send(cand);
+    }
+    drop(cand_tx);
+
+    let mut prepared_list = Vec::new();
+    while let Ok(prep) = prep_rx.recv() {
+        prepared_list.push(prep);
+    }
+    for h in compile_workers {
+        let _ = h.join();
+    }
+
+    if cancel.is_cancelled() {
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
+
+    prepared_list.sort_by_key(|p| match p {
+        PreparedCandidate::Ready(id, ..) => *id,
+        PreparedCandidate::CompileError(id, ..) => *id,
+        PreparedCandidate::Failed(id, ..) => *id,
+    });
+
+    let total_submissions_count = prepared_list.len();
+    let completed_submissions_count = Arc::new(AtomicUsize::new(0));
+
+    let total_test_points: usize = prepared_list
+        .iter()
+        .map(|p| match p {
+            PreparedCandidate::Ready(_, _, _, sub) => sub.ctx.tests.len(),
+            _ => 0,
+        })
+        .sum();
+
+    let (pool_event_tx, pool_event_rx) = unbounded::<PoolEvent>();
+    let pool_events_opt = if cli.tui || format == OutputFormat::Ndjson {
+        Some(pool_event_tx.clone())
+    } else {
+        None
+    };
+
+    let pb = if format == OutputFormat::Human && !cli.tui {
+        let p = indicatif::ProgressBar::new(total_test_points as u64);
+        p.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        p.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tests ({eta})")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        Some(p)
+    } else {
+        None
+    };
+
+    let (event_hub_tx, event_hub_rx) = unbounded::<(String, String, JudgeEvent)>();
+    let listener_handle = if format == OutputFormat::Human && !cli.tui {
+        let pb = pb.clone();
+        let completed_counter = Arc::clone(&completed_submissions_count);
+        Some(std::thread::spawn(move || {
+            while let Ok((player, prob_name, event)) = event_hub_rx.recv() {
+                match event {
+                    JudgeEvent::TestDone(_) => {
+                        if let Some(ref p) = pb {
+                            p.inc(1);
+                        }
+                    }
+                    JudgeEvent::SubmissionDone(ref report) => {
+                        let done = completed_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let msg = format!(
+                            "[{done}/{total_submissions_count}] {player} / {prob_name} -> {} {:.1}",
+                            report.verdict, report.score
+                        );
+                        if let Some(ref p) = pb {
+                            p.println(msg);
+                        } else {
+                            println!("{msg}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let ndjson_handle = if format == OutputFormat::Ndjson {
+        let rx = pool_event_rx.clone();
+        Some(std::thread::spawn(move || {
+            for ev in rx {
+                if let Ok(line) = serde_json::to_string(&ev) {
+                    println!("{line}");
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let mut final_reports: HashMap<usize, SubmissionJudgeReport> = HashMap::new();
+    let mut pool_submissions = Vec::new();
+    let mut pool_sub_meta = Vec::new();
+
+    for item in prepared_list {
+        match item {
+            PreparedCandidate::CompileError(sub_id, player, prob_name, ce_report) => {
+                let done = completed_submissions_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if format == OutputFormat::Human && !cli.tui {
+                    let msg = format!(
+                        "[{done}/{total_submissions_count}] {player} / {prob_name} -> CE 0.0"
+                    );
+                    if let Some(ref p) = pb {
+                        p.println(msg);
+                    } else {
+                        println!("{msg}");
+                    }
+                }
+                if let Some(ref ptx) = pool_events_opt {
+                    let _ = ptx.send(PoolEvent {
+                        submission: SubmissionRef {
+                            id: sub_id,
+                            problem: prob_name.clone(),
+                            name: player.clone(),
+                        },
+                        inner: JudgeEvent::SubmissionDone(ce_report.clone()),
+                    });
+                }
+                final_reports.insert(sub_id, ce_report);
+            }
+            PreparedCandidate::Failed(sub_id, player, prob_name, err) => {
+                let done = completed_submissions_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if format == OutputFormat::Human && !cli.tui {
+                    let msg = format!(
+                        "[{done}/{total_submissions_count}] {player} / {prob_name} -> JudgeFailed ({err})"
+                    );
+                    if let Some(ref p) = pb {
+                        p.println(msg);
+                    } else {
+                        println!("{msg}");
+                    }
+                }
+                let fail_report = SubmissionJudgeReport {
+                    schema_version: 1,
+                    problem: prob_name.clone(),
+                    submission: format!("{player} - {prob_name}"),
+                    verdict: Verdict::JudgeFailed,
+                    score: 0.0,
+                    max_time_ms: 0,
+                    max_memory_kb: 0,
+                    subtasks: vec![],
+                    tests: vec![],
+                };
+                if let Some(ref ptx) = pool_events_opt {
+                    let _ = ptx.send(PoolEvent {
+                        submission: SubmissionRef {
+                            id: sub_id,
+                            problem: prob_name.clone(),
+                            name: player.clone(),
+                        },
+                        inner: JudgeEvent::SubmissionDone(fail_report.clone()),
+                    });
+                }
+                final_reports.insert(sub_id, fail_report);
+            }
+            PreparedCandidate::Ready(sub_id, player, prob_name, mut pool_sub) => {
+                let hub_tx = event_hub_tx.clone();
+                let (ev_tx, ev_rx) = unbounded::<JudgeEvent>();
+                pool_sub.events = Some(ev_tx);
+                let p_name = player.clone();
+                let pr_name = prob_name.clone();
+                std::thread::spawn(move || {
+                    while let Ok(ev) = ev_rx.recv() {
+                        let _ = hub_tx.send((p_name.clone(), pr_name.clone(), ev));
+                    }
+                });
+                pool_submissions.push(pool_sub);
+                pool_sub_meta.push((sub_id, player, prob_name));
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase B / C: JudgePool Evaluation and Precise Rejudging
+    // -------------------------------------------------------------------------
+    let topology = Topology::detect(0, cli.jobs);
+    let slots = topology.slots.len().max(1);
+    let slot_cpus: Vec<Option<usize>> = topology.slots.iter().map(|s| s.cpu_core).collect();
+
+    let tui_handle = if cli.tui {
+        let sub_metas: Vec<SubmissionMeta> = candidates
+            .iter()
+            .map(|cand| {
+                let test_names = if cand.prob_idx < problems.len() {
+                    problems[cand.prob_idx]
+                        .tests
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect()
+                } else {
+                    vec![]
+                };
+                SubmissionMeta {
+                    id: cand.sub_id,
+                    problem: cand.prob_name.clone(),
+                    name: cand.player.clone(),
+                    test_names,
+                }
+            })
+            .collect();
+        let title = format!(
+            "Contest: {}",
+            contest_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        let cancel_tui = cancel.clone();
+        let rx = pool_event_rx.clone();
+        Some(std::thread::spawn(move || {
+            let _ = run_multi_tui(&title, &sub_metas, slots, slot_cpus, rx, cancel_tui, true);
+        }))
+    } else {
+        None
+    };
+
+    let pool = JudgePool::new(PoolOptions {
+        sandbox_mode: sandbox_mode_str.to_string(),
+        require_tier: cli.require_tier,
+        slots,
+        window: (slots / 2).max(2),
+        memory_budget: Topology::memory_budget_bytes(),
+        pool_events: pool_events_opt,
+    });
+
+    let reports = pool.run(pool_submissions, cancel);
+    drop(pool);
+    drop(pool_event_tx);
+    drop(event_hub_tx);
+
+    if let Some(h) = listener_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = tui_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = ndjson_handle {
+        let _ = h.join();
+    }
+
+    if let Some(p) = pb {
+        p.finish_and_clear();
+    }
+
+    if cancel.is_cancelled() {
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
+
+    for ((sub_id, player, prob_name), rep_res) in pool_sub_meta.into_iter().zip(reports) {
+        match rep_res {
+            Ok(report) => {
+                final_reports.insert(sub_id, report);
+            }
+            Err(e) => {
+                eprintln!("  -> Judging failed for {player} / {prob_name}: {e}");
+                let fail_report = SubmissionJudgeReport {
+                    schema_version: 1,
+                    problem: prob_name.clone(),
+                    submission: format!("{player} - {prob_name}"),
+                    verdict: Verdict::JudgeFailed,
+                    score: 0.0,
+                    max_time_ms: 0,
+                    max_memory_kb: 0,
+                    subtasks: vec![],
+                    tests: vec![],
+                };
+                final_reports.insert(sub_id, fail_report);
+            }
+        }
+    }
+
+    for (sub_id, candidate) in candidates.iter().enumerate() {
+        if let Some(report) = final_reports.remove(&sub_id) {
+            if let Some(st) = standings_map.get_mut(&candidate.player) {
+                st.total_score += report.score;
+                st.total_time_ms += report.max_time_ms;
+                st.problem_results.insert(
+                    candidate.prob_name.clone(),
+                    (report.verdict, report.score, report.max_time_ms),
+                );
+            }
+            all_reports.push(report);
         }
     }
 
@@ -381,7 +749,43 @@ pub fn run_contest(
     }
 
     // Output results
-    if format == OutputFormat::Json {
+    if format == OutputFormat::Ndjson {
+        let standings_json: Vec<serde_json::Value> = standings
+            .iter()
+            .map(|st| {
+                let prob_map: serde_json::Map<String, serde_json::Value> = st
+                    .problem_results
+                    .iter()
+                    .map(|(p, (v, s, t))| {
+                        (
+                            p.clone(),
+                            serde_json::json!({
+                                "verdict": v,
+                                "score": s,
+                                "time_ms": t,
+                            }),
+                        )
+                    })
+                    .collect();
+
+                serde_json::json!({
+                    "rank": st.rank,
+                    "name": st.name,
+                    "total_score": st.total_score,
+                    "total_time_ms": st.total_time_ms,
+                    "problems": prob_map,
+                })
+            })
+            .collect();
+
+        let out = serde_json::json!({
+            "event": "contest_finished",
+            "ok": true,
+            "standings": standings_json,
+        });
+        println!("{}", serde_json::to_string(&out).unwrap());
+        return ExitCode::from(EXIT_SUCCESS);
+    } else if format == OutputFormat::Json {
         let standings_json: Vec<serde_json::Value> = standings
             .iter()
             .map(|st| {
@@ -418,6 +822,7 @@ pub fn run_contest(
             "standings": standings_json,
             "html_report": html_path.to_string_lossy().to_string(),
             "csv_report": csv_path.to_string_lossy().to_string(),
+            "reports": all_reports,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else if format == OutputFormat::Human {

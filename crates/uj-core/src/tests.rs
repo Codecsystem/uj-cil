@@ -124,7 +124,13 @@ pub fn discover_tests(
         });
     }
 
-    // Map subtasks and distribute weights
+    assign_subtasks_and_weights(&mut cases, config);
+
+    Ok(cases)
+}
+
+/// Assign subtask IDs and weights to test cases based on problem configuration.
+pub fn assign_subtasks_and_weights(cases: &mut [TestCase], config: &ProblemConfig) {
     if config.subtasks.is_empty() {
         // Default: Evenly distribute 100 points among all test cases.
         // Remainder is distributed to the first remainder cases.
@@ -166,8 +172,6 @@ pub fn discover_tests(
             }
         }
     }
-
-    Ok(cases)
 }
 
 /// A parsed, reusable pattern for subtask test matching.

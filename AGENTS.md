@@ -43,10 +43,13 @@ uj-cil/
 │   │   │   └── security.rs    # AppContainer Profile 独占创建、ACL 目录赋权与清理
 │   │   └── src/none.rs        # 无隔离回退实现 (Tier::None)
 │   ├── uj-engine/             # [评测调度] 多核调度器、编译器、大小核绑定
-│   │   ├── src/compiler.rs    # 多语言编译驱动与增量缓存
+│   │   ├── src/compiler.rs    # 多语言编译驱动与增量缓存 (支持按 hash 并发互斥)
 │   │   ├── src/judge.rs       # 题目评测主循环 (标准题、交互题、通信题、提交答案题)
 │   │   ├── src/scheduler.rs   # DAG 依赖拓扑驱动的线程池评测调度器
-│   │   └── src/topology.rs    # CPU 大小核识别与 P 核物理槽位独占绑定
+│   │   ├── src/topology.rs    # CPU 大小核识别与 P 核物理槽位独占绑定
+│   │   ├── src/pool.rs        # [Round 9] 全局多提交评测工作池与任务窃取 (JudgePool)
+│   │   ├── src/budget.rs      # [Round 9] 物理内存动态限额与预算管控 (MemoryBudget)
+│   │   └── src/context.rs     # [Round 9] 跨提交共享的 ProblemContext 与 SubmissionContext
 │   ├── uj-checker/            # [校验比较] 零拷贝比较器与第三方协议适配
 │   │   ├── src/builtin.rs     # mmap + memchr 内置快速比较器 (exact, wcmp, fcmp 等)
 │   │   ├── src/testlib.rs     # Testlib XML/Appes 协议适配与 SPJ 执行
@@ -56,9 +59,13 @@ uj-cil/
 │   │   ├── src/csv.rs         # CSV 格式导出
 │   │   └── src/schema.rs      # JSON Schema 定义与导出
 │   ├── uj-tui/                # [终端交互] Ratatui 实时监控看板
+│   │   ├── src/multi.rs       # [Round 9] 多提交 Master-Detail 监控看板
+│   │   └── src/pipeline.rs    # [Round 10] 出题流式执行三进度条与用例网格看板
 │   └── uj-cli/                # [命令行界面] 命令分发、流水线、MCP Server、Doctor 诊断
 │       ├── src/cli.rs         # Clap 派生参数定义
 │       ├── src/author_cmd.rs  # 出题自动化流水线 (build -> gen -> validate -> ans -> verify -> stress)
+│       ├── src/author_steps.rs# [Round 10] 流水线用例级细粒度串联执行与步骤抽象
+│       ├── src/contest_cmd.rs # [Round 9] 比赛批量多提交评测与全局池调度
 │       ├── src/judge_cmd.rs   # 独立评测与批量评测命令调度
 │       ├── src/mcp_server.rs  # Model Context Protocol stdio 交互服务端
 │       └── src/doctor.rs      # 宿主系统环境健康检查

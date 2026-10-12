@@ -1,4 +1,5 @@
 mod author_cmd;
+pub(crate) mod author_steps;
 mod cli;
 mod contest_cmd;
 mod doctor;

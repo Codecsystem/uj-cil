@@ -87,6 +87,12 @@ impl Topology {
             slots,
         }
     }
+
+    /// Return 80% of host available memory in bytes for MemoryBudget.
+    pub fn memory_budget_bytes() -> u64 {
+        let caps = HOST_CAPABILITIES.lock();
+        (caps.available_mem_bytes as f64 * 0.8) as u64
+    }
 }
 
 #[cfg(test)]

@@ -646,3 +646,596 @@ int main() {
     assert_eq!(report["verdict"], "AC");
     assert_eq!(report["score"], 100.0);
 }
+
+#[test]
+fn test_pipeline_early_invalid_case() {
+    let _guard = lock_test();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let pdir = temp.path();
+
+    let problem_toml = r#"schema = 1
+name = "early_fail"
+type = "traditional"
+validator = "validator.cpp"
+
+[limits]
+time = "1s"
+memory = "256MB"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+
+[[tests.gen]]
+generator = "gen.cpp"
+args = "test"
+count = 200
+
+[[solutions]]
+path = "solutions/std.cpp"
+tag = "main"
+"#;
+    std::fs::write(pdir.join("problem.toml"), problem_toml).unwrap();
+
+    let gen_cpp = r#"#include <iostream>
+#include <string>
+#include <thread>
+#include <chrono>
+
+int main(int argc, char* argv[]) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::string arg = (argc > 2) ? argv[2] : "";
+    if (arg == "2") {
+        std::cout << "-999\n";
+    } else {
+        std::cout << "42\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("gen.cpp"), gen_cpp).unwrap();
+
+    let val_cpp = r#"#include <iostream>
+
+int main() {
+    int x = 0;
+    if (std::cin >> x) {
+        if (x < 0) {
+            std::cerr << "Value must be non-negative\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("validator.cpp"), val_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("solutions")).unwrap();
+    let std_cpp = r#"#include <iostream>
+int main() {
+    int x;
+    if (std::cin >> x) {
+        std::cout << x * 2 << "\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("solutions/std.cpp"), std_cpp).unwrap();
+
+    let output = uj_cmd()
+        .arg("pipeline")
+        .arg("-p")
+        .arg(pdir)
+        .arg("--format")
+        .arg("human")
+        .output()
+        .expect("Failed to execute uj pipeline");
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Validator failed on test '2'"),
+        "stderr should contain validator failure on test '2', got: {stderr}"
+    );
+
+    let in_count = std::fs::read_dir(pdir.join("tests"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "in"))
+        .count();
+    assert!(
+        in_count < 200,
+        "Expected fewer than 200 cases generated due to early termination, got: {in_count}"
+    );
+}
+
+#[test]
+fn test_pipeline_steps_aborted_status() {
+    let _guard = lock_test();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let pdir = temp.path();
+
+    let problem_toml = r#"schema = 1
+name = "early_fail_json"
+type = "traditional"
+validator = "validator.cpp"
+
+[limits]
+time = "1s"
+memory = "256MB"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+
+[[tests.gen]]
+generator = "gen.cpp"
+args = "test"
+count = 200
+
+[[solutions]]
+path = "solutions/std.cpp"
+tag = "main"
+"#;
+    std::fs::write(pdir.join("problem.toml"), problem_toml).unwrap();
+
+    let gen_cpp = r#"#include <iostream>
+#include <string>
+#include <thread>
+#include <chrono>
+
+int main(int argc, char* argv[]) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::string arg = (argc > 2) ? argv[2] : "";
+    if (arg == "2") {
+        std::cout << "-999\n";
+    } else {
+        std::cout << "42\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("gen.cpp"), gen_cpp).unwrap();
+
+    let val_cpp = r#"#include <iostream>
+
+int main() {
+    int x = 0;
+    if (std::cin >> x) {
+        if (x < 0) {
+            std::cerr << "Value must be non-negative\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("validator.cpp"), val_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("solutions")).unwrap();
+    let std_cpp = r#"#include <iostream>
+int main() {
+    int x;
+    if (std::cin >> x) {
+        std::cout << x * 2 << "\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("solutions/std.cpp"), std_cpp).unwrap();
+
+    let output = uj_cmd()
+        .arg("pipeline")
+        .arg("-p")
+        .arg(pdir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj pipeline");
+
+    assert_eq!(output.status.code(), Some(3));
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let pipe_json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+
+    assert_eq!(pipe_json["ok"], false);
+    assert_eq!(pipe_json["failed_step"], "validate");
+    let steps = pipe_json["steps"].as_array().expect("steps array");
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[0]["name"], "build");
+    assert_eq!(steps[0]["status"], "success");
+    assert_eq!(steps[1]["name"], "gen");
+    assert_eq!(steps[1]["status"], "aborted");
+    assert_eq!(steps[2]["name"], "validate");
+    assert_eq!(steps[2]["status"], "failed");
+}
+
+#[test]
+fn test_pipeline_handwritten_cases_validated() {
+    let _guard = lock_test();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let pdir = temp.path();
+
+    let problem_toml = r#"schema = 1
+name = "handwritten_test"
+type = "traditional"
+validator = "validator.cpp"
+
+[limits]
+time = "1s"
+memory = "256MB"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+
+[[tests.gen]]
+generator = "gen.cpp"
+args = "test"
+count = 2
+
+[[subtasks]]
+id = 1
+score = 100.0
+scoring = "min"
+tests = ["*"]
+
+[[solutions]]
+path = "solutions/std.cpp"
+tag = "main"
+"#;
+    std::fs::write(pdir.join("problem.toml"), problem_toml).unwrap();
+
+    let gen_cpp = r#"#include <iostream>
+int main() {
+    std::cout << "10\n";
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("gen.cpp"), gen_cpp).unwrap();
+
+    let val_cpp = r#"#include <iostream>
+int main() {
+    int x = 0;
+    if (std::cin >> x) {
+        if (x <= 0) return 1;
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("validator.cpp"), val_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("solutions")).unwrap();
+    let std_cpp = r#"#include <iostream>
+int main() {
+    int x;
+    if (std::cin >> x) {
+        std::cout << x + 5 << "\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("solutions/std.cpp"), std_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("tests")).unwrap();
+    std::fs::write(pdir.join("tests/sample1.in"), "20\n").unwrap();
+
+    let output = uj_cmd()
+        .arg("pipeline")
+        .arg("-p")
+        .arg(pdir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj pipeline");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Pipeline failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(pdir.join("tests/sample1.ans").is_file());
+    let sample1_ans = std::fs::read_to_string(pdir.join("tests/sample1.ans")).unwrap();
+    assert_eq!(sample1_ans.trim(), "25");
+
+    assert!(pdir.join("tests/1.ans").is_file());
+    assert!(pdir.join("tests/2.ans").is_file());
+}
+
+#[test]
+fn test_pipeline_subtask_group_arg() {
+    let _guard = lock_test();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let pdir = temp.path();
+
+    let problem_toml = r#"schema = 1
+name = "subtask_group_test"
+type = "traditional"
+validator = "validator.cpp"
+
+[limits]
+time = "1s"
+memory = "256MB"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+
+[[subtasks]]
+id = 1
+score = 30.0
+scoring = "sum"
+tests = ["sample*"]
+
+[[subtasks]]
+id = 2
+score = 70.0
+scoring = "sum"
+tests = ["data*"]
+
+[[solutions]]
+path = "solutions/std.cpp"
+tag = "main"
+"#;
+    std::fs::write(pdir.join("problem.toml"), problem_toml).unwrap();
+
+    let val_cpp = r#"#include <iostream>
+#include <string>
+
+int main(int argc, char* argv[]) {
+    int group = -1;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--group") {
+            group = std::stoi(argv[i + 1]);
+            break;
+        }
+    }
+    int x = 0;
+    std::cin >> x;
+    if (x == 100 && group != 1) {
+        std::cerr << "Expected group 1 for sample, got " << group << "\n";
+        return 1;
+    }
+    if (x == 200 && group != 2) {
+        std::cerr << "Expected group 2 for normal, got " << group << "\n";
+        return 1;
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("validator.cpp"), val_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("solutions")).unwrap();
+    let std_cpp = r#"#include <iostream>
+int main() {
+    int x;
+    if (std::cin >> x) {
+        std::cout << x << "\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("solutions/std.cpp"), std_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("tests")).unwrap();
+    std::fs::write(pdir.join("tests/sample1.in"), "100\n").unwrap();
+    std::fs::write(pdir.join("tests/data1.in"), "200\n").unwrap();
+
+    let output = uj_cmd()
+        .arg("pipeline")
+        .arg("-p")
+        .arg(pdir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj pipeline");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Pipeline failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_pipeline_cache_hit_rerun() {
+    let _guard = lock_test();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let pdir = temp.path();
+
+    let problem_toml = r#"schema = 1
+name = "cache_hit_test"
+type = "traditional"
+validator = "validator.cpp"
+
+[limits]
+time = "1s"
+memory = "256MB"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+
+[[tests.gen]]
+generator = "gen.cpp"
+args = "test"
+count = 3
+
+[[subtasks]]
+id = 1
+score = 100.0
+scoring = "min"
+tests = ["*"]
+
+[[solutions]]
+path = "solutions/std.cpp"
+tag = "main"
+"#;
+    std::fs::write(pdir.join("problem.toml"), problem_toml).unwrap();
+
+    let gen_cpp = r#"#include <iostream>
+int main() {
+    std::cout << "50\n";
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("gen.cpp"), gen_cpp).unwrap();
+
+    let val_cpp = r#"#include <iostream>
+int main() {
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("validator.cpp"), val_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("solutions")).unwrap();
+    let std_cpp = r#"#include <iostream>
+int main() {
+    int x;
+    if (std::cin >> x) {
+        std::cout << x * 3 << "\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("solutions/std.cpp"), std_cpp).unwrap();
+
+    // First run
+    let out1 = uj_cmd()
+        .arg("pipeline")
+        .arg("-p")
+        .arg(pdir)
+        .output()
+        .expect("Failed to execute uj pipeline run 1");
+    assert_eq!(
+        out1.status.code(),
+        Some(0),
+        "Run 1 failed: stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    let mtime_1_in = std::fs::metadata(pdir.join("tests/1.in"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mtime_1_ans = std::fs::metadata(pdir.join("tests/1.ans"))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // Sleep briefly so any rewrite would show a different mtime
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Second run
+    let out2 = uj_cmd()
+        .arg("pipeline")
+        .arg("-p")
+        .arg(pdir)
+        .output()
+        .expect("Failed to execute uj pipeline run 2");
+    assert_eq!(
+        out2.status.code(),
+        Some(0),
+        "Run 2 failed: stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    let mtime_2_in = std::fs::metadata(pdir.join("tests/1.in"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mtime_2_ans = std::fs::metadata(pdir.join("tests/1.ans"))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    assert_eq!(
+        mtime_1_in, mtime_2_in,
+        "tests/1.in mtime changed on cached rerun!"
+    );
+    assert_eq!(
+        mtime_1_ans, mtime_2_ans,
+        "tests/1.ans mtime changed on cached rerun!"
+    );
+}
+
+#[test]
+fn test_pipeline_staged_fallback() {
+    let _guard = lock_test();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let pdir = temp.path();
+
+    let problem_toml = r#"schema = 1
+name = "staged_fallback_test"
+type = "traditional"
+validator = "validator.cpp"
+
+[limits]
+time = "1s"
+memory = "256MB"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+
+[[tests.gen]]
+generator = "gen.cpp"
+args = "test"
+count = 2
+
+[[solutions]]
+path = "solutions/std.cpp"
+tag = "main"
+"#;
+    std::fs::write(pdir.join("problem.toml"), problem_toml).unwrap();
+
+    let gen_cpp = r#"#include <iostream>
+int main() {
+    std::cout << "7\n";
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("gen.cpp"), gen_cpp).unwrap();
+
+    let val_cpp = r#"#include <iostream>
+int main() {
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("validator.cpp"), val_cpp).unwrap();
+
+    std::fs::create_dir_all(pdir.join("solutions")).unwrap();
+    let std_cpp = r#"#include <iostream>
+int main() {
+    int x;
+    if (std::cin >> x) {
+        std::cout << x * 10 << "\n";
+    }
+    return 0;
+}
+"#;
+    std::fs::write(pdir.join("solutions/std.cpp"), std_cpp).unwrap();
+
+    let output = uj_cmd()
+        .env("UJ_PIPELINE_STAGED", "1")
+        .arg("pipeline")
+        .arg("-p")
+        .arg(pdir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj pipeline");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Staged pipeline failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let pipe_json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(pipe_json["ok"], true);
+    assert_eq!(pipe_json["steps"].as_array().map(|a| a.len()), Some(6));
+}

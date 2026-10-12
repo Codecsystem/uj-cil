@@ -205,3 +205,88 @@ fn test_authoring_doctor_problem() {
     let report: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
     assert_eq!(report["ok"], true);
 }
+
+fn copy_dir_all(
+    src: impl AsRef<std::path::Path>,
+    dst: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_verify_parallel_order() {
+    let _guard = lock_test();
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let test_dir = scratch_dir.join("test_verify_order");
+    let _ = fs::remove_dir_all(&test_dir);
+
+    let aplusb_src = get_workspace_root().join("tests/problems/aplusb");
+    copy_dir_all(&aplusb_src, &test_dir).unwrap();
+
+    let p_toml = test_dir.join("problem.toml");
+    let mut toml_str = fs::read_to_string(&p_toml).unwrap();
+    toml_str.push_str(
+        r#"
+[[solutions]]
+path = "solutions/ac.cpp"
+tag = "accepted"
+
+[[solutions]]
+path = "solutions/wa.cpp"
+tag = "wrong_answer"
+
+[[solutions]]
+path = "solutions/tle.cpp"
+tag = "time_limit"
+"#,
+    );
+    fs::write(&p_toml, toml_str).unwrap();
+
+    let out = uj_cmd()
+        .arg("verify")
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("--format")
+        .arg("human")
+        .output()
+        .expect("Failed to execute uj verify");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "uj verify failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout_str.lines().filter(|l| l.starts_with("[")).collect();
+
+    assert_eq!(lines.len(), 3, "Expected 3 solution results: {stdout_str}");
+    assert!(
+        lines[0].contains("[1/3] solutions/ac.cpp (Accepted) -> OK"),
+        "Line 1 mismatch: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("[2/3] solutions/wa.cpp (WrongAnswer) -> OK"),
+        "Line 2 mismatch: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("[3/3] solutions/tle.cpp (TimeLimit) -> OK"),
+        "Line 3 mismatch: {}",
+        lines[2]
+    );
+
+    let _ = fs::remove_dir_all(&test_dir);
+}

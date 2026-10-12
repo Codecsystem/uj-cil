@@ -549,3 +549,44 @@ Agent 只需直接读取 `stress/fail-142.in` 文件，即可立即进入断点�
 4. **沙盒降级感知与环境自适应**：
    - 在未配置完整 cgroup v2 委派的轻量容器、无特权 Docker 或 WSL 环境中，`uj` 会自动降级为 `Tier::Degraded`（保留 namespace 与 seccomp 隔离，使用 POSIX rlimit 进行防护）。
    - Agent 自动化调度时，无需强求 `Full` 层级，直接采用默认 `--sandbox auto` 即可平滑适配任何宿主环境。
+
+---
+
+## 8. 高级并发与流式协议规范 (Concurrent & Streaming Protocols)
+
+### 8.1 比赛全局池评测与 NDJSON 事件流 (`uj contest --format ndjson`)
+
+在 `uj contest` 评测过程中指定 `--format ndjson` 时，评测引擎通过标准输出流式推送多提交信封事件（`PoolEvent`），单行 JSON 格式如下：
+
+```json
+{
+  "submission": {
+    "id": 0,
+    "problem": "aplusb",
+    "name": "ac1 - aplusb"
+  },
+  "event": "test_start",
+  "data": {
+    "id": "1",
+    "slot": 3
+  }
+}
+```
+
+- **`submission` 字段**：指示该事件归属的提交上下文（`id` 为递增提交序列号，`problem` 为题目名，`name` 为选手或解法名）。
+- **`event` 字段**：
+  - `test_start`：某个测试点开始在指定槽位（`slot`，对应所绑定的 CPU 核心）上执行。
+  - `test_done`：测试点运行完毕，`data` 包含测试用例裁定结果 `SingleTestResult`。
+  - `submission_done`：该提交的所有测试点已评测汇总完毕，`data` 包含整份提交报告 `SubmissionJudgeReport`。
+
+### 8.2 出题流水线用例级细粒度流式执行与 `aborted` 状态 (`uj pipeline`)
+
+在 `uj pipeline` 中，出题准备已由传统阶段化批处理升级为用例级串联模式（`gen(i) -> validate(i) -> ans(i)`）：
+
+1. **早期中断与 `aborted` 状态**：
+   - 当某个用例在生成（gen）或校验（validate）阶段发生异常时，流水线会立即通过 `CancelToken` 广播熔断；
+   - 熔断发生时，已启动并失败的阶段标记为 `"status": "failed"`；
+   - **由于前序步骤失败而被迫未启动的阶段，在 JSON / NDJSON 中明确标记为 `"status": "aborted"`**（区别于因无需执行而跳过的 `"skipped"`）；
+   - CI/CD 与 Agent 可根据 `"aborted"` 准确识别出被阻断的下游阶段。
+2. **渐进回退与调试降级（`UJ_PIPELINE_STAGED`）**：
+   - 若遇到特殊测试场景或旧版脚本兼容需求，可通过设置环境变量 `UJ_PIPELINE_STAGED=1` 强制回退到分阶段批处理模式（阶段 1 全量 gen ➡️ 阶段 2 全量 validate ➡️ 阶段 3 全量 ans）。

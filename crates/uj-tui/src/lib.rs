@@ -24,6 +24,12 @@ use uj_core::verdict::Verdict;
 use uj_report::result::{JudgeEvent, SingleTestResult, SubmissionJudgeReport, SubtaskResult};
 use uj_sandbox::CancelToken;
 
+pub mod multi;
+pub use multi::{SubmissionMeta, run_multi_tui};
+
+pub mod pipeline;
+pub use pipeline::{CaseStageEvent, Stage, run_pipeline_tui};
+
 /// Test case execution status in the live UI.
 #[derive(Debug, Clone)]
 pub enum TestCaseStatus {
@@ -116,15 +122,19 @@ impl TuiApp {
                     self.add_log(format!("{timestamp} FAILED compiling {target}"));
                 }
             }
-            JudgeEvent::TestStart { id, .. } => {
+            JudgeEvent::TestStart { id, slot, .. } => {
                 if let Some(entry) = self.test_entries.iter_mut().find(|(name, _)| *name == id) {
                     entry.1 = TestCaseStatus::Running;
                 }
-                // Assign to an idle slot
-                for slot in &mut self.slots {
-                    if slot.active_test.is_none() {
-                        slot.active_test = Some(id.clone());
-                        break;
+                if let Some(s) = slot.filter(|&s| s < self.slots.len()) {
+                    self.slots[s].active_test = Some(id.clone());
+                } else {
+                    // Assign to first idle slot
+                    for slot in &mut self.slots {
+                        if slot.active_test.is_none() {
+                            slot.active_test = Some(id.clone());
+                            break;
+                        }
                     }
                 }
             }
@@ -193,7 +203,7 @@ impl TuiApp {
 }
 
 /// RAII Guard ensuring terminal restoration on exit or panic.
-struct TerminalGuard;
+pub struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -519,11 +529,23 @@ fn draw_body(f: &mut Frame, app: &TuiApp, area: Rect) {
         ])
         .split(area);
 
-    draw_tests_table(f, app, body_split[0]);
+    draw_tests_table(
+        f,
+        &app.test_entries,
+        app.selected_idx,
+        &app.scroll_offset,
+        body_split[0],
+    );
     draw_right_panel(f, app, body_split[1]);
 }
 
-fn draw_tests_table(f: &mut Frame, app: &TuiApp, area: Rect) {
+pub fn draw_tests_table(
+    f: &mut Frame,
+    test_entries: &[(String, TestCaseStatus)],
+    selected_idx: usize,
+    scroll_offset: &std::cell::Cell<usize>,
+    area: Rect,
+) {
     let header_row = Row::new(vec![
         Cell::from("#").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Test").style(Style::default().add_modifier(Modifier::BOLD)),
@@ -535,17 +557,16 @@ fn draw_tests_table(f: &mut Frame, app: &TuiApp, area: Rect) {
     .style(Style::default().fg(Color::DarkGray));
 
     let visible_count = (area.height as usize).saturating_sub(4).max(1);
-    let mut offset = app.scroll_offset.get();
-    if app.selected_idx < offset {
-        offset = app.selected_idx;
-    } else if app.selected_idx >= offset + visible_count {
-        offset = app.selected_idx + 1 - visible_count;
+    let mut offset = scroll_offset.get();
+    if selected_idx < offset {
+        offset = selected_idx;
+    } else if selected_idx >= offset + visible_count {
+        offset = selected_idx + 1 - visible_count;
     }
-    app.scroll_offset.set(offset);
+    scroll_offset.set(offset);
 
-    let total_tests = app.test_entries.len();
-    let rows: Vec<Row> = app
-        .test_entries
+    let total_tests = test_entries.len();
+    let rows: Vec<Row> = test_entries
         .iter()
         .enumerate()
         .skip(offset)
@@ -595,7 +616,7 @@ fn draw_tests_table(f: &mut Frame, app: &TuiApp, area: Rect) {
                 }
             };
 
-            let row_style = if i == app.selected_idx {
+            let row_style = if i == selected_idx {
                 Style::default()
                     .bg(Color::Rgb(40, 50, 75))
                     .fg(Color::White)
@@ -814,6 +835,7 @@ mod tests {
         app.handle_event(JudgeEvent::TestStart {
             id: "1".to_string(),
             subtask: None,
+            slot: None,
         });
         assert_eq!(app.slots[0].active_test.as_deref(), Some("1"));
         assert!(matches!(app.test_entries[0].1, TestCaseStatus::Running));

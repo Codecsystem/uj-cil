@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_LANGUAGES_TOML: &str = include_str!("../../../assets/languages.toml");
@@ -92,6 +93,7 @@ struct CompileSessionInner {
     problem_limits: parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, u64, u64)>>,
     fast_results: parking_lot::Mutex<std::collections::HashMap<FastCompileKey, FastCompileValue>>,
     mtime_precheck: parking_lot::Mutex<std::collections::HashMap<PrecheckKey, PrecheckValue>>,
+    inflight: parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>,
 }
 
 fn run_command_with_timeout(
@@ -584,6 +586,32 @@ impl CompileSession {
         let base_cache_dir = problem_dir
             .map(|p| p.join(".uj").join("cache").join("bin"))
             .unwrap_or_else(|| PathBuf::from(".uj/cache/bin"));
+
+        let hash_lock = if !no_cache {
+            let mut inflight = self.inner.inflight.lock();
+            inflight
+                .entry(cache_hash.clone())
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+                .clone()
+        } else {
+            Arc::new(parking_lot::Mutex::new(()))
+        };
+        let _compile_guard = hash_lock.lock();
+
+        if !no_cache {
+            let fast_cache = self.inner.fast_results.lock();
+            if let Some(cached_res) = fast_cache.get(&cache_hash)
+                && cached_res.binary_path.exists()
+                && fs::metadata(&cached_res.binary_path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            {
+                let mut res = cached_res.clone();
+                res.cached = true;
+                res.duration_ms = start.elapsed().as_millis() as u64;
+                return Ok(res);
+            }
+        }
         let cache_dir = base_cache_dir.join(&cache_hash);
         let exe_ext = if cfg!(windows) { ".exe" } else { "" };
         let cached_bin = cache_dir.join(format!("prog{exe_ext}"));
@@ -893,6 +921,56 @@ mod tests {
         fs::write(&extra, b"grader updated content").unwrap();
         let hash2 = compute_sources_hash(&src, &[extra]).unwrap();
         assert_ne!(hash1, hash2);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_compile_same_source_concurrently() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("uj_test_concurrent_comp_{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let src = tmp_dir.join("aplusb.cpp");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let code = format!(
+            "#include <iostream>\n// nonce: {nonce}\nint main() {{ int a, b; if (std::cin >> a >> b) std::cout << a + b << std::endl; return 0; }}\n"
+        );
+        fs::write(&src, code.as_bytes()).unwrap();
+
+        let session = Arc::new(CompileSession::new());
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let session_clone = Arc::clone(&session);
+            let src_clone = src.clone();
+            handles.push(std::thread::spawn(move || {
+                session_clone.compile(&src_clone, false)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            let res = h.join().unwrap();
+            results.push(res);
+        }
+
+        if results[0].is_ok() {
+            let mut uncached_count = 0;
+            for r in &results {
+                let res = r.as_ref().unwrap();
+                assert!(res.binary_path.exists());
+                if !res.cached {
+                    uncached_count += 1;
+                }
+            }
+            assert_eq!(
+                uncached_count, 1,
+                "Only 1 thread should compile, others hit cache"
+            );
+        }
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

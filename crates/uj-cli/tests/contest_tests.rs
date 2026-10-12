@@ -238,3 +238,276 @@ fn test_contest_judging_and_leaderboard() {
     assert_eq!(standings[0]["total_score"], 100.0);
     assert_eq!(standings[0]["rank"], 1);
 }
+
+#[test]
+fn test_contest_ce_and_tle_tail() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let uj = uj_bin();
+    let temp = tempdir().unwrap();
+    let contest_dir = temp.path();
+
+    let tail_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/contests/tail");
+    if !tail_fixture.exists() {
+        return;
+    }
+    copy_dir_all(&tail_fixture, contest_dir).unwrap();
+
+    let json_output = Command::new(&uj)
+        .arg("--format")
+        .arg("json")
+        .arg("contest")
+        .arg(contest_dir)
+        .output()
+        .expect("failed to execute uj contest");
+
+    assert!(
+        json_output.status.success(),
+        "Contest execution failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+
+    let json_val: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json_output.stdout))
+            .expect("Must be valid JSON");
+
+    assert_eq!(json_val["ok"], true);
+    assert_eq!(json_val["problems_count"], 2);
+    assert_eq!(json_val["contestants_count"], 10);
+
+    let standings = json_val["standings"].as_array().unwrap();
+
+    // Check CE submission
+    let ce1 = standings
+        .iter()
+        .find(|s| s["name"] == "ce1")
+        .expect("ce1 not found");
+    assert_eq!(ce1["total_score"], 0.0);
+    assert_eq!(ce1["problems"]["aplusb"]["verdict"], "CE");
+    assert_eq!(ce1["problems"]["slowsum"]["verdict"], "CE");
+
+    // Check TLE submissions
+    let tle1 = standings
+        .iter()
+        .find(|s| s["name"] == "tle1")
+        .expect("tle1 not found");
+    assert_eq!(tle1["problems"]["aplusb"]["verdict"], "AC");
+    assert_eq!(tle1["problems"]["slowsum"]["verdict"], "TLE");
+
+    let tle2 = standings
+        .iter()
+        .find(|s| s["name"] == "tle2")
+        .expect("tle2 not found");
+    assert_eq!(tle2["problems"]["aplusb"]["verdict"], "AC");
+    assert_eq!(tle2["problems"]["slowsum"]["verdict"], "TLE");
+
+    // Check AC submissions
+    for name in &["ac1", "ac2", "ac3", "ac4", "ac5", "ac6"] {
+        let ac = standings
+            .iter()
+            .find(|s| s["name"] == *name)
+            .unwrap_or_else(|| panic!("{name} not found"));
+        assert_eq!(
+            ac["total_score"], 200.0,
+            "{name} total score should be 200.0"
+        );
+        assert_eq!(ac["problems"]["aplusb"]["verdict"], "AC");
+        assert_eq!(ac["problems"]["slowsum"]["verdict"], "AC");
+    }
+}
+
+#[test]
+fn test_contest_report_order_deterministic() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let uj = uj_bin();
+    let tail_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/contests/tail");
+    if !tail_fixture.exists() {
+        return;
+    }
+
+    // Run 1: --jobs 1
+    let temp1 = tempdir().unwrap();
+    copy_dir_all(&tail_fixture, temp1.path()).unwrap();
+    let out1 = Command::new(&uj)
+        .arg("--jobs")
+        .arg("1")
+        .arg("--format")
+        .arg("human")
+        .arg("contest")
+        .arg(temp1.path())
+        .output()
+        .expect("failed to execute uj contest with jobs 1");
+    assert!(
+        out1.status.success(),
+        "Jobs 1 failed: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // Run 2: --jobs 8
+    let temp2 = tempdir().unwrap();
+    copy_dir_all(&tail_fixture, temp2.path()).unwrap();
+    let out2 = Command::new(&uj)
+        .arg("--jobs")
+        .arg("8")
+        .arg("--format")
+        .arg("human")
+        .arg("contest")
+        .arg(temp2.path())
+        .output()
+        .expect("failed to execute uj contest with jobs 8");
+    assert!(
+        out2.status.success(),
+        "Jobs 8 failed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    let csv1 = fs::read_to_string(temp1.path().join("contest_report.csv")).unwrap();
+    let csv2 = fs::read_to_string(temp2.path().join("contest_report.csv")).unwrap();
+
+    // Strip time_ms (index 4) and memory_kb (index 5) columns:
+    // "submission,problem,test,verdict,time_ms,memory_kb,score" -> "submission,problem,test,verdict,score"
+    fn strip_dynamic_columns(csv: &str) -> Vec<String> {
+        csv.lines()
+            .map(|line| {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 7 {
+                    format!(
+                        "{},{},{},{},{}",
+                        parts[0], parts[1], parts[2], parts[3], parts[6]
+                    )
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
+
+    let rows1 = strip_dynamic_columns(&csv1);
+    let rows2 = strip_dynamic_columns(&csv2);
+
+    assert_eq!(rows1.len(), rows2.len(), "Row count must be identical");
+    for (idx, (r1, r2)) in rows1.iter().zip(rows2.iter()).enumerate() {
+        assert_eq!(r1, r2, "Row {idx} mismatch between --jobs 1 and --jobs 8");
+    }
+}
+
+#[test]
+fn test_contest_precise_after_pool() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let uj = uj_bin();
+    let temp = tempdir().unwrap();
+    let contest_dir = temp.path();
+
+    let tail_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/contests/tail");
+    if !tail_fixture.exists() {
+        return;
+    }
+    copy_dir_all(&tail_fixture, contest_dir).unwrap();
+
+    let out = Command::new(&uj)
+        .arg("--precise")
+        .arg("true")
+        .arg("--format")
+        .arg("json")
+        .arg("contest")
+        .arg(contest_dir)
+        .output()
+        .expect("failed to execute uj contest with precise");
+
+    assert!(
+        out.status.success(),
+        "Contest with precise failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json_val: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("Must be valid JSON");
+
+    // Check reports field in JSON output
+    let reports = json_val["reports"]
+        .as_array()
+        .expect("reports array expected in JSON");
+    let mut rejudged_found = false;
+    for rep in reports {
+        if let Some(tests) = rep["tests"].as_array() {
+            for t in tests {
+                if t["timing"]["rejudged"].as_bool() == Some(true) {
+                    rejudged_found = true;
+                    break;
+                }
+            }
+        }
+        if rejudged_found {
+            break;
+        }
+    }
+
+    let html_content = fs::read_to_string(contest_dir.join("contest_report.html")).unwrap();
+    assert!(
+        rejudged_found || html_content.contains("Rejudged"),
+        "Precise rejudging must be executed for borderline edge cases"
+    );
+}
+
+#[test]
+fn contest_ndjson_stream() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let uj = uj_bin();
+    let temp = tempdir().unwrap();
+    let contest_dir = temp.path();
+
+    let tail_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/contests/tail");
+    if !tail_fixture.exists() {
+        return;
+    }
+    copy_dir_all(&tail_fixture, contest_dir).unwrap();
+
+    let out = Command::new(&uj)
+        .arg("--format")
+        .arg("ndjson")
+        .arg("contest")
+        .arg(contest_dir)
+        .output()
+        .expect("failed to execute uj contest with ndjson");
+
+    assert!(
+        out.status.success(),
+        "Contest with ndjson failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout_str
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert!(!lines.is_empty(), "Ndjson output must not be empty");
+
+    let mut event_count = 0;
+    for (idx, line) in lines.iter().enumerate() {
+        let val: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("Line {idx} is not valid JSON: '{line}': {e}"));
+        if idx == lines.len() - 1 {
+            assert_eq!(val["event"], "contest_finished");
+            assert_eq!(val["ok"], true);
+            assert!(val["standings"].is_array());
+        } else {
+            assert!(
+                val.get("submission").is_some(),
+                "PoolEvent must contain submission ref: {line}"
+            );
+            assert!(
+                val.get("event").is_some(),
+                "PoolEvent must contain event name: {line}"
+            );
+            event_count += 1;
+        }
+    }
+    assert!(
+        event_count > 0,
+        "Must have streamed pool events before contest_finished"
+    );
+}
