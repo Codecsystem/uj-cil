@@ -13,6 +13,8 @@ static COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 pub struct CgroupV2 {
     path: PathBuf,
+    cpu_stat_file: parking_lot::Mutex<Option<fs::File>>,
+    mem_events_file: parking_lot::Mutex<Option<fs::File>>,
 }
 
 fn enable_subtree_controllers(dir: &Path) {
@@ -166,7 +168,11 @@ impl CgroupV2 {
             ))
         })?;
 
-        Ok(Self { path: sub_path })
+        Ok(Self {
+            path: sub_path,
+            cpu_stat_file: parking_lot::Mutex::new(None),
+            mem_events_file: parking_lot::Mutex::new(None),
+        })
     }
 
     pub fn set_limits(
@@ -235,11 +241,20 @@ impl CgroupV2 {
 
     /// Read total CPU time consumed by the cgroup in microseconds.
     pub fn read_cpu_time_us(&self) -> u64 {
-        let stat_file = self.path.join("cpu.stat");
-        if let Ok(content) = fs::read_to_string(stat_file) {
-            for line in content.lines() {
-                if let Some(rest) = line.strip_prefix("usage_usec ") {
-                    return rest.trim().parse::<u64>().unwrap_or(0);
+        use std::os::unix::fs::FileExt;
+        let mut guard = self.cpu_stat_file.lock();
+        if guard.is_none() {
+            *guard = fs::File::open(self.path.join("cpu.stat")).ok();
+        }
+        if let Some(ref f) = *guard {
+            let mut buf = [0u8; 512];
+            if let Ok(n) = f.read_at(&mut buf, 0)
+                && let Ok(content) = std::str::from_utf8(&buf[..n])
+            {
+                for line in content.lines() {
+                    if let Some(rest) = line.strip_prefix("usage_usec ") {
+                        return rest.trim().parse::<u64>().unwrap_or(0);
+                    }
                 }
             }
         }
@@ -248,15 +263,24 @@ impl CgroupV2 {
 
     /// Check if the cgroup triggered an out-of-memory event.
     pub fn read_oom_killed(&self) -> bool {
-        let events_file = self.path.join("memory.events");
-        if let Ok(content) = fs::read_to_string(events_file) {
-            for line in content.lines() {
-                if let Some(rest) = line
-                    .strip_prefix("oom_kill ")
-                    .or_else(|| line.strip_prefix("oom "))
-                    && rest.trim().parse::<u64>().is_ok_and(|count| count > 0)
-                {
-                    return true;
+        use std::os::unix::fs::FileExt;
+        let mut guard = self.mem_events_file.lock();
+        if guard.is_none() {
+            *guard = fs::File::open(self.path.join("memory.events")).ok();
+        }
+        if let Some(ref f) = *guard {
+            let mut buf = [0u8; 512];
+            if let Ok(n) = f.read_at(&mut buf, 0)
+                && let Ok(content) = std::str::from_utf8(&buf[..n])
+            {
+                for line in content.lines() {
+                    if let Some(rest) = line
+                        .strip_prefix("oom_kill ")
+                        .or_else(|| line.strip_prefix("oom "))
+                        && rest.trim().parse::<u64>().is_ok_and(|count| count > 0)
+                    {
+                        return true;
+                    }
                 }
             }
         }
@@ -282,6 +306,8 @@ impl CgroupV2 {
 
     /// Clean up and remove this cgroup directory.
     pub fn cleanup(&self) {
+        let _ = self.cpu_stat_file.lock().take();
+        let _ = self.mem_events_file.lock().take();
         self.kill();
         // Give kernel a brief moment to reap processes, then rmdir
         for _ in 0..10 {

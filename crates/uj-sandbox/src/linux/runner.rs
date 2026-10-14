@@ -73,20 +73,19 @@ pub fn execute_in_sandbox(
     cancel: &CancelToken,
     tier: Tier,
 ) -> Result<RunResult, SandboxError> {
-    execute_in_sandbox_with_stdio(spec, cgroup_base, cancel, tier, None, None)
+    execute_in_sandbox_with_stdio(spec, cgroup_base, cancel, tier, None, None, Vec::new())
 }
 
-/// Executes a single process in Linux sandbox with optional raw stdin/stdout fds.
+/// Executes a single process in Linux sandbox with optional owned stdin/stdout/extra fds.
 pub fn execute_in_sandbox_with_stdio(
     spec: &RunSpec,
     cgroup_base: Option<&Path>,
     cancel: &CancelToken,
     tier: Tier,
-    custom_stdin: Option<std::os::unix::io::RawFd>,
-    custom_stdout: Option<std::os::unix::io::RawFd>,
+    custom_stdin: Option<std::os::unix::io::OwnedFd>,
+    custom_stdout: Option<std::os::unix::io::OwnedFd>,
+    extra_owned_fds: Vec<std::os::unix::io::OwnedFd>,
 ) -> Result<RunResult, SandboxError> {
-    use std::os::unix::io::FromRawFd;
-
     if spec.argv.is_empty() {
         return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
     }
@@ -116,7 +115,7 @@ pub fn execute_in_sandbox_with_stdio(
 
     // Stdio
     if let Some(fd) = custom_stdin {
-        cmd.stdin(unsafe { StdProcessStdio::from(File::from_raw_fd(fd)) });
+        cmd.stdin(StdProcessStdio::from(fd));
     } else {
         match &spec.stdin {
             Stdio::Null => {
@@ -137,7 +136,7 @@ pub fn execute_in_sandbox_with_stdio(
 
     let capture_stdout = custom_stdout.is_none() && matches!(&spec.stdout, Stdio::Pipe);
     if let Some(fd) = custom_stdout {
-        cmd.stdout(unsafe { StdProcessStdio::from(File::from_raw_fd(fd)) });
+        cmd.stdout(StdProcessStdio::from(fd));
     } else {
         match &spec.stdout {
             Stdio::Null => {
@@ -167,6 +166,7 @@ pub fn execute_in_sandbox_with_stdio(
             .max(8 * 1024 * 1024)
     });
     let is_trusted = spec.trusted;
+    let extra_raw_fds: Vec<i32> = spec.extra_fds.iter().map(|f| f.0 as i32).collect();
 
     let host_exe = if exe_path.is_absolute() {
         exe_path.clone()
@@ -269,19 +269,6 @@ pub fn execute_in_sandbox_with_stdio(
         c_exe,
     ) = if let Some(ref rootfs) = jail_rootfs_path {
         let _ = fs::create_dir_all(rootfs);
-        for d in ["usr", "dev", "proc", "tmp", "box", "etc", "old_root"] {
-            let _ = fs::create_dir_all(rootfs.join(d));
-        }
-        for (link_name, target) in [
-            ("bin", "usr/bin"),
-            ("lib", "usr/lib"),
-            ("lib64", "usr/lib64"),
-        ] {
-            let link_path = rootfs.join(link_name);
-            if !link_path.exists() {
-                let _ = std::os::unix::fs::symlink(target, &link_path);
-            }
-        }
 
         let c_rootfs = std::ffi::CString::new(rootfs.to_string_lossy().as_bytes())
             .map_err(|e| SandboxError::Internal(format!("Invalid rootfs path: {e}")))?;
@@ -764,17 +751,41 @@ pub fn execute_in_sandbox_with_stdio(
                     // Child is now PID 1 in the new PID namespace!
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
 
-                    let status_tx_fd = 3;
-                    if status_write_fd != status_tx_fd {
-                        if libc::dup2(status_write_fd, status_tx_fd) < 0 {
+                    let num_extra = extra_raw_fds.len().min(64);
+                    let status_tx_fd = 3 + num_extra as i32;
+                    let min_safe = status_tx_fd + 10;
+                    let mut temp_fds = [0i32; 64];
+                    for i in 0..num_extra {
+                        let dup_fd = libc::fcntl(extra_raw_fds[i], libc::F_DUPFD_CLOEXEC, min_safe);
+                        if dup_fd < 0 {
                             libc::_exit(124);
                         }
+                        temp_fds[i] = dup_fd;
+                    }
+                    let temp_status_fd =
+                        libc::fcntl(status_write_fd, libc::F_DUPFD_CLOEXEC, min_safe);
+                    if temp_status_fd < 0 {
+                        libc::_exit(124);
+                    }
+                    for (i, &tfd) in temp_fds.iter().enumerate().take(num_extra) {
+                        let target_fd = 3 + i as i32;
+                        if libc::dup2(tfd, target_fd) < 0 {
+                            libc::_exit(124);
+                        }
+                        libc::close(tfd);
+                    }
+                    if libc::dup2(temp_status_fd, status_tx_fd) < 0 {
+                        libc::_exit(124);
+                    }
+                    libc::close(temp_status_fd);
+                    if status_write_fd > status_tx_fd {
                         libc::close(status_write_fd);
                     }
 
-                    // Close all fds >= 4 so parent Command::spawn() error pipe reaches EOF
-                    if libc::syscall(libc::SYS_close_range, 4, !0u32, 0) != 0 {
-                        for fd in 4..256 {
+                    // Close all fds > status_tx_fd so parent Command::spawn() error pipe reaches EOF
+                    let close_from = (status_tx_fd + 1) as u32;
+                    if libc::syscall(libc::SYS_close_range, close_from, !0u32, 0) != 0 {
+                        for fd in (close_from as i32)..256 {
                             libc::close(fd);
                         }
                     }
@@ -967,6 +978,26 @@ pub fn execute_in_sandbox_with_stdio(
                 };
                 libc::setrlimit(libc::RLIMIT_CORE, &rlim_zero);
 
+                let num_extra = extra_raw_fds.len().min(64);
+                if num_extra > 0 {
+                    let min_safe = 3 + num_extra as i32 + 10;
+                    let mut temp_fds = [0i32; 64];
+                    for i in 0..num_extra {
+                        let dup_fd = libc::fcntl(extra_raw_fds[i], libc::F_DUPFD_CLOEXEC, min_safe);
+                        if dup_fd < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        temp_fds[i] = dup_fd;
+                    }
+                    for (i, &tfd) in temp_fds.iter().enumerate().take(num_extra) {
+                        let target_fd = 3 + i as i32;
+                        if libc::dup2(tfd, target_fd) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        libc::close(tfd);
+                    }
+                }
+
                 Ok(())
             }
         });
@@ -985,6 +1016,8 @@ pub fn execute_in_sandbox_with_stdio(
             )));
         }
     };
+
+    drop(extra_owned_fds);
 
     // Close supervisor's write end of the status pipe
     unsafe {
@@ -1005,8 +1038,8 @@ pub fn execute_in_sandbox_with_stdio(
         let mut stdout = child.stdout.take().unwrap();
         let ole = ole_flag.clone();
         Some(thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
+            let mut buf = Vec::with_capacity(stdout_limit.min(65536));
+            let mut chunk = vec![0u8; 65536];
             while let Ok(n) = stdout.read(&mut chunk) {
                 if n == 0 {
                     break;
@@ -1028,8 +1061,8 @@ pub fn execute_in_sandbox_with_stdio(
     let stderr_handle = {
         let mut stderr = child.stderr.take().unwrap();
         Some(thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
+            let mut buf = Vec::with_capacity(stderr_limit.min(65536));
+            let mut chunk = vec![0u8; 65536];
             while let Ok(n) = stderr.read(&mut chunk) {
                 if n == 0 {
                     break;
@@ -1263,13 +1296,17 @@ pub fn execute_group_in_sandbox(
     cancel: &CancelToken,
     tier: Tier,
 ) -> Result<Vec<RunResult>, SandboxError> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
     if specs.is_empty() {
         return Ok(Vec::new());
     }
 
     let n = specs.len();
-    let mut wired_stdins: Vec<Option<std::os::unix::io::RawFd>> = vec![None; n];
-    let mut wired_stdouts: Vec<Option<std::os::unix::io::RawFd>> = vec![None; n];
+    let mut specs = specs.to_vec();
+    let mut wired_stdins: Vec<Option<OwnedFd>> = (0..n).map(|_| None).collect();
+    let mut wired_stdouts: Vec<Option<OwnedFd>> = (0..n).map(|_| None).collect();
+    let mut extra_owned: Vec<Vec<OwnedFd>> = (0..n).map(|_| Vec::new()).collect();
 
     for conn in &wiring.connections {
         if conn.from_proc >= n || conn.to_proc >= n {
@@ -1278,23 +1315,99 @@ pub fn execute_group_in_sandbox(
                 conn.from_proc, conn.to_proc, n
             )));
         }
+        if wired_stdouts[conn.from_proc].is_some() || wired_stdins[conn.to_proc].is_some() {
+            return Err(SandboxError::Internal(format!(
+                "Duplicate stdio wiring connection from {} to {}",
+                conn.from_proc, conn.to_proc
+            )));
+        }
         let mut fds = [0i32; 2];
         let res = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
         if res != 0 {
             return Err(SandboxError::Io(std::io::Error::last_os_error()));
         }
-        wired_stdouts[conn.from_proc] = Some(fds[1]);
-        wired_stdins[conn.to_proc] = Some(fds[0]);
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        wired_stdouts[conn.from_proc] = Some(write_fd);
+        wired_stdins[conn.to_proc] = Some(read_fd);
+    }
+
+    if let Some(mgr_idx) = wiring.star_manager_proc {
+        if mgr_idx >= n {
+            return Err(SandboxError::Internal(format!(
+                "Invalid star_manager_proc {} (total procs: {})",
+                mgr_idx, n
+            )));
+        }
+        let mut star_fds_env = Vec::new();
+        for p in 0..n {
+            if p == mgr_idx {
+                continue;
+            }
+            if wired_stdins[p].is_some() || wired_stdouts[p].is_some() {
+                return Err(SandboxError::Internal(format!(
+                    "Duplicate stdio wiring for star participant {p}"
+                )));
+            }
+            let mut fds1 = [0i32; 2];
+            if unsafe { libc::pipe2(fds1.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(SandboxError::Io(std::io::Error::last_os_error()));
+            }
+            let p_to_m_read = unsafe { OwnedFd::from_raw_fd(fds1[0]) };
+            let p_to_m_write = unsafe { OwnedFd::from_raw_fd(fds1[1]) };
+
+            let mut fds2 = [0i32; 2];
+            if unsafe { libc::pipe2(fds2.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(SandboxError::Io(std::io::Error::last_os_error()));
+            }
+            let m_to_p_read = unsafe { OwnedFd::from_raw_fd(fds2[0]) };
+            let m_to_p_write = unsafe { OwnedFd::from_raw_fd(fds2[1]) };
+
+            wired_stdouts[p] = Some(p_to_m_write);
+            wired_stdins[p] = Some(m_to_p_read);
+
+            let r_target = 3 + specs[mgr_idx].extra_fds.len();
+            let w_target = r_target + 1;
+            specs[mgr_idx]
+                .extra_fds
+                .push(uj_core::run::RawFdOrHandle(p_to_m_read.as_raw_fd() as usize));
+            specs[mgr_idx].extra_fds.push(uj_core::run::RawFdOrHandle(
+                m_to_p_write.as_raw_fd() as usize
+            ));
+            extra_owned[mgr_idx].push(p_to_m_read);
+            extra_owned[mgr_idx].push(m_to_p_write);
+
+            specs[mgr_idx]
+                .argv
+                .push(std::ffi::OsString::from(r_target.to_string()));
+            specs[mgr_idx]
+                .argv
+                .push(std::ffi::OsString::from(w_target.to_string()));
+            star_fds_env.push(format!("{r_target},{w_target}"));
+        }
+        specs[mgr_idx].env.push((
+            std::ffi::OsString::from("UJ_STAR_FDS"),
+            std::ffi::OsString::from(star_fds_env.join(";")),
+        ));
     }
 
     // Run specs concurrently in worker threads
     let results: Result<Vec<RunResult>, SandboxError> = thread::scope(|s| {
         let mut handles = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
-            let in_fd = wired_stdins[i];
-            let out_fd = wired_stdouts[i];
+            let in_fd = wired_stdins[i].take();
+            let out_fd = wired_stdouts[i].take();
+            let ex_fds = std::mem::take(&mut extra_owned[i]);
             handles.push(s.spawn(move || {
-                execute_in_sandbox_with_stdio(spec, cgroup_base, cancel, tier, in_fd, out_fd)
+                execute_in_sandbox_with_stdio(
+                    spec,
+                    cgroup_base,
+                    cancel,
+                    tier,
+                    in_fd,
+                    out_fd,
+                    ex_fds,
+                )
             }));
         }
 
@@ -1314,4 +1427,137 @@ pub fn execute_group_in_sandbox(
     });
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PipeConnection;
+    use uj_core::run::Limits;
+
+    fn count_open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|it| it.count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_execute_group_partial_error_no_fd_leak() {
+        let temp_dir = std::env::temp_dir();
+        let spec0 = RunSpec {
+            argv: vec!["/bin/true".into()],
+            env: vec![],
+            work_dir: temp_dir.clone(),
+            ro_binds: vec![],
+            stdin: Stdio::Pipe,
+            stdout: Stdio::Pipe,
+            stderr: Stdio::Pipe,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+        let spec1 = RunSpec {
+            argv: vec![], // Invalid empty argv causes immediate early error in worker
+            env: vec![],
+            work_dir: temp_dir,
+            ro_binds: vec![],
+            stdin: Stdio::Pipe,
+            stdout: Stdio::Pipe,
+            stderr: Stdio::Pipe,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+        let wiring = Wiring {
+            connections: vec![
+                PipeConnection {
+                    from_proc: 0,
+                    to_proc: 1,
+                },
+                PipeConnection {
+                    from_proc: 1,
+                    to_proc: 0,
+                },
+            ],
+            star_manager_proc: None,
+        };
+        let cancel = CancelToken::new();
+
+        // Warm-up
+        let _ = execute_group_in_sandbox(
+            &[spec0.clone(), spec1.clone()],
+            &wiring,
+            None,
+            &cancel,
+            Tier::Degraded,
+        );
+        let before_fds = count_open_fds();
+
+        for _ in 0..30 {
+            let res = execute_group_in_sandbox(
+                &[spec0.clone(), spec1.clone()],
+                &wiring,
+                None,
+                &cancel,
+                Tier::Degraded,
+            );
+            assert!(res.is_err());
+        }
+
+        let after_fds = count_open_fds();
+        assert!(
+            after_fds <= before_fds + 5,
+            "FD leak detected! before={before_fds}, after={after_fds}"
+        );
+    }
+
+    #[test]
+    fn test_execute_group_duplicate_wiring_rejected() {
+        let temp_dir = std::env::temp_dir();
+        let spec = RunSpec {
+            argv: vec!["/bin/true".into()],
+            env: vec![],
+            work_dir: temp_dir,
+            ro_binds: vec![],
+            stdin: Stdio::Null,
+            stdout: Stdio::Null,
+            stderr: Stdio::Null,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+        let dup_wiring = Wiring {
+            connections: vec![
+                PipeConnection {
+                    from_proc: 0,
+                    to_proc: 1,
+                },
+                PipeConnection {
+                    from_proc: 0,
+                    to_proc: 1,
+                },
+            ],
+            star_manager_proc: None,
+        };
+        let cancel = CancelToken::new();
+        let res = execute_group_in_sandbox(
+            &[spec.clone(), spec],
+            &dup_wiring,
+            None,
+            &cancel,
+            Tier::Degraded,
+        );
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Duplicate stdio wiring")
+        );
+    }
 }

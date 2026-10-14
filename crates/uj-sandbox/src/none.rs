@@ -16,7 +16,9 @@ use crate::ntstatus::is_ntstatus_exception;
 use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
 
 #[cfg(unix)]
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 pub struct NoneSandbox;
 
@@ -29,8 +31,9 @@ impl NoneSandbox {
         &self,
         spec: &RunSpec,
         cancel: &CancelToken,
-        #[cfg(unix)] custom_stdin: Option<RawFd>,
-        #[cfg(unix)] custom_stdout: Option<RawFd>,
+        #[cfg(unix)] custom_stdin: Option<OwnedFd>,
+        #[cfg(unix)] custom_stdout: Option<OwnedFd>,
+        #[cfg(unix)] extra_owned_fds: Vec<OwnedFd>,
     ) -> Result<RunResult, SandboxError> {
         if spec.argv.is_empty() {
             return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
@@ -54,7 +57,7 @@ impl NoneSandbox {
         // Stdio setup
         #[cfg(unix)]
         if let Some(fd) = custom_stdin {
-            cmd.stdin(unsafe { StdProcessStdio::from(File::from_raw_fd(fd)) });
+            cmd.stdin(StdProcessStdio::from(fd));
         } else {
             match &spec.stdin {
                 Stdio::Null => {
@@ -96,7 +99,7 @@ impl NoneSandbox {
 
         #[cfg(unix)]
         if let Some(fd) = custom_stdout {
-            cmd.stdout(unsafe { StdProcessStdio::from(File::from_raw_fd(fd)) });
+            cmd.stdout(StdProcessStdio::from(fd));
         } else {
             match &spec.stdout {
                 Stdio::Null => {
@@ -134,10 +137,39 @@ impl NoneSandbox {
         // Always pipe stderr to capture diagnostics
         cmd.stderr(StdProcessStdio::piped());
 
+        #[cfg(unix)]
+        if !spec.extra_fds.is_empty() {
+            let extra_raw_fds: Vec<i32> = spec.extra_fds.iter().map(|f| f.0 as i32).collect();
+            unsafe {
+                cmd.pre_exec(move || {
+                    let min_safe = 3 + extra_raw_fds.len() as i32 + 10;
+                    let mut temp_fds = Vec::with_capacity(extra_raw_fds.len());
+                    for &src_fd in &extra_raw_fds {
+                        let dup_fd = libc::fcntl(src_fd, libc::F_DUPFD_CLOEXEC, min_safe);
+                        if dup_fd < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        temp_fds.push(dup_fd);
+                    }
+                    for (idx, &tfd) in temp_fds.iter().enumerate() {
+                        let target_fd = 3 + idx as i32;
+                        if libc::dup2(tfd, target_fd) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        libc::close(tfd);
+                    }
+                    Ok(())
+                });
+            }
+        }
+
         let start_time = Instant::now();
         let mut child = cmd
             .spawn()
             .map_err(|e| SandboxError::Internal(format!("Failed to spawn child: {e}")))?;
+
+        #[cfg(unix)]
+        drop(extra_owned_fds);
 
         // Output capture channels and threads
         let stdout_limit = spec.limits.output_bytes as usize;
@@ -292,8 +324,10 @@ impl NoneSandbox {
         cancel: &CancelToken,
     ) -> Result<Vec<RunResult>, SandboxError> {
         let n = specs.len();
-        let mut wired_stdins: Vec<Option<RawFd>> = vec![None; n];
-        let mut wired_stdouts: Vec<Option<RawFd>> = vec![None; n];
+        let mut specs = specs.to_vec();
+        let mut wired_stdins: Vec<Option<OwnedFd>> = (0..n).map(|_| None).collect();
+        let mut wired_stdouts: Vec<Option<OwnedFd>> = (0..n).map(|_| None).collect();
+        let mut extra_owned: Vec<Vec<OwnedFd>> = (0..n).map(|_| Vec::new()).collect();
 
         for conn in &wiring.connections {
             if conn.from_proc >= n || conn.to_proc >= n {
@@ -302,22 +336,90 @@ impl NoneSandbox {
                     conn.from_proc, conn.to_proc, n
                 )));
             }
+            if wired_stdouts[conn.from_proc].is_some() || wired_stdins[conn.to_proc].is_some() {
+                return Err(SandboxError::Internal(format!(
+                    "Duplicate stdio wiring connection from {} to {}",
+                    conn.from_proc, conn.to_proc
+                )));
+            }
             let mut fds = [0i32; 2];
             let res = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
             if res != 0 {
                 return Err(SandboxError::Io(std::io::Error::last_os_error()));
             }
-            wired_stdouts[conn.from_proc] = Some(fds[1]);
-            wired_stdins[conn.to_proc] = Some(fds[0]);
+            let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            wired_stdouts[conn.from_proc] = Some(write_fd);
+            wired_stdins[conn.to_proc] = Some(read_fd);
+        }
+
+        if let Some(mgr_idx) = wiring.star_manager_proc {
+            if mgr_idx >= n {
+                return Err(SandboxError::Internal(format!(
+                    "Invalid star_manager_proc {} (total procs: {})",
+                    mgr_idx, n
+                )));
+            }
+            let mut star_fds_env = Vec::new();
+            for p in 0..n {
+                if p == mgr_idx {
+                    continue;
+                }
+                if wired_stdins[p].is_some() || wired_stdouts[p].is_some() {
+                    return Err(SandboxError::Internal(format!(
+                        "Duplicate stdio wiring for star participant {p}"
+                    )));
+                }
+                let mut fds1 = [0i32; 2];
+                if unsafe { libc::pipe2(fds1.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                    return Err(SandboxError::Io(std::io::Error::last_os_error()));
+                }
+                let p_to_m_read = unsafe { OwnedFd::from_raw_fd(fds1[0]) };
+                let p_to_m_write = unsafe { OwnedFd::from_raw_fd(fds1[1]) };
+
+                let mut fds2 = [0i32; 2];
+                if unsafe { libc::pipe2(fds2.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                    return Err(SandboxError::Io(std::io::Error::last_os_error()));
+                }
+                let m_to_p_read = unsafe { OwnedFd::from_raw_fd(fds2[0]) };
+                let m_to_p_write = unsafe { OwnedFd::from_raw_fd(fds2[1]) };
+
+                wired_stdouts[p] = Some(p_to_m_write);
+                wired_stdins[p] = Some(m_to_p_read);
+
+                let r_target = 3 + specs[mgr_idx].extra_fds.len();
+                let w_target = r_target + 1;
+                specs[mgr_idx]
+                    .extra_fds
+                    .push(uj_core::run::RawFdOrHandle(p_to_m_read.as_raw_fd() as usize));
+                specs[mgr_idx].extra_fds.push(uj_core::run::RawFdOrHandle(
+                    m_to_p_write.as_raw_fd() as usize,
+                ));
+                extra_owned[mgr_idx].push(p_to_m_read);
+                extra_owned[mgr_idx].push(m_to_p_write);
+
+                specs[mgr_idx]
+                    .argv
+                    .push(std::ffi::OsString::from(r_target.to_string()));
+                specs[mgr_idx]
+                    .argv
+                    .push(std::ffi::OsString::from(w_target.to_string()));
+                star_fds_env.push(format!("{r_target},{w_target}"));
+            }
+            specs[mgr_idx].env.push((
+                std::ffi::OsString::from("UJ_STAR_FDS"),
+                std::ffi::OsString::from(star_fds_env.join(";")),
+            ));
         }
 
         // Run specs concurrently in worker threads
         thread::scope(|s| {
             let mut handles = Vec::new();
             for (i, spec) in specs.iter().enumerate() {
-                let in_fd = wired_stdins[i];
-                let out_fd = wired_stdouts[i];
-                handles.push(s.spawn(move || self.run_impl(spec, cancel, in_fd, out_fd)));
+                let in_fd = wired_stdins[i].take();
+                let out_fd = wired_stdouts[i].take();
+                let ex_fds = std::mem::take(&mut extra_owned[i]);
+                handles.push(s.spawn(move || self.run_impl(spec, cancel, in_fd, out_fd, ex_fds)));
             }
 
             let mut res = Vec::new();
@@ -351,7 +453,7 @@ impl Sandbox for NoneSandbox {
     fn run(&self, spec: &RunSpec, cancel: &CancelToken) -> Result<RunResult, SandboxError> {
         #[cfg(unix)]
         {
-            self.run_impl(spec, cancel, None, None)
+            self.run_impl(spec, cancel, None, None, Vec::new())
         }
         #[cfg(not(unix))]
         {

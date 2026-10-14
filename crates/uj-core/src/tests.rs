@@ -62,6 +62,56 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     a_chars.peek().is_some().cmp(&b_chars.peek().is_some())
 }
 
+fn input_size_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u64>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Fast cached lookup of test input file byte size for LPT scheduling.
+pub fn get_input_file_size(path: &Path) -> u64 {
+    if let Ok(guard) = input_size_cache().lock()
+        && let Some(&sz) = guard.get(path)
+    {
+        return sz;
+    }
+    let sz = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if let Ok(mut guard) = input_size_cache().lock() {
+        guard.insert(path.to_path_buf(), sz);
+    }
+    sz
+}
+
+/// Detect test cases that match patterns of more than one subtask.
+/// Returns a list of `(test_name, matched_subtask_ids)`.
+pub fn detect_subtask_pattern_overlaps(
+    cases: &[TestCase],
+    config: &ProblemConfig,
+) -> Vec<(String, Vec<u32>)> {
+    if config.subtasks.len() <= 1 {
+        return Vec::new();
+    }
+    let compiled: Vec<(u32, PatternSet)> = config
+        .subtasks
+        .iter()
+        .map(|s| (s.id, PatternSet::compile(&s.tests)))
+        .collect();
+
+    let mut overlaps = Vec::new();
+    for case in cases {
+        let mut matched = Vec::new();
+        for (id, pset) in &compiled {
+            if pset.is_match(&case.name) {
+                matched.push(*id);
+            }
+        }
+        if matched.len() > 1 {
+            overlaps.push((case.name.clone(), matched));
+        }
+    }
+    overlaps
+}
+
 /// Discover tests from directory according to configuration.
 pub fn discover_tests(
     problem_dir: &Path,
@@ -79,21 +129,22 @@ pub fn discover_tests(
         return Ok(Vec::new());
     }
 
-    let mut found_inputs: Vec<(String, PathBuf)> = Vec::new();
+    let mut found_inputs: Vec<(String, PathBuf, u64)> = Vec::new();
 
     for entry in fs::read_dir(&tests_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file()
-            && let Some(ext) = path.extension()
+        if let Some(ext) = path.extension()
             && ext.eq_ignore_ascii_case("in")
+            && let Ok(meta) = entry.metadata()
+            && meta.is_file()
         {
             let stem = path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            found_inputs.push((stem, path));
+            found_inputs.push((stem, path, meta.len()));
         }
     }
 
@@ -101,8 +152,13 @@ pub fn discover_tests(
     found_inputs.sort_by(|a, b| natural_cmp(&a.0, &b.0));
 
     let mut cases = Vec::with_capacity(found_inputs.len());
+    if let Ok(mut cache) = input_size_cache().lock() {
+        for (_, in_path, len) in &found_inputs {
+            cache.insert(in_path.clone(), *len);
+        }
+    }
 
-    for (stem, in_path) in found_inputs {
+    for (stem, in_path, _) in found_inputs {
         // Look for matching .ans or .out
         let ans_candidate = tests_dir.join(format!("{stem}.ans"));
         let out_candidate = tests_dir.join(format!("{stem}.out"));

@@ -152,7 +152,7 @@ pub fn exec_gen(
     job: &GenJob,
     work_dir: &Path,
     cancel: &CancelToken,
-) -> Result<u64, StepError> {
+) -> Result<(u64, String), StepError> {
     let start = Instant::now();
     let limits = Limits::new(5000, 512 * 1024 * 1024);
     let spec = RunSpec {
@@ -185,6 +185,7 @@ pub fn exec_gen(
     }
 
     let stdout_bytes = res.stdout.map(|o| o.bytes).unwrap_or_default();
+    let in_hash = blake3::hash(&stdout_bytes).to_hex().to_string();
     if let Err(e) = safe_write_file(&job.target_in, &stdout_bytes) {
         return Err(StepError::Runtime(format!(
             "Failed to write {}: {e}",
@@ -192,7 +193,7 @@ pub fn exec_gen(
         )));
     }
     let _ = safe_write_file(&job.cache_meta, job.hash.as_bytes());
-    Ok(start.elapsed().as_millis() as u64)
+    Ok((start.elapsed().as_millis() as u64, in_hash))
 }
 
 pub fn exec_validate(
@@ -249,18 +250,23 @@ pub fn exec_ans(
     input: &Path,
     ans_path: &Path,
     problem_dir: &Path,
+    work_dir: &Path,
+    precomputed_in_hash: Option<&str>,
     limits: &Limits,
     force: bool,
     cancel: &CancelToken,
 ) -> Result<AnsOutcome, StepError> {
-    let in_hash = match hash_file_streaming(input) {
-        Ok(h) => h,
-        Err(e) => {
-            return Err(StepError::Runtime(format!(
-                "Failed to read input file for hash {}: {e}",
-                input.display()
-            )));
-        }
+    let in_hash = match precomputed_in_hash {
+        Some(h) => h.to_string(),
+        None => match hash_file_streaming(input) {
+            Ok(h) => h,
+            Err(e) => {
+                return Err(StepError::Runtime(format!(
+                    "Failed to read input file for hash {}: {e}",
+                    input.display()
+                )));
+            }
+        },
     };
 
     let cache_meta = problem_dir
@@ -281,7 +287,7 @@ pub fn exec_ans(
     let spec = RunSpec {
         argv: vec![sol_bin.as_os_str().to_os_string()],
         env: vec![],
-        work_dir: problem_dir.to_path_buf(),
+        work_dir: work_dir.to_path_buf(),
         ro_binds: vec![],
         stdin: Stdio::File(input.to_path_buf()),
         stdout: Stdio::Pipe,
@@ -499,7 +505,7 @@ pub fn run_case_stages(
     };
 
     let sol_path = problem_dir.join(&main_sol.path);
-    let compiled_sol = match session.compile(&sol_path, false) {
+    let compiled_sol = match session.compile_problem_solution(problem_dir, &cfg, &sol_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile main solution: {e}");
@@ -628,14 +634,16 @@ pub fn run_case_stages(
     };
 
     let val_binary = compiled_val.map(|c| c.binary_path);
-    let sol_binary = compiled_sol.binary_path;
+    let sol_binary =
+        uj_sandbox::get_or_prepare_authorized_binary(&compiled_sol.binary_path, problem_dir)
+            .unwrap_or_else(|_| compiled_sol.binary_path.clone());
     let prob_dir = problem_dir.to_path_buf();
     let gen_work_dir = tests_dir.clone();
     let run_limits = limits.clone();
     let force = false;
 
     let mut handles = Vec::new();
-    for _ in 0..num_workers {
+    for worker_idx in 0..num_workers {
         let job_rx = job_rx.clone();
         let res_tx = res_tx.clone();
         let stop = stop_flag.clone();
@@ -661,6 +669,18 @@ pub fn run_case_stages(
                 }
             };
 
+            let slot_box = match uj_sandbox::create_slot_box_dir(&p_dir, worker_idx) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = res_tx.send(CaseResult::RuntimeError {
+                        stage: Stage::Ans,
+                        err: format!("Failed to create sandbox box dir: {e}"),
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+
             if let Some(ref vb) = val_bin {
                 let _ = sandbox.authorize_executable(vb);
             }
@@ -670,6 +690,8 @@ pub fn run_case_stages(
                 if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
                     break;
                 }
+
+                let mut gen_in_hash: Option<String> = None;
 
                 // 1. Stage: Gen
                 if let Some(ref g_job) = job.gen_job {
@@ -681,7 +703,8 @@ pub fn run_case_stages(
                     }
 
                     match exec_gen(sandbox.as_ref(), g_job, &g_dir, &cancel) {
-                        Ok(gen_ms) => {
+                        Ok((gen_ms, in_hash)) => {
+                            gen_in_hash = Some(in_hash);
                             if let Some(ref tx) = etx {
                                 let _ = tx.send(CaseStageEvent::StageDone {
                                     idx: job.idx,
@@ -810,6 +833,7 @@ pub fn run_case_stages(
                     });
                 }
 
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
                 match exec_ans(
                     sandbox.as_ref(),
                     &sol_bin,
@@ -817,6 +841,8 @@ pub fn run_case_stages(
                     &job.input_path,
                     &job.ans_path,
                     &p_dir,
+                    &slot_box.box_dir,
+                    gen_in_hash.as_deref(),
                     &limits,
                     force,
                     &cancel,

@@ -61,6 +61,12 @@ pub(crate) unsafe fn spawn_suspended_process(
     let pcwstr_work_dir = PCWSTR(work_dir_utf16.as_ptr());
 
     let mut inherit_handles = vec![h_stdin, h_stdout, h_stderr];
+    for extra in &spec.extra_fds {
+        let h = HANDLE(extra.0 as *mut _);
+        if !h.is_invalid() && !inherit_handles.contains(&h) {
+            inherit_handles.push(h);
+        }
+    }
 
     let mut attr_count = 1;
     if app_container.is_some() {
@@ -195,8 +201,8 @@ pub fn execute_in_job(
 
     // Prepare pipes / file handles for stdin, stdout, stderr
     let (h_stdin, stdin_cleaner) = prepare_stdin(&spec.stdin)?;
-    let (h_stdout, stdout_read_handle, stdout_cleaner) = prepare_stdout(&spec.stdout)?;
-    let (h_stderr, stderr_read_handle, stderr_cleaner) = prepare_stderr(&spec.stderr)?;
+    let (h_stdout, stdout_read_cleaner, stdout_cleaner) = prepare_stdout(&spec.stdout)?;
+    let (h_stderr, stderr_read_cleaner, stderr_cleaner) = prepare_stderr(&spec.stderr)?;
 
     let pi = unsafe { spawn_suspended_process(spec, h_stdin, h_stdout, h_stderr, app_container)? };
 
@@ -222,7 +228,8 @@ pub fn execute_in_job(
     let stderr_limit = spec.limits.stderr_bytes as usize;
     let ole_flag = Arc::new(AtomicBool::new(false));
 
-    let stdout_handle = if let Some(r_handle) = stdout_read_handle {
+    let stdout_handle = if let Some(r_cleaner) = stdout_read_cleaner {
+        let r_handle = r_cleaner.into_raw();
         let ole_flag_clone = Arc::clone(&ole_flag);
         let raw_h = r_handle.0 as usize;
         Some(thread::spawn(move || {
@@ -233,7 +240,8 @@ pub fn execute_in_job(
         None
     };
 
-    let stderr_handle = if let Some(r_handle) = stderr_read_handle {
+    let stderr_handle = if let Some(r_cleaner) = stderr_read_cleaner {
+        let r_handle = r_cleaner.into_raw();
         let raw_h = r_handle.0 as usize;
         Some(thread::spawn(move || {
             let handle = HANDLE(raw_h as *mut _);
@@ -391,6 +399,7 @@ pub fn execute_group_in_jobs(
     }
 
     let n = specs.len();
+    let mut specs = specs.to_vec();
 
     // 1. Create wired pipes
     let mut wired_stdins: Vec<Option<HANDLE>> = vec![None; n];
@@ -402,6 +411,12 @@ pub fn execute_group_in_jobs(
             return Err(SandboxError::Internal(format!(
                 "Invalid wiring connection from {} to {} (total procs: {})",
                 conn.from_proc, conn.to_proc, n
+            )));
+        }
+        if wired_stdouts[conn.from_proc].is_some() || wired_stdins[conn.to_proc].is_some() {
+            return Err(SandboxError::Internal(format!(
+                "Duplicate stdio wiring connection from {} to {}",
+                conn.from_proc, conn.to_proc
             )));
         }
         use windows::Win32::System::Pipes::CreatePipe;
@@ -419,12 +434,89 @@ pub fn execute_group_in_jobs(
         pipe_cleaners.push(HandleCleaner { handle: h_write });
     }
 
+    if let Some(mgr_idx) = wiring.star_manager_proc {
+        if mgr_idx >= n {
+            return Err(SandboxError::Internal(format!(
+                "Invalid star_manager_proc {} (total procs: {})",
+                mgr_idx, n
+            )));
+        }
+        use windows::Win32::System::Pipes::CreatePipe;
+        let mut star_fds_env = Vec::new();
+        for p in 0..n {
+            if p == mgr_idx {
+                continue;
+            }
+            if wired_stdins[p].is_some() || wired_stdouts[p].is_some() {
+                return Err(SandboxError::Internal(format!(
+                    "Duplicate stdio wiring for star participant {p}"
+                )));
+            }
+            let mut p_to_m_read = HANDLE::default();
+            let mut p_to_m_write = HANDLE::default();
+            unsafe {
+                CreatePipe(&mut p_to_m_read, &mut p_to_m_write, None, 65536)
+                    .map_err(|e| SandboxError::Internal(format!("CreatePipe failed: {e}")))?;
+                let _ =
+                    SetHandleInformation(p_to_m_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+                let _ =
+                    SetHandleInformation(p_to_m_write, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+            }
+            pipe_cleaners.push(HandleCleaner {
+                handle: p_to_m_read,
+            });
+            pipe_cleaners.push(HandleCleaner {
+                handle: p_to_m_write,
+            });
+
+            let mut m_to_p_read = HANDLE::default();
+            let mut m_to_p_write = HANDLE::default();
+            unsafe {
+                CreatePipe(&mut m_to_p_read, &mut m_to_p_write, None, 65536)
+                    .map_err(|e| SandboxError::Internal(format!("CreatePipe failed: {e}")))?;
+                let _ =
+                    SetHandleInformation(m_to_p_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+                let _ =
+                    SetHandleInformation(m_to_p_write, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+            }
+            pipe_cleaners.push(HandleCleaner {
+                handle: m_to_p_read,
+            });
+            pipe_cleaners.push(HandleCleaner {
+                handle: m_to_p_write,
+            });
+
+            wired_stdouts[p] = Some(p_to_m_write);
+            wired_stdins[p] = Some(m_to_p_read);
+
+            let r_val = p_to_m_read.0 as usize;
+            let w_val = m_to_p_write.0 as usize;
+            specs[mgr_idx]
+                .extra_fds
+                .push(uj_core::run::RawFdOrHandle(r_val));
+            specs[mgr_idx]
+                .extra_fds
+                .push(uj_core::run::RawFdOrHandle(w_val));
+            specs[mgr_idx]
+                .argv
+                .push(std::ffi::OsString::from(r_val.to_string()));
+            specs[mgr_idx]
+                .argv
+                .push(std::ffi::OsString::from(w_val.to_string()));
+            star_fds_env.push(format!("{r_val},{w_val}"));
+        }
+        specs[mgr_idx].env.push((
+            std::ffi::OsString::from("UJ_STAR_FDS"),
+            std::ffi::OsString::from(star_fds_env.join(";")),
+        ));
+    }
+
     // 2. Prepare I/O for each process
     let mut stdin_handles = Vec::with_capacity(n);
     let mut stdout_handles = Vec::with_capacity(n);
     let mut stderr_handles = Vec::with_capacity(n);
-    let mut stdout_read_handles = Vec::with_capacity(n);
-    let mut stderr_read_handles = Vec::with_capacity(n);
+    let mut stdout_read_cleaners = Vec::with_capacity(n);
+    let mut stderr_read_cleaners = Vec::with_capacity(n);
     let mut extra_cleaners = Vec::new();
 
     for i in 0..n {
@@ -444,22 +536,35 @@ pub fn execute_group_in_jobs(
             prepare_stdout(&specs[i].stdout)?
         };
         stdout_handles.push(h_out);
-        stdout_read_handles.push(r_out);
+        stdout_read_cleaners.push(r_out);
         if let Some(c) = out_cleaner {
             extra_cleaners.push(c);
         }
 
         let (h_err, r_err, err_cleaner) = prepare_stderr(&specs[i].stderr)?;
         stderr_handles.push(h_err);
-        stderr_read_handles.push(r_err);
+        stderr_read_cleaners.push(r_err);
         if let Some(c) = err_cleaner {
             extra_cleaners.push(c);
         }
     }
 
+    struct ScopedGroupProcs(Vec<PROCESS_INFORMATION>);
+    impl Drop for ScopedGroupProcs {
+        fn drop(&mut self) {
+            for pi in self.0.drain(..) {
+                unsafe {
+                    let _ = TerminateProcess(pi.hProcess, 1);
+                    let _ = CloseHandle(pi.hThread);
+                    let _ = CloseHandle(pi.hProcess);
+                }
+            }
+        }
+    }
+
     // 3. Create Job Objects and Spawn suspended processes
     let mut jobs = Vec::with_capacity(n);
-    let mut proc_infos = Vec::with_capacity(n);
+    let mut scoped_procs = ScopedGroupProcs(Vec::with_capacity(n));
 
     for i in 0..n {
         let job = JobObject::create(None).map_err(|e| {
@@ -489,6 +594,7 @@ pub fn execute_group_in_jobs(
 
         if let Err(e) = job.assign_process(pi.hProcess) {
             unsafe {
+                let _ = TerminateProcess(pi.hProcess, 1);
                 let _ = CloseHandle(pi.hThread);
                 let _ = CloseHandle(pi.hProcess);
             }
@@ -498,8 +604,10 @@ pub fn execute_group_in_jobs(
         }
 
         jobs.push(job);
-        proc_infos.push(pi);
+        scoped_procs.0.push(pi);
     }
+
+    let proc_infos = std::mem::take(&mut scoped_procs.0);
 
     // 4. IMPORTANT: Close all parent copies of pipe handles so children receive EOF!
     drop(pipe_cleaners);
@@ -515,7 +623,8 @@ pub fn execute_group_in_jobs(
         ole_flags.push(ole_flag.clone());
 
         let stdout_limit = specs[i].limits.output_bytes as usize;
-        let s_thread = if let Some(r_handle) = stdout_read_handles[i] {
+        let s_thread = if let Some(r_cleaner) = stdout_read_cleaners[i].take() {
+            let r_handle = r_cleaner.into_raw();
             let flag_clone = ole_flag.clone();
             let raw_h = r_handle.0 as usize;
             Some(thread::spawn(move || {
@@ -528,7 +637,8 @@ pub fn execute_group_in_jobs(
         stdout_threads.push(s_thread);
 
         let stderr_limit = specs[i].limits.stderr_bytes as usize;
-        let e_thread = if let Some(r_handle) = stderr_read_handles[i] {
+        let e_thread = if let Some(r_cleaner) = stderr_read_cleaners[i].take() {
+            let r_handle = r_cleaner.into_raw();
             let raw_h = r_handle.0 as usize;
             Some(thread::spawn(move || {
                 let handle = HANDLE(raw_h as *mut _);
@@ -746,6 +856,14 @@ struct HandleCleaner {
     handle: HANDLE,
 }
 
+impl HandleCleaner {
+    fn into_raw(mut self) -> HANDLE {
+        let h = self.handle;
+        self.handle = HANDLE::default();
+        h
+    }
+}
+
 impl Drop for HandleCleaner {
     fn drop(&mut self) {
         if !self.handle.is_invalid() {
@@ -807,7 +925,7 @@ fn prepare_stdin(stdin: &Stdio) -> Result<(HANDLE, Option<HandleCleaner>), Sandb
 
 fn prepare_stdout(
     stdout: &Stdio,
-) -> Result<(HANDLE, Option<HANDLE>, Option<HandleCleaner>), SandboxError> {
+) -> Result<(HANDLE, Option<HandleCleaner>, Option<HandleCleaner>), SandboxError> {
     use windows::Win32::System::Pipes::CreatePipe;
 
     match stdout {
@@ -821,7 +939,7 @@ fn prepare_stdout(
             }
             Ok((
                 write_pipe,
-                Some(read_pipe),
+                Some(HandleCleaner { handle: read_pipe }),
                 Some(HandleCleaner { handle: write_pipe }),
             ))
         }
@@ -872,7 +990,7 @@ fn prepare_stdout(
 
 fn prepare_stderr(
     _stderr: &Stdio,
-) -> Result<(HANDLE, Option<HANDLE>, Option<HandleCleaner>), SandboxError> {
+) -> Result<(HANDLE, Option<HandleCleaner>, Option<HandleCleaner>), SandboxError> {
     // Always create a pipe to capture stderr for diagnostics
     prepare_stdout(&Stdio::Pipe)
 }
@@ -1154,5 +1272,148 @@ pub fn detect_p_core_primary_cpus() -> Vec<usize> {
         (0..num_cpus::get()).collect()
     } else {
         p_cores
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PipeConnection, Wiring};
+    use uj_core::run::Limits;
+
+    #[test]
+    fn test_execute_group_partial_spawn_failure_no_handle_leak() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("uj_test_grp_leak_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let spec0 = RunSpec {
+            argv: vec!["cmd.exe".into(), "/c".into(), "exit".into(), "0".into()],
+            env: vec![],
+            work_dir: temp_dir.clone(),
+            ro_binds: vec![],
+            stdin: Stdio::Pipe,
+            stdout: Stdio::Pipe,
+            stderr: Stdio::Pipe,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+        let spec1 = RunSpec {
+            argv: vec![temp_dir.join("non_existent_binary_12345.exe").into()],
+            env: vec![],
+            work_dir: temp_dir.clone(),
+            ro_binds: vec![],
+            stdin: Stdio::Pipe,
+            stdout: Stdio::Pipe,
+            stderr: Stdio::Pipe,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+
+        let wiring = Wiring {
+            connections: vec![
+                PipeConnection {
+                    from_proc: 0,
+                    to_proc: 1,
+                },
+                PipeConnection {
+                    from_proc: 1,
+                    to_proc: 0,
+                },
+            ],
+            star_manager_proc: None,
+        };
+        let cancel = CancelToken::new();
+
+        // Warm-up run
+        let _ = execute_group_in_jobs(
+            &[spec0.clone(), spec1.clone()],
+            &wiring,
+            None,
+            &cancel,
+            Tier::Degraded,
+        );
+
+        let mut before_handles = 0u32;
+        unsafe {
+            let _ = GetProcessHandleCount(GetCurrentProcess(), &mut before_handles);
+        }
+
+        for _ in 0..30 {
+            let res = execute_group_in_jobs(
+                &[spec0.clone(), spec1.clone()],
+                &wiring,
+                None,
+                &cancel,
+                Tier::Degraded,
+            );
+            assert!(res.is_err());
+        }
+
+        let mut after_handles = 0u32;
+        unsafe {
+            let _ = GetProcessHandleCount(GetCurrentProcess(), &mut after_handles);
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Allow tiny noise from background test threads, but 30 iterations leaking 6+ handles each would be +180 handles
+        assert!(
+            after_handles <= before_handles + 15,
+            "Handle leak detected! before={before_handles}, after={after_handles}"
+        );
+    }
+
+    #[test]
+    fn test_execute_group_duplicate_wiring_rejected() {
+        let temp_dir = std::env::temp_dir();
+        let spec = RunSpec {
+            argv: vec!["cmd.exe".into()],
+            env: vec![],
+            work_dir: temp_dir,
+            ro_binds: vec![],
+            stdin: Stdio::Null,
+            stdout: Stdio::Null,
+            stderr: Stdio::Null,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+        let dup_wiring = Wiring {
+            connections: vec![
+                PipeConnection {
+                    from_proc: 0,
+                    to_proc: 1,
+                },
+                PipeConnection {
+                    from_proc: 0,
+                    to_proc: 1,
+                },
+            ],
+            star_manager_proc: None,
+        };
+        let cancel = CancelToken::new();
+        let res = execute_group_in_jobs(
+            &[spec.clone(), spec],
+            &dup_wiring,
+            None,
+            &cancel,
+            Tier::Degraded,
+        );
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Duplicate stdio wiring")
+        );
     }
 }

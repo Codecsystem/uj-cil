@@ -180,29 +180,42 @@ impl<'a> Iterator for TokenIterator<'a> {
 // Builtin Checkers
 // ----------------------------------------------------------------------------
 
-/// Byte-by-byte exact match.
+fn find_first_mismatch(a: &[u8], b: &[u8]) -> usize {
+    let min_len = a.len().min(b.len());
+    let mut offset = 0;
+    let (a_chunks, a_rem) = a[..min_len].as_chunks::<64>();
+    let (b_chunks, b_rem) = b[..min_len].as_chunks::<64>();
+    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        if ac != bc {
+            for j in 0..64 {
+                if ac[j] != bc[j] {
+                    return offset + j;
+                }
+            }
+        }
+        offset += 64;
+    }
+    for (j, (&ab, &bb)) in a_rem.iter().zip(b_rem.iter()).enumerate() {
+        if ab != bb {
+            return offset + j;
+        }
+    }
+    min_len
+}
+
+/// Byte-by-byte exact match (accelerated via 64-byte chunk scan + SIMD memchr line counting).
 pub fn check_exact(output: &[u8], answer: &[u8]) -> CheckResult {
     if output == answer {
         return CheckResult::accepted();
     }
 
-    let min_len = output.len().min(answer.len());
-    let mut line = 1;
-    let mut col = 1;
-    let mut diff_pos = min_len;
-
-    for i in 0..min_len {
-        if output[i] != answer[i] {
-            diff_pos = i;
-            break;
-        }
-        if output[i] == b'\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
+    let diff_pos = find_first_mismatch(output, answer);
+    let prefix = &output[..diff_pos];
+    let line = memchr::memchr_iter(b'\n', prefix).count() + 1;
+    let col = match memchr::memrchr(b'\n', prefix) {
+        Some(last_nl) => diff_pos - last_nl,
+        None => diff_pos + 1,
+    };
 
     let actual_snippet = if diff_pos < output.len() {
         let end = (diff_pos + 40).min(output.len());
@@ -1082,5 +1095,35 @@ mod tests {
         // Snippet larger than total char count (13 chars)
         let s20 = token.snippet(20);
         assert_eq!(s20, "你好世界🎉Rust竞赛判题系统");
+    }
+
+    #[test]
+    fn test_check_exact_32mb_mismatch_speed_and_accuracy() {
+        // 32 MiB buffer of lines ("0123456789abcdef\n" = 17 bytes per line)
+        let line_bytes = b"0123456789abcdef\n";
+        let num_lines = 1_900_000;
+        let mut ans = Vec::with_capacity(num_lines * line_bytes.len());
+        for _ in 0..num_lines {
+            ans.extend_from_slice(line_bytes);
+        }
+        let mut out = ans.clone();
+        // Flip a byte near the end on line num_lines, column 6 (1-indexed)
+        let target_idx = (num_lines - 1) * line_bytes.len() + 5;
+        out[target_idx] = b'X';
+
+        let start = std::time::Instant::now();
+        let res = check_exact(&out, &ans);
+        let elapsed = start.elapsed();
+
+        assert_eq!(res.verdict, uj_core::verdict::Verdict::WrongAnswer);
+        let diff = res.diff.expect("diff summary present");
+        assert_eq!(diff.line, num_lines);
+        assert_eq!(diff.column, 6);
+        assert!(diff.expected.starts_with("56789abcdef"));
+        assert!(diff.actual.starts_with("X6789abcdef"));
+        assert!(
+            elapsed.as_millis() < 200,
+            "check_exact on 32MB took too long: {elapsed:?}"
+        );
     }
 }

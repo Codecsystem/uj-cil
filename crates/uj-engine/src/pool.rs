@@ -2,7 +2,6 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -136,9 +135,23 @@ impl JudgePool {
         for (idx, pool_sub) in subs.into_iter().enumerate() {
             let sub_id = pool_sub.ctx.submission_id;
             let mut sorted_tests = pool_sub.ctx.tests.clone();
-            sorted_tests.sort_by_cached_key(|t| {
-                Reverse(fs::metadata(&t.input_path).map(|m| m.len()).unwrap_or(0))
-            });
+            if pool_sub.ctx.problem.has_depends {
+                let ranks = &pool_sub.ctx.problem.subtask_topo_rank;
+                sorted_tests.sort_by_cached_key(|t| {
+                    let topo_rank = t
+                        .subtask_id
+                        .and_then(|id| ranks.get(&id).copied())
+                        .unwrap_or(0);
+                    (
+                        topo_rank,
+                        Reverse(uj_core::tests::get_input_file_size(&t.input_path)),
+                    )
+                });
+            } else {
+                sorted_tests.sort_by_cached_key(|t| {
+                    Reverse(uj_core::tests::get_input_file_size(&t.input_path))
+                });
+            }
             let count = sorted_tests.len();
             total_all_tests += count;
             expected_tests_count.insert(sub_id, count);
@@ -199,6 +212,9 @@ impl JudgePool {
                     let event_tx = task.event_tx;
 
                     if let Some(ref err) = init_error {
+                        if let Some(st_id) = test.subtask_id {
+                            sub.complete_subtask_test(st_id, false);
+                        }
                         let failed_res = SingleTestResult::synthetic(
                             &test,
                             Verdict::JudgeFailed,
@@ -214,11 +230,33 @@ impl JudgePool {
 
                     let sb = sandbox.as_ref().unwrap();
 
-                    // Check fail-fast
+                    // Check subtask DAG dependencies (VULN-06: always active when problem has depends)
+                    if sub.problem.has_depends
+                        && let Some(st_id) = test.subtask_id
+                        && let Some(failed_dep) = sub.wait_for_dependencies(st_id, &cancel_clone)
+                    {
+                        sub.complete_subtask_test(st_id, false);
+                        let skipped_res = SingleTestResult::synthetic(
+                            &test,
+                            Verdict::Skipped,
+                            Some(format!(
+                                "Skipped due to failed dependency subtask {failed_dep}"
+                            )),
+                            Some(sb.tier()),
+                        );
+                        let _ = result_tx_clone.send(TaskResult {
+                            sub_id: sub.submission_id,
+                            result: skipped_res,
+                        });
+                        continue;
+                    }
+
+                    // Check fail-fast within same subtask
                     if sub.fail_fast
                         && let Some(st_id) = test.subtask_id
                         && sub.is_subtask_failed(st_id)
                     {
+                        sub.complete_subtask_test(st_id, false);
                         let skipped_res = SingleTestResult::synthetic(
                             &test,
                             Verdict::Skipped,
@@ -235,6 +273,9 @@ impl JudgePool {
                     // Authorize executable
                     if let Some(ref p) = sub.prepared_exe {
                         if let Some(prev_err) = auth_failed.get(p) {
+                            if let Some(st_id) = test.subtask_id {
+                                sub.complete_subtask_test(st_id, false);
+                            }
                             let failed_res = SingleTestResult::synthetic(
                                 &test,
                                 Verdict::JudgeFailed,
@@ -250,6 +291,9 @@ impl JudgePool {
                             continue;
                         }
                         if let Err(e) = sb.authorize_executable(p) {
+                            if let Some(st_id) = test.subtask_id {
+                                sub.complete_subtask_test(st_id, false);
+                            }
                             auth_failed.insert(p.clone(), e.to_string());
                             let failed_res = SingleTestResult::synthetic(
                                 &test,
@@ -318,11 +362,10 @@ impl JudgePool {
 
                     drop(lease);
 
-                    if sub.fail_fast
-                        && !res.verdict.is_accepted()
-                        && let Some(st_id) = test.subtask_id
+                    if let Some(st_id) = test.subtask_id
+                        && (sub.problem.has_depends || sub.fail_fast)
                     {
-                        sub.mark_subtask_failed(st_id);
+                        sub.complete_subtask_test(st_id, res.verdict.is_accepted());
                     }
 
                     let done_ev = JudgeEvent::TestDone(res.clone());
@@ -1179,5 +1222,92 @@ int main() {
         assert_eq!(reports.len(), 1);
         let rep = reports[0].as_ref().unwrap();
         assert_eq!(rep.verdict, Verdict::Accepted);
+    }
+
+    #[test]
+    fn test_pool_subtask_dependency_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prob_dir = tmp.path().join("dep_prob");
+        let tests_dir = prob_dir.join("tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+
+        let toml_str = r#"
+name = "dep_prob"
+type = "traditional"
+[limits]
+time = "1000ms"
+memory = "256MB"
+[[subtasks]]
+id = 1
+score = 40.0
+tests = ["1_*"]
+[[subtasks]]
+id = 2
+score = 60.0
+tests = ["2_*"]
+depends = [1]
+"#;
+        let toml_path = prob_dir.join("problem.toml");
+        fs::write(&toml_path, toml_str).unwrap();
+        // Subtask 1 input is tiny; Subtask 2 input is larger (would win pure LPT without topo rank)
+        fs::write(tests_dir.join("1_1.in"), "1 2\n").unwrap();
+        fs::write(tests_dir.join("1_1.ans"), "3\n").unwrap();
+        fs::write(tests_dir.join("2_1.in"), "100000 200000\n").unwrap();
+        fs::write(tests_dir.join("2_1.ans"), "300000\n").unwrap();
+
+        let sol_src = prob_dir.join("wa_st1.cpp");
+        fs::write(
+            &sol_src,
+            r#"
+#include <iostream>
+int main() {
+    long long a, b;
+    if (!(std::cin >> a >> b)) return 0;
+    if (a == 1) std::cout << 999 << "\n";
+    else std::cout << (a + b) << "\n";
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+
+        let cfg = ProblemConfig::from_toml_str(toml_str, Some(&toml_path)).unwrap();
+        let session = crate::compiler::CompileSession::new();
+        let comp = session.compile(&sol_src, false).unwrap();
+        let p_ctx = Arc::new(ProblemContext::prepare(0, &prob_dir, &cfg, &session).unwrap());
+        let tests = uj_core::tests::discover_tests(&prob_dir, &cfg).unwrap();
+
+        // Notice fail_fast is false: dependency skipping must still skip subtask 2!
+        let sub =
+            Arc::new(SubmissionContext::prepare(1, "wa_st1", p_ctx, &comp, tests, false).unwrap());
+
+        let pool = JudgePool::new(PoolOptions {
+            sandbox_mode: "none".to_string(),
+            require_tier: false,
+            slots: 2,
+            window: 1,
+            memory_budget: 1024 * 1024 * 1024,
+            pool_events: None,
+        });
+
+        let cancel = CancelToken::new();
+        let reports = pool.run(
+            vec![PoolSubmission {
+                ctx: sub,
+                events: None,
+                precise: false,
+            }],
+            &cancel,
+        );
+        let rep = reports[0].as_ref().unwrap();
+        assert_eq!(rep.score, 0.0);
+        let t1 = rep.tests.iter().find(|t| t.id == "1_1").unwrap();
+        let t2 = rep.tests.iter().find(|t| t.id == "2_1").unwrap();
+        assert_eq!(t1.verdict, Verdict::WrongAnswer);
+        assert_eq!(
+            t2.verdict,
+            Verdict::Skipped,
+            "Dependent subtask 2 test should be Skipped when subtask 1 fails"
+        );
     }
 }

@@ -385,13 +385,17 @@ fn main() -> ExitCode {
             csv.as_deref(),
             format,
         ),
-        Commands::Contest { dir } => {
+        Commands::Contest {
+            dir,
+            problems,
+            contestants,
+        } => {
             let cancel = uj_sandbox::CancelToken::new();
             let cancel_clone = cancel.clone();
             let _ = ctrlc::set_handler(move || {
                 cancel_clone.cancel();
             });
-            contest_cmd::run_contest(dir, &args, format, &cancel)
+            contest_cmd::run_contest(dir, problems, contestants, &args, format, &cancel)
         }
         Commands::Import { kind, file } => {
             if kind == "lemon" {

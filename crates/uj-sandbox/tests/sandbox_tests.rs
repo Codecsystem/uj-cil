@@ -361,6 +361,7 @@ fn test_windows_run_group_wiring() {
             from_proc: 0,
             to_proc: 1,
         }],
+        star_manager_proc: None,
     };
 
     let cancel = CancelToken::new();

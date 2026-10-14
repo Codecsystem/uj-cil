@@ -28,6 +28,9 @@ pub struct ProblemContext {
     pub resolved_checker: ResolvedChecker,
     pub interactor_bin: Option<PathBuf>,
     pub manager_bin: Option<PathBuf>,
+    pub has_depends: bool,
+    pub subtask_topo_rank: std::collections::HashMap<u32, usize>,
+    pub subtask_transitive_deps: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 impl ProblemContext {
@@ -180,6 +183,33 @@ impl ProblemContext {
             None
         };
 
+        let has_depends = problem_config
+            .subtasks
+            .iter()
+            .any(|s| !s.depends.is_empty());
+        let topo_order = crate::judge::topological_subtask_order(&problem_config.subtasks);
+        let mut subtask_topo_rank = std::collections::HashMap::with_capacity(topo_order.len());
+        let mut subtask_transitive_deps =
+            std::collections::HashMap::with_capacity(topo_order.len());
+        for (rank, &st_idx) in topo_order.iter().enumerate() {
+            let st = &problem_config.subtasks[st_idx];
+            subtask_topo_rank.insert(st.id, rank);
+            let mut deps: Vec<u32> = Vec::new();
+            for &dep_id in &st.depends {
+                if !deps.contains(&dep_id) {
+                    deps.push(dep_id);
+                }
+                if let Some(trans) = subtask_transitive_deps.get(&dep_id) {
+                    for &t_id in trans {
+                        if !deps.contains(&t_id) {
+                            deps.push(t_id);
+                        }
+                    }
+                }
+            }
+            subtask_transitive_deps.insert(st.id, deps);
+        }
+
         Ok(Self {
             problem_id,
             problem_dir: problem_dir.to_path_buf(),
@@ -189,6 +219,9 @@ impl ProblemContext {
             resolved_checker,
             interactor_bin,
             manager_bin,
+            has_depends,
+            subtask_topo_rank,
+            subtask_transitive_deps,
         })
     }
 }
@@ -205,6 +238,8 @@ pub struct SubmissionContext {
     pub tests: Vec<TestCase>,
     pub fail_fast: bool,
     pub failed_subtasks: Arc<Mutex<std::collections::HashSet<u32>>>,
+    pub subtask_remaining: Arc<Mutex<std::collections::HashMap<u32, usize>>>,
+    pub dep_condvar: Arc<parking_lot::Condvar>,
 }
 
 impl SubmissionContext {
@@ -248,6 +283,16 @@ impl SubmissionContext {
             None
         };
 
+        let mut remaining = std::collections::HashMap::new();
+        for st in &problem.config.subtasks {
+            remaining.insert(st.id, 0);
+        }
+        for t in &tests {
+            if let Some(st_id) = t.subtask_id {
+                *remaining.entry(st_id).or_insert(0) += 1;
+            }
+        }
+
         Ok(Self {
             submission_id: id,
             submission_name: name.to_string(),
@@ -259,6 +304,8 @@ impl SubmissionContext {
             tests,
             fail_fast,
             failed_subtasks: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            subtask_remaining: Arc::new(Mutex::new(remaining)),
+            dep_condvar: Arc::new(parking_lot::Condvar::new()),
         })
     }
 
@@ -268,6 +315,57 @@ impl SubmissionContext {
 
     pub fn mark_subtask_failed(&self, subtask_id: u32) {
         self.failed_subtasks.lock().insert(subtask_id);
+        self.dep_condvar.notify_all();
+    }
+
+    /// Wait until all transitive dependency subtasks of `subtask_id` have completed, or return
+    /// `Some(failed_dep_id)` immediately if any transitive dependency has already failed.
+    pub fn wait_for_dependencies(&self, subtask_id: u32, cancel: &CancelToken) -> Option<u32> {
+        let deps = self.problem.subtask_transitive_deps.get(&subtask_id)?;
+        if deps.is_empty() {
+            return None;
+        }
+        let mut rem_guard = self.subtask_remaining.lock();
+        loop {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            {
+                let failed = self.failed_subtasks.lock();
+                for &dep_id in deps {
+                    if failed.contains(&dep_id) {
+                        return Some(dep_id);
+                    }
+                }
+            }
+            let all_deps_done = deps
+                .iter()
+                .all(|dep_id| rem_guard.get(dep_id).copied().unwrap_or(0) == 0);
+            if all_deps_done {
+                let failed = self.failed_subtasks.lock();
+                for &dep_id in deps {
+                    if failed.contains(&dep_id) {
+                        return Some(dep_id);
+                    }
+                }
+                return None;
+            }
+            self.dep_condvar
+                .wait_for(&mut rem_guard, std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Record completion of one test belonging to `subtask_id`, marking the subtask failed if
+    /// `!passed` and waking any dependent subtask workers.
+    pub fn complete_subtask_test(&self, subtask_id: u32, passed: bool) {
+        let mut rem_guard = self.subtask_remaining.lock();
+        if !passed {
+            self.failed_subtasks.lock().insert(subtask_id);
+        }
+        if let Some(cnt) = rem_guard.get_mut(&subtask_id) {
+            *cnt = cnt.saturating_sub(1);
+        }
+        self.dep_condvar.notify_all();
     }
 }
 

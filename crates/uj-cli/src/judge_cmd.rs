@@ -7,7 +7,7 @@ use std::thread;
 use std::time::SystemTime;
 
 use crossbeam_channel::unbounded;
-use uj_core::config::{ProblemConfig, ProblemType};
+use uj_core::config::ProblemConfig;
 use uj_core::verdict::Verdict;
 use uj_engine::compiler::CompileError;
 use uj_engine::judge::JudgeOptions;
@@ -40,10 +40,19 @@ pub(crate) fn save_run_report(
     let pid = std::process::id();
     let run_filename = format!("run-{ts}-{pid}-{seq}.json");
 
-    let targets = [
-        problem_dir.join(".uj").join("runs"),
-        PathBuf::from(".uj").join("runs"),
-    ];
+    let primary_runs_dir = problem_dir.join(".uj").join("runs");
+    let mut targets = vec![primary_runs_dir];
+    let same_dir = match (
+        fs::canonicalize(problem_dir),
+        std::env::current_dir().and_then(fs::canonicalize),
+    ) {
+        (Ok(p1), Ok(p2)) => p1 == p2,
+        _ => problem_dir == Path::new(".") || problem_dir.as_os_str().is_empty(),
+    };
+    if !same_dir {
+        targets.push(PathBuf::from(".uj").join("runs"));
+    }
+
     for runs_dir in targets {
         fs::create_dir_all(&runs_dir)?;
 
@@ -291,56 +300,12 @@ pub fn run_judge(
         }
 
         // 1. Compile source (or resolve output directory for output-only)
-        let compile_res = match problem_config.problem_type {
-            ProblemType::OutputOnly => Ok(uj_engine::compiler::CompileResult {
-                binary_path: source.clone(),
-                is_interpreted: false,
-                interpreter_cmd: None,
-                compiler_output: String::new(),
-                duration_ms: 0,
-                cached: false,
-            }),
-            ProblemType::Grader => {
-                let (extra_sources, include_dirs) = if let Some(ref grader) = problem_config.grader
-                {
-                    let extra: Vec<PathBuf> = grader
-                        .files
-                        .iter()
-                        .map(|f| {
-                            if f.is_absolute() {
-                                f.clone()
-                            } else {
-                                problem_dir.join(f)
-                            }
-                        })
-                        .collect();
-                    let mut incs = Vec::new();
-                    incs.push(problem_dir.to_path_buf());
-                    for h in &grader.headers {
-                        let hp = if h.is_absolute() {
-                            h.clone()
-                        } else {
-                            problem_dir.join(h)
-                        };
-                        if hp.is_dir() {
-                            incs.push(hp);
-                        } else if let Some(parent) = hp.parent() {
-                            incs.push(parent.to_path_buf());
-                        }
-                    }
-                    (extra, incs)
-                } else {
-                    (vec![], vec![problem_dir.to_path_buf()])
-                };
-                compile_session.compile_with_options(
-                    source,
-                    &extra_sources,
-                    &include_dirs,
-                    cli.no_cache,
-                )
-            }
-            _ => compile_session.compile(source, cli.no_cache),
-        };
+        let compile_res = compile_session.compile_problem_solution(
+            problem_dir,
+            &problem_config,
+            source,
+            cli.no_cache,
+        );
 
         let compiled = match compile_res {
             Ok(res) => {

@@ -62,6 +62,7 @@ pub struct CleanupReport {
 #[derive(Debug, Clone, Default)]
 pub struct Wiring {
     pub connections: Vec<PipeConnection>,
+    pub star_manager_proc: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,14 +495,152 @@ pub use windows::process::{detect_p_core_primary_cpus, prewarm_binary};
 #[cfg(not(windows))]
 pub fn prewarm_binary(_exe_path: &std::path::Path, _work_dir: &std::path::Path) {}
 
+/// Parse Linux `/sys/devices/system/cpu` topology to identify primary threads of physical P-cores,
+/// filtering out SMT sibling threads and lower-capacity/lower-frequency E-cores.
+pub fn parse_linux_p_core_primary_cpus(sysfs_cpu_dir: &std::path::Path) -> Option<Vec<usize>> {
+    let entries = std::fs::read_dir(sysfs_cpu_dir).ok()?;
+    struct CoreCandidate {
+        cpu_id: usize,
+        capacity: u64,
+        max_freq: u64,
+    }
+    let mut candidates = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(id_str) = name_str.strip_prefix("cpu") else {
+            continue;
+        };
+        let Ok(cpu_id) = id_str.parse::<usize>() else {
+            continue;
+        };
+
+        let cpu_path = entry.path();
+        // Skip offline CPUs if `online` file exists and is "0"
+        if let Ok(online) = std::fs::read_to_string(cpu_path.join("online"))
+            && online.trim() == "0"
+        {
+            continue;
+        }
+
+        // Check `topology/thread_siblings_list` to keep only the primary thread per physical core
+        if let Ok(siblings) =
+            std::fs::read_to_string(cpu_path.join("topology").join("thread_siblings_list"))
+        {
+            let first_sibling = siblings
+                .trim()
+                .split([',', '-'])
+                .next()
+                .and_then(|s| s.trim().parse::<usize>().ok());
+            if let Some(primary_id) = first_sibling
+                && primary_id != cpu_id
+            {
+                continue;
+            }
+        }
+
+        let capacity = std::fs::read_to_string(cpu_path.join("cpu_capacity"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let max_freq = std::fs::read_to_string(cpu_path.join("cpufreq").join("cpuinfo_max_freq"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        candidates.push(CoreCandidate {
+            cpu_id,
+            capacity,
+            max_freq,
+        });
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let max_cap = candidates.iter().map(|c| c.capacity).max().unwrap_or(0);
+    let min_cap = candidates.iter().map(|c| c.capacity).min().unwrap_or(0);
+    let max_freq = candidates.iter().map(|c| c.max_freq).max().unwrap_or(0);
+
+    let mut result: Vec<usize> = candidates
+        .into_iter()
+        .filter(|c| {
+            if max_cap > 0 && max_cap != min_cap {
+                // Hybrid capacity reported (e.g. 1024 for P-core vs 609 for E-core)
+                c.capacity == max_cap
+            } else if max_freq > 0 {
+                // Keep cores within 85% of peak turbo frequency (retains non-TVB P-cores, filters E-cores)
+                c.max_freq.saturating_mul(100) >= max_freq.saturating_mul(85)
+            } else {
+                true
+            }
+        })
+        .map(|c| c.cpu_id)
+        .collect();
+
+    if result.is_empty() {
+        return None;
+    }
+    result.sort_unstable();
+    Some(result)
+}
+
 #[cfg(not(windows))]
 pub fn detect_p_core_primary_cpus() -> Vec<usize> {
-    (0..num_cpus::get()).collect()
+    parse_linux_p_core_primary_cpus(std::path::Path::new("/sys/devices/system/cpu"))
+        .unwrap_or_else(|| (0..num_cpus::get()).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_linux_hybrid_and_smt_sysfs() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("uj_test_sysfs_topo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Simulate 4 P-cores with SMT (cpus 0..8, pairs (0,1), (2,3), (4,5), (6,7))
+        for p in 0..4 {
+            let primary = p * 2;
+            let sibling = p * 2 + 1;
+            for cid in [primary, sibling] {
+                let cdir = temp_dir.join(format!("cpu{cid}"));
+                std::fs::create_dir_all(cdir.join("topology")).unwrap();
+                std::fs::create_dir_all(cdir.join("cpufreq")).unwrap();
+                std::fs::write(
+                    cdir.join("topology").join("thread_siblings_list"),
+                    format!("{primary},{sibling}\n"),
+                )
+                .unwrap();
+                std::fs::write(cdir.join("cpu_capacity"), "1024\n").unwrap();
+                std::fs::write(cdir.join("cpufreq").join("cpuinfo_max_freq"), "5500000\n").unwrap();
+            }
+        }
+        // Simulate 4 E-cores without SMT (cpus 8..12)
+        for cid in 8..12 {
+            let cdir = temp_dir.join(format!("cpu{cid}"));
+            std::fs::create_dir_all(cdir.join("topology")).unwrap();
+            std::fs::create_dir_all(cdir.join("cpufreq")).unwrap();
+            std::fs::write(
+                cdir.join("topology").join("thread_siblings_list"),
+                format!("{cid}\n"),
+            )
+            .unwrap();
+            std::fs::write(cdir.join("cpu_capacity"), "609\n").unwrap();
+            std::fs::write(cdir.join("cpufreq").join("cpuinfo_max_freq"), "4000000\n").unwrap();
+        }
+
+        let p_cores = parse_linux_p_core_primary_cpus(&temp_dir).unwrap();
+        assert_eq!(p_cores, vec![0, 2, 4, 6]);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_force_remove_readonly_file() {

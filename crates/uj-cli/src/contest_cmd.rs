@@ -109,8 +109,6 @@ fn discover_submissions(contest_dir: &Path) -> BTreeMap<String, HashMap<String, 
     let mut submissions: BTreeMap<String, HashMap<String, PathBuf>> = BTreeMap::new();
     let candidates = ["source", "players", "submissions"];
 
-    let valid_exts = ["cpp", "cc", "cxx", "c", "rs", "py"];
-
     for folder_name in &candidates {
         let root = contest_dir.join(folder_name);
         if !root.is_dir() {
@@ -139,7 +137,7 @@ fn discover_submissions(contest_dir: &Path) -> BTreeMap<String, HashMap<String, 
                             for f in prob_files.flatten() {
                                 let f_path = f.path();
                                 if let Some(ext) = f_path.extension().and_then(|e| e.to_str())
-                                    && valid_exts.contains(&ext.to_lowercase().as_str())
+                                    && uj_engine::compiler::Language::is_supported_extension(ext)
                                 {
                                     submissions
                                         .entry(player_name.clone())
@@ -154,7 +152,7 @@ fn discover_submissions(contest_dir: &Path) -> BTreeMap<String, HashMap<String, 
                         if let (Some(stem), Some(ext)) = (
                             item_path.file_stem().and_then(|s| s.to_str()),
                             item_path.extension().and_then(|e| e.to_str()),
-                        ) && valid_exts.contains(&ext.to_lowercase().as_str())
+                        ) && uj_engine::compiler::Language::is_supported_extension(ext)
                         {
                             submissions
                                 .entry(player_name.clone())
@@ -173,6 +171,8 @@ fn discover_submissions(contest_dir: &Path) -> BTreeMap<String, HashMap<String, 
 
 pub fn run_contest(
     contest_dir: &Path,
+    problem_filter: &[String],
+    contestant_filter: &[String],
     cli: &Cli,
     format: OutputFormat,
     cancel: &CancelToken,
@@ -185,7 +185,19 @@ pub fn run_contest(
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
 
-    let problems = discover_problems(contest_dir);
+    let mut problems = discover_problems(contest_dir);
+    if !problem_filter.is_empty() {
+        problems.retain(|p| {
+            let dir_name = p
+                .dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            problem_filter
+                .iter()
+                .any(|f| f == &p.name || f == &dir_name)
+        });
+    }
     if problems.is_empty() {
         if format == OutputFormat::Json {
             let err_obj = serde_json::json!({
@@ -206,7 +218,10 @@ pub fn run_contest(
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
 
-    let submissions = discover_submissions(contest_dir);
+    let mut submissions = discover_submissions(contest_dir);
+    if !contestant_filter.is_empty() {
+        submissions.retain(|player, _| contestant_filter.iter().any(|f| f == player));
+    }
     if submissions.is_empty() {
         if format == OutputFormat::Json {
             let err_obj = serde_json::json!({
@@ -354,7 +369,12 @@ pub fn run_contest(
                     }
                 };
 
-                let compile_res = session.compile(&candidate.source_path, no_cache);
+                let compile_res = session.compile_problem_solution(
+                    &p_ctx.problem_dir,
+                    &p_ctx.config,
+                    &candidate.source_path,
+                    no_cache,
+                );
                 match compile_res {
                     Err(_e) => {
                         let ce_report = SubmissionJudgeReport {

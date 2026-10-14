@@ -59,6 +59,13 @@ impl Language {
         }
     }
 
+    pub fn is_supported_extension(ext: &str) -> bool {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "cpp" | "cc" | "cxx" | "c++" | "c" | "rs" | "py" | "java" | "go"
+        )
+    }
+
     pub fn id(&self) -> &'static str {
         match self {
             Self::Cpp => "cpp",
@@ -269,6 +276,55 @@ impl CompileSession {
         self.compile_with_options(source_path, &[], &[], no_cache)
     }
 
+    /// Compile a problem solution (or std), automatically attaching grader source files
+    /// and header include directories when `cfg.problem_type == ProblemType::Grader`.
+    pub fn compile_problem_solution(
+        &self,
+        problem_dir: &Path,
+        cfg: &uj_core::config::ProblemConfig,
+        source_path: &Path,
+        no_cache: bool,
+    ) -> Result<CompileResult, CompileError> {
+        if cfg.problem_type == uj_core::config::ProblemType::OutputOnly {
+            return Ok(CompileResult {
+                binary_path: source_path.to_path_buf(),
+                is_interpreted: false,
+                interpreter_cmd: None,
+                compiler_output: String::new(),
+                duration_ms: 0,
+                cached: false,
+            });
+        }
+        let mut extra_sources = Vec::new();
+        let mut include_dirs = vec![problem_dir.to_path_buf()];
+        if cfg.problem_type == uj_core::config::ProblemType::Grader
+            && let Some(ref grader) = cfg.grader
+        {
+            for gf in &grader.files {
+                let p = if gf.is_absolute() {
+                    gf.clone()
+                } else {
+                    problem_dir.join(gf)
+                };
+                extra_sources.push(p);
+            }
+            for gh in &grader.headers {
+                let p = if gh.is_absolute() {
+                    gh.clone()
+                } else {
+                    problem_dir.join(gh)
+                };
+                if let Some(parent) = p.parent() {
+                    let parent_buf = parent.to_path_buf();
+                    if !include_dirs.contains(&parent_buf) {
+                        include_dirs.push(parent_buf);
+                    }
+                }
+            }
+        }
+        self.compile_with_options(source_path, &extra_sources, &include_dirs, no_cache)
+    }
+
     fn resolve_languages_config(
         &self,
         problem_dir: Option<&Path>,
@@ -427,6 +483,7 @@ impl CompileSession {
 
         let problem_dir = source_path
             .ancestors()
+            .chain(include_dirs.iter().map(|p| p.as_path()))
             .find(|p| p.join("problem.toml").exists() || p.join(".uj").exists());
 
         // 1. Load and merge languages.toml using session cache

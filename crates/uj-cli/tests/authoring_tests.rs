@@ -290,3 +290,287 @@ tag = "time_limit"
 
     let _ = fs::remove_dir_all(&test_dir);
 }
+
+#[test]
+fn test_communication_star_topology() {
+    let _guard = lock_test();
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let test_dir = scratch_dir.join("test_comm_star");
+    let _ = fs::remove_dir_all(&test_dir);
+    fs::create_dir_all(test_dir.join("tests")).unwrap();
+    fs::create_dir_all(test_dir.join("solutions")).unwrap();
+
+    fs::write(
+        test_dir.join("problem.toml"),
+        r#"name = "star_comm"
+type = "communication"
+manager = "manager.cpp"
+processes = 2
+communication_topology = "star"
+
+[limits]
+time = "2000ms"
+memory = "256MB"
+
+[checker]
+type = "builtin"
+name = "wcmp"
+"#,
+    )
+    .unwrap();
+
+    fs::write(test_dir.join("tests/1.in"), "15 27\n").unwrap();
+    fs::write(test_dir.join("tests/1.ans"), "42\n").unwrap();
+
+    // Manager reads a, b from input file argv[1], sends `a` to worker 0 and `b` to worker 1 via star pipes,
+    // reads 2*a from worker 0 and 2*b from worker 1, and prints 1.0 (AC) to score_file / stdout if (r0 + r1)/2 == a + b.
+    let manager_cpp = r#"#include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#include <io.h>
+#define fdopen _fdopen
+#else
+#include <unistd.h>
+#endif
+
+FILE* open_pipe_handle(const char* arg, const char* mode) {
+    long long raw = std::strtoll(arg, nullptr, 10);
+#ifdef _WIN32
+    int fd = _open_osfhandle((intptr_t)raw, 0);
+#else
+    int fd = (int)raw;
+#endif
+    return fdopen(fd, mode);
+}
+
+int main(int argc, char** argv) {
+    if (argc < 7) return 2;
+    FILE* fin = std::fopen(argv[1], "r");
+    if (!fin) return 3;
+    long long a = 0, b = 0;
+    if (std::fscanf(fin, "%lld %lld", &a, &b) != 2) return 3;
+    std::fclose(fin);
+
+    FILE* from_w0 = open_pipe_handle(argv[3], "r");
+    FILE* to_w0 = open_pipe_handle(argv[4], "w");
+    FILE* from_w1 = open_pipe_handle(argv[5], "r");
+    FILE* to_w1 = open_pipe_handle(argv[6], "w");
+    if (!to_w0 || !from_w0 || !to_w1 || !from_w1) return 4;
+
+    std::fprintf(to_w0, "%lld\n", a);
+    std::fflush(to_w0);
+    std::fprintf(to_w1, "%lld\n", b);
+    std::fflush(to_w1);
+
+    long long r0 = 0, r1 = 0;
+    if (std::fscanf(from_w0, "%lld", &r0) != 1) return 5;
+    if (std::fscanf(from_w1, "%lld", &r1) != 1) return 6;
+
+    double score = ((r0 + r1) / 2 == a + b) ? 1.0 : 0.0;
+    std::printf("%.1f\n", score);
+    std::fflush(stdout);
+    return 0;
+}
+"#;
+    fs::write(test_dir.join("manager.cpp"), manager_cpp).unwrap();
+
+    let worker_cpp = r#"#include <iostream>
+int main() {
+    long long x;
+    if (std::cin >> x) {
+        std::cout << (x * 2) << std::endl;
+    }
+    return 0;
+}
+"#;
+    let sol_path = test_dir.join("solutions/ac.cpp");
+    fs::write(&sol_path, worker_cpp).unwrap();
+
+    let out = uj_cmd()
+        .arg("judge")
+        .arg(&sol_path)
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj judge on star communication problem");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Star communication judge failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(report["verdict"], "AC");
+    assert_eq!(report["score"], 100.0);
+
+    let _ = fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_doctor_subtask_overlap_and_orphan_ans() {
+    let _guard = lock_test();
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let test_dir = scratch_dir.join("test_doctor_overlap");
+    let _ = fs::remove_dir_all(&test_dir);
+    fs::create_dir_all(test_dir.join("tests")).unwrap();
+
+    fs::write(
+        test_dir.join("problem.toml"),
+        r#"name = "doc_test"
+type = "traditional"
+
+[limits]
+time = "1000ms"
+memory = "256MB"
+
+[[subtasks]]
+id = 1
+score = 30.0
+tests = ["*"]
+
+[[subtasks]]
+id = 2
+score = 40.0
+tests = ["2*"]
+
+[[subtasks]]
+id = 3
+score = 30.0
+tests = ["nonexistent_*"]
+"#,
+    )
+    .unwrap();
+
+    fs::write(test_dir.join("tests/1.in"), "1 2\n").unwrap();
+    fs::write(test_dir.join("tests/1.ans"), "3\n").unwrap();
+    fs::write(test_dir.join("tests/2.in"), "3 4\n").unwrap();
+    fs::write(test_dir.join("tests/2.ans"), "7\n").unwrap();
+    fs::write(test_dir.join("tests/orphan.ans"), "99\n").unwrap();
+
+    let out = uj_cmd()
+        .arg("doctor")
+        .arg("--problem")
+        .arg("--format")
+        .arg("json")
+        .current_dir(&test_dir)
+        .output()
+        .expect("Failed to execute uj doctor --problem");
+
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+
+    let orphan_check = checks
+        .iter()
+        .find(|c| c["name"] == "Orphan Answer Files")
+        .expect("Orphan Answer Files check missing");
+    assert_eq!(orphan_check["status"], "Warn");
+    assert!(
+        orphan_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("orphan.ans")
+    );
+
+    let coverage_check = checks
+        .iter()
+        .find(|c| c["name"] == "Subtask Coverage")
+        .expect("Subtask Coverage check missing");
+    assert_eq!(coverage_check["status"], "Warn");
+    assert!(
+        coverage_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("Subtasks matching 0 test cases: [3]")
+    );
+
+    let overlap_check = checks
+        .iter()
+        .find(|c| c["name"] == "Subtask Pattern Overlap")
+        .expect("Subtask Pattern Overlap check missing");
+    assert_eq!(overlap_check["status"], "Warn");
+    assert!(
+        overlap_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("subtasks [1, 2]")
+    );
+
+    let _ = fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_tl_subtask_stats_and_preserve_indentation() {
+    let _guard = lock_test();
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let test_dir = scratch_dir.join("test_tl_indent");
+    let _ = fs::remove_dir_all(&test_dir);
+
+    let aplusb_src = get_workspace_root().join("tests/problems/aplusb");
+    copy_dir_all(&aplusb_src, &test_dir).unwrap();
+
+    let p_toml = test_dir.join("problem.toml");
+    fs::write(
+        &p_toml,
+        r#"name = "aplusb"
+type = "traditional"
+
+[limits]
+    time = "1000ms" # indented time comment
+    memory = "256MB"
+
+[[subtasks]]
+id = 1
+score = 100.0
+tests = ["*"]
+
+[[solutions]]
+path = "solutions/ac.cpp"
+tag = "main"
+"#,
+    )
+    .unwrap();
+
+    let out = uj_cmd()
+        .arg("tl")
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("--apply")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj tl --apply");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "uj tl failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let res: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["applied"], true);
+    let subtask_stats = res["subtask_stats"]
+        .as_array()
+        .expect("subtask_stats missing");
+    assert_eq!(subtask_stats.len(), 1);
+    assert_eq!(subtask_stats[0]["id"], 1);
+
+    let updated_toml = fs::read_to_string(&p_toml).unwrap();
+    assert!(
+        updated_toml.contains("    time = \""),
+        "Expected leading 4-space indentation to be preserved in:\n{updated_toml}"
+    );
+    assert!(
+        updated_toml.contains("# indented time comment"),
+        "Expected trailing inline comment to be preserved in:\n{updated_toml}"
+    );
+
+    let _ = fs::remove_dir_all(&test_dir);
+}

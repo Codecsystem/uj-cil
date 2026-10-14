@@ -308,13 +308,75 @@ fn run_problem_checks(checks: &mut Vec<DoctorCheckItem>, root: &Path) {
                         });
                     }
 
-                    // 2. Check for duplicate test data (hash)
+                    // 1b. Check for orphan .ans / .out files without matching .in
+                    let mut orphan_ans = Vec::new();
+                    let known_in_stems: std::collections::HashSet<std::path::PathBuf> = discovered
+                        .iter()
+                        .map(|t| t.input_path.with_extension(""))
+                        .collect();
+                    let tests_dir = root.join(&cfg.tests.dir);
+                    if let Ok(entries) = std::fs::read_dir(&tests_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file()
+                                && let Some(ext) = p.extension().and_then(|e| e.to_str())
+                                && (ext == "ans" || ext == "out")
+                            {
+                                let stem_path = p.with_extension("");
+                                if !known_in_stems.contains(&stem_path) {
+                                    orphan_ans.push(
+                                        p.file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    orphan_ans.sort();
+                    if orphan_ans.is_empty() {
+                        checks.push(DoctorCheckItem {
+                            name: "Orphan Answer Files".to_string(),
+                            status: CheckStatus::Pass,
+                            message: "No orphan .ans/.out files without matching .in files"
+                                .to_string(),
+                            recommendation: None,
+                        });
+                    } else {
+                        checks.push(DoctorCheckItem {
+                            name: "Orphan Answer Files".to_string(),
+                            status: CheckStatus::Warn,
+                            message: format!(
+                                "Orphan answer files without .in: {}",
+                                orphan_ans.join(", ")
+                            ),
+                            recommendation: Some(
+                                "Remove stale .ans/.out files or add their corresponding .in files"
+                                    .to_string(),
+                            ),
+                        });
+                    }
+
+                    // 2. Check for duplicate test data (streaming hash) and answer cache freshness
                     let mut hashes: std::collections::HashMap<String, String> =
                         std::collections::HashMap::new();
                     let mut duplicates = Vec::new();
+                    let ans_cache_path = root.join(".uj").join("cache").join("ans_state.json");
+                    let ans_cache: Option<std::collections::BTreeMap<String, String>> =
+                        std::fs::read_to_string(&ans_cache_path)
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&s).ok());
+                    let mut stale_ans = Vec::new();
+
                     for t in &discovered {
-                        if let Ok(bytes) = std::fs::read(&t.input_path) {
-                            let hash = blake3::hash(&bytes).to_hex().to_string();
+                        if let Ok(hash) = crate::author_steps::hash_file_streaming(&t.input_path) {
+                            if let Some(ref cache_map) = ans_cache
+                                && let Some(cached_hash) = cache_map.get(&t.name)
+                                && cached_hash != &hash
+                            {
+                                stale_ans.push(t.name.clone());
+                            }
                             if let Some(existing) = hashes.get(&hash) {
                                 duplicates.push(format!("'{}' == '{}'", t.name, existing));
                             } else {
@@ -343,31 +405,91 @@ fn run_problem_checks(checks: &mut Vec<DoctorCheckItem>, root: &Path) {
                         });
                     }
 
-                    // 3. Check subtask coverage
+                    if !stale_ans.is_empty() {
+                        checks.push(DoctorCheckItem {
+                            name: "Answer Cache Freshness".to_string(),
+                            status: CheckStatus::Warn,
+                            message: format!(
+                                "Input modified since .ans was generated for: {}",
+                                stale_ans.join(", ")
+                            ),
+                            recommendation: Some(
+                                "Run 'uj ans --force' to regenerate stale answer files".to_string(),
+                            ),
+                        });
+                    }
+
+                    // 3. Check subtask coverage and pattern overlap
                     if !cfg.subtasks.is_empty() {
                         let uncovered: Vec<_> = discovered
                             .iter()
                             .filter(|t| t.subtask_id.is_none())
                             .map(|t| t.name.as_str())
                             .collect();
-                        if uncovered.is_empty() {
+                        let empty_subtasks: Vec<u32> = cfg
+                            .subtasks
+                            .iter()
+                            .filter(|st| !discovered.iter().any(|t| t.subtask_id == Some(st.id)))
+                            .map(|st| st.id)
+                            .collect();
+                        if uncovered.is_empty() && empty_subtasks.is_empty() {
                             checks.push(DoctorCheckItem {
                                 name: "Subtask Coverage".to_string(),
                                 status: CheckStatus::Pass,
-                                message: "All test cases are covered by configured subtasks"
+                                message:
+                                    "All test cases are covered and all subtasks are non-empty"
+                                        .to_string(),
+                                recommendation: None,
+                            });
+                        } else {
+                            let mut msgs = Vec::new();
+                            if !uncovered.is_empty() {
+                                msgs.push(format!(
+                                    "Tests not assigned to any subtask: {}",
+                                    uncovered.join(", ")
+                                ));
+                            }
+                            if !empty_subtasks.is_empty() {
+                                msgs.push(format!(
+                                    "Subtasks matching 0 test cases: {:?}",
+                                    empty_subtasks
+                                ));
+                            }
+                            checks.push(DoctorCheckItem {
+                                name: "Subtask Coverage".to_string(),
+                                status: CheckStatus::Warn,
+                                message: msgs.join("; "),
+                                recommendation: Some(
+                                    "Update subtask tests pattern in problem.toml".to_string(),
+                                ),
+                            });
+                        }
+
+                        let overlaps =
+                            uj_core::tests::detect_subtask_pattern_overlaps(&discovered, &cfg);
+                        if overlaps.is_empty() {
+                            checks.push(DoctorCheckItem {
+                                name: "Subtask Pattern Overlap".to_string(),
+                                status: CheckStatus::Pass,
+                                message: "No test cases match multiple subtask patterns"
                                     .to_string(),
                                 recommendation: None,
                             });
                         } else {
+                            let desc: Vec<String> = overlaps
+                                .iter()
+                                .map(|(name, ids)| format!("'{name}' -> subtasks {ids:?}"))
+                                .collect();
                             checks.push(DoctorCheckItem {
-                                name: "Subtask Coverage".to_string(),
+                                name: "Subtask Pattern Overlap".to_string(),
                                 status: CheckStatus::Warn,
                                 message: format!(
-                                    "Tests not assigned to any subtask: {}",
-                                    uncovered.join(", ")
+                                    "Test cases matched by multiple subtasks: {}",
+                                    desc.join(", ")
                                 ),
                                 recommendation: Some(
-                                    "Update subtask tests pattern in problem.toml".to_string(),
+                                    "Make [[subtasks]] test glob patterns mutually exclusive"
+                                        .to_string(),
                                 ),
                             });
                         }

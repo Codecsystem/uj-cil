@@ -136,6 +136,15 @@ impl AppContainerProfile {
     }
 
     pub fn grant_path_access(path: &std::path::Path, sid_str: &str) -> Result<(), std::io::Error> {
+        if path.join("problem.toml").exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Security violation: refusing to grant untrusted AppContainer recursive write ACL to problem directory '{}'",
+                    path.display()
+                ),
+            ));
+        }
         let status = std::process::Command::new("icacls")
             .arg(path)
             .arg("/grant")

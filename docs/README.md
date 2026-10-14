@@ -37,6 +37,7 @@ docs/
 |---|---|
 | [plans/PLAN.md](plans/PLAN.md) | **项目工程规划底稿**：系统设计哲学、阶段性实施路线与初始设计规范。 |
 | [plans/IMPROVEMENT_PLAN.md](plans/IMPROVEMENT_PLAN.md) | **专项改进方案**：针对并发信号安全、编译依赖感知、NDJSON 终结事件、答案内存映射等 P0-P2 缺陷与性能项的改进实施方案。 |
+| [plans/ROUND11_EXECUTION_PLAN.md](plans/ROUND11_EXECUTION_PLAN.md) | **Round 11 综合演进执行计划**：覆盖 10 项安全/正确性漏洞修复、6 项核心热路径性能优化与 4 项新功能扩展的详细拆解与验证规范。 |
 
 ---
 
@@ -61,7 +62,7 @@ docs/
 
 | 文档 | 主要内容与定位 |
 |---|---|
-| [opt/README.md](opt/README.md) | **性能优化迭代总览**：Round 0 至 Round 8 综合性能提升对比表与基准数据。 |
+| [opt/README.md](opt/README.md) | **性能优化迭代总览**：Round 0 至 Round 11 综合性能提升对比表与基准数据。 |
 | [opt/PERFORMANCE_ACCEPTANCE.md](opt/PERFORMANCE_ACCEPTANCE.md) | Round 0 初始优化验收报告。 |
 | [opt/PERFORMANCE_EXECUTION_GEMINI.md](opt/PERFORMANCE_EXECUTION_GEMINI.md) | 性能优化执行审阅记录。 |
 | [opt/PERFORMANCE_QUICK_RECHECK.md](opt/PERFORMANCE_QUICK_RECHECK.md) | 性能快速复验记录。 |
@@ -73,3 +74,6 @@ docs/
 | [opt/ROUND_6_SLOT_BOX_POOLING.md](opt/ROUND_6_SLOT_BOX_POOLING.md) | Round 6：沙盒槽位工作目录池化复用。 |
 | [opt/ROUND_7_STDOUT_PIPE_BUFFERING.md](opt/ROUND_7_STDOUT_PIPE_BUFFERING.md) | Round 7：输出管道环形缓冲与预分配流式读取。 |
 | [opt/ROUND_8_COMPILER_CACHE_QUICKPATH.md](opt/ROUND_8_COMPILER_CACHE_QUICKPATH.md) | Round 8：编译会话内存快表与二进制准备短路。 |
+| [opt/ROUND_9_GLOBAL_POOL.md](opt/ROUND_9_GLOBAL_POOL.md) | Round 9：全局评测任务池与多提交 Master-Detail 监控。 |
+| [opt/ROUND_10_CASE_PIPELINE.md](opt/ROUND_10_CASE_PIPELINE.md) | Round 10：出题流水线用例级细粒度串联与流式 TUI。 |
+| [opt/ROUND_11_HARDENING_AND_PERF.md](opt/ROUND_11_HARDENING_AND_PERF.md) | Round 11：Cgroup FD 预打开复用、check_exact 向量化、输入大小缓存与安全加固基准报告。 |

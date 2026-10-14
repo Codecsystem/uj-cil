@@ -1,11 +1,12 @@
-//! Minimal BPF seccomp filter for Linux sandbox.
+//! Minimal BPF seccomp filter for Linux sandbox (x86_64 and aarch64).
 
 #[repr(C)]
-struct sock_filter {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct sock_filter {
+    pub code: u16,
+    pub jt: u8,
+    pub jf: u8,
+    pub k: u32,
 }
 
 #[repr(C)]
@@ -28,31 +29,110 @@ const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
 const SECCOMP_RET_ERRNO: u32 = 0x00050000;
 
-const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
+#[allow(dead_code)]
+pub(crate) const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
+#[allow(dead_code)]
+pub(crate) const AUDIT_ARCH_AARCH64: u32 = 0xc00000b7;
 
 // System call numbers on x86_64
-const SYS_CLONE: u32 = 56;
-const SYS_PTRACE: u32 = 101;
-const SYS_PIVOT_ROOT: u32 = 155;
-const SYS_CHROOT: u32 = 161;
-const SYS_MOUNT: u32 = 165;
-const SYS_UMOUNT2: u32 = 166;
-const SYS_SWAPON: u32 = 167;
-const SYS_SWAPOFF: u32 = 168;
-const SYS_REBOOT: u32 = 169;
-const SYS_INIT_MODULE: u32 = 175;
-const SYS_DELETE_MODULE: u32 = 176;
-const SYS_KEXEC_LOAD: u32 = 246;
-const SYS_ADD_KEY: u32 = 248;
-const SYS_REQUEST_KEY: u32 = 249;
-const SYS_KEYCTL: u32 = 250;
-const SYS_UNSHARE: u32 = 272;
-const SYS_PERF_EVENT_OPEN: u32 = 298;
-const SYS_SETNS: u32 = 308;
-const SYS_FINIT_MODULE: u32 = 313;
-const SYS_KEXEC_FILE_LOAD: u32 = 320;
-const SYS_BPF: u32 = 321;
-const SYS_CLONE3: u32 = 435;
+#[allow(dead_code)]
+pub(crate) mod x86_64_nr {
+    pub const SYS_CLONE: u32 = 56;
+    pub const SYS_PTRACE: u32 = 101;
+    pub const SYS_PIVOT_ROOT: u32 = 155;
+    pub const SYS_CHROOT: u32 = 161;
+    pub const SYS_MOUNT: u32 = 165;
+    pub const SYS_UMOUNT2: u32 = 166;
+    pub const SYS_SWAPON: u32 = 167;
+    pub const SYS_SWAPOFF: u32 = 168;
+    pub const SYS_REBOOT: u32 = 169;
+    pub const SYS_INIT_MODULE: u32 = 175;
+    pub const SYS_DELETE_MODULE: u32 = 176;
+    pub const SYS_KEXEC_LOAD: u32 = 246;
+    pub const SYS_ADD_KEY: u32 = 248;
+    pub const SYS_REQUEST_KEY: u32 = 249;
+    pub const SYS_KEYCTL: u32 = 250;
+    pub const SYS_UNSHARE: u32 = 272;
+    pub const SYS_PERF_EVENT_OPEN: u32 = 298;
+    pub const SYS_SETNS: u32 = 308;
+    pub const SYS_FINIT_MODULE: u32 = 313;
+    pub const SYS_KEXEC_FILE_LOAD: u32 = 320;
+    pub const SYS_BPF: u32 = 321;
+    pub const SYS_CLONE3: u32 = 435;
+
+    pub const BLACKLIST: [u32; 20] = [
+        SYS_PTRACE,
+        SYS_PIVOT_ROOT,
+        SYS_CHROOT,
+        SYS_MOUNT,
+        SYS_UMOUNT2,
+        SYS_SWAPON,
+        SYS_SWAPOFF,
+        SYS_REBOOT,
+        SYS_INIT_MODULE,
+        SYS_DELETE_MODULE,
+        SYS_KEXEC_LOAD,
+        SYS_ADD_KEY,
+        SYS_REQUEST_KEY,
+        SYS_KEYCTL,
+        SYS_UNSHARE,
+        SYS_PERF_EVENT_OPEN,
+        SYS_SETNS,
+        SYS_FINIT_MODULE,
+        SYS_KEXEC_FILE_LOAD,
+        SYS_BPF,
+    ];
+}
+
+// System call numbers on aarch64 (asm-generic/unistd.h)
+#[allow(dead_code)]
+pub(crate) mod aarch64_nr {
+    pub const SYS_UMOUNT2: u32 = 39;
+    pub const SYS_MOUNT: u32 = 40;
+    pub const SYS_PIVOT_ROOT: u32 = 41;
+    pub const SYS_CHROOT: u32 = 51;
+    pub const SYS_UNSHARE: u32 = 97;
+    pub const SYS_KEXEC_LOAD: u32 = 104;
+    pub const SYS_INIT_MODULE: u32 = 105;
+    pub const SYS_DELETE_MODULE: u32 = 106;
+    pub const SYS_PTRACE: u32 = 117;
+    pub const SYS_REBOOT: u32 = 142;
+    pub const SYS_ADD_KEY: u32 = 217;
+    pub const SYS_REQUEST_KEY: u32 = 218;
+    pub const SYS_KEYCTL: u32 = 219;
+    pub const SYS_CLONE: u32 = 220;
+    pub const SYS_SWAPON: u32 = 224;
+    pub const SYS_SWAPOFF: u32 = 225;
+    pub const SYS_PERF_EVENT_OPEN: u32 = 241;
+    pub const SYS_SETNS: u32 = 268;
+    pub const SYS_FINIT_MODULE: u32 = 273;
+    pub const SYS_BPF: u32 = 280;
+    pub const SYS_KEXEC_FILE_LOAD: u32 = 294;
+    pub const SYS_CLONE3: u32 = 435;
+
+    pub const BLACKLIST: [u32; 20] = [
+        SYS_PTRACE,
+        SYS_PIVOT_ROOT,
+        SYS_CHROOT,
+        SYS_MOUNT,
+        SYS_UMOUNT2,
+        SYS_SWAPON,
+        SYS_SWAPOFF,
+        SYS_REBOOT,
+        SYS_INIT_MODULE,
+        SYS_DELETE_MODULE,
+        SYS_KEXEC_LOAD,
+        SYS_ADD_KEY,
+        SYS_REQUEST_KEY,
+        SYS_KEYCTL,
+        SYS_UNSHARE,
+        SYS_PERF_EVENT_OPEN,
+        SYS_SETNS,
+        SYS_FINIT_MODULE,
+        SYS_KEXEC_FILE_LOAD,
+        SYS_BPF,
+    ];
+}
 
 // Namespace flags for clone (user, net, mount, pid, ipc, uts, cgroup)
 const CLONE_NAMESPACE_FLAGS: u32 = 0x7a020000;
@@ -72,160 +152,177 @@ struct Inst {
     k: u32,
 }
 
-pub fn apply_seccomp_filter() -> Result<(), std::io::Error> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let blacklist = [
-            SYS_PTRACE,
-            SYS_PIVOT_ROOT,
-            SYS_CHROOT,
-            SYS_MOUNT,
-            SYS_UMOUNT2,
-            SYS_SWAPON,
-            SYS_SWAPOFF,
-            SYS_REBOOT,
-            SYS_INIT_MODULE,
-            SYS_DELETE_MODULE,
-            SYS_KEXEC_LOAD,
-            SYS_ADD_KEY,
-            SYS_REQUEST_KEY,
-            SYS_KEYCTL,
-            SYS_UNSHARE,
-            SYS_PERF_EVENT_OPEN,
-            SYS_SETNS,
-            SYS_FINIT_MODULE,
-            SYS_KEXEC_FILE_LOAD,
-            SYS_BPF,
-        ];
-
-        let mut insts = vec![
-            // [0] Load arch (offset 4)
-            Inst {
-                code: BPF_LD | BPF_W | BPF_ABS,
-                jt: JumpTarget::Relative(0),
-                jf: JumpTarget::Relative(0),
-                k: 4,
-            },
-            // [1] Check arch == AUDIT_ARCH_X86_64
-            Inst {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: JumpTarget::Relative(1), // skip kill instruction
-                jf: JumpTarget::Relative(0),
-                k: AUDIT_ARCH_X86_64,
-            },
-            // [2] Kill if architecture mismatch
-            Inst {
-                code: BPF_RET | BPF_K,
-                jt: JumpTarget::Relative(0),
-                jf: JumpTarget::Relative(0),
-                k: SECCOMP_RET_KILL_PROCESS,
-            },
-            // [3] Load syscall number (offset 0)
-            Inst {
-                code: BPF_LD | BPF_W | BPF_ABS,
-                jt: JumpTarget::Relative(0),
-                jf: JumpTarget::Relative(0),
-                k: 0,
-            },
-            // [4] Block x32 ABI (nr >= 0x40000000 / __X32_SYSCALL_BIT)
-            Inst {
-                code: BPF_JMP | BPF_JGE | BPF_K,
-                jt: JumpTarget::Enosys,
-                jf: JumpTarget::Relative(0),
-                k: 0x40000000,
-            },
-            // [5] Block clone3 (args are in struct pointer, return ENOSYS so glibc falls back to clone)
-            Inst {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: JumpTarget::Enosys,
-                jf: JumpTarget::Relative(0),
-                k: SYS_CLONE3,
-            },
-        ];
-
-        // [6..] Check blacklisted syscalls
-        for &sys_nr in &blacklist {
-            insts.push(Inst {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: JumpTarget::Eperm,
-                jf: JumpTarget::Relative(0),
-                k: sys_nr,
-            });
-        }
-
-        // Check clone namespace flags
-        insts.push(Inst {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: JumpTarget::Relative(1), // jump to flag check
-            jf: JumpTarget::Allow,
-            k: SYS_CLONE,
-        });
-        // Load clone_flags (args[0] lower 32 bits, offset 16 in seccomp_data)
-        insts.push(Inst {
+pub(crate) fn build_bpf_filter(
+    audit_arch: u32,
+    block_x32: bool,
+    sys_clone3: u32,
+    sys_clone: u32,
+    blacklist: &[u32],
+) -> Vec<sock_filter> {
+    let mut insts = vec![
+        // [0] Load arch (offset 4)
+        Inst {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: JumpTarget::Relative(0),
             jf: JumpTarget::Relative(0),
-            k: 16,
-        });
-        // If any namespace flags are set, return EPERM
+            k: 4,
+        },
+        // [1] Check arch == audit_arch
+        Inst {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: JumpTarget::Relative(1), // skip kill instruction
+            jf: JumpTarget::Relative(0),
+            k: audit_arch,
+        },
+        // [2] Kill if architecture mismatch
+        Inst {
+            code: BPF_RET | BPF_K,
+            jt: JumpTarget::Relative(0),
+            jf: JumpTarget::Relative(0),
+            k: SECCOMP_RET_KILL_PROCESS,
+        },
+        // [3] Load syscall number (offset 0)
+        Inst {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: JumpTarget::Relative(0),
+            jf: JumpTarget::Relative(0),
+            k: 0,
+        },
+    ];
+
+    if block_x32 {
+        // Block x32 ABI (nr >= 0x40000000 / __X32_SYSCALL_BIT)
         insts.push(Inst {
-            code: BPF_JMP | BPF_JSET | BPF_K,
+            code: BPF_JMP | BPF_JGE | BPF_K,
+            jt: JumpTarget::Enosys,
+            jf: JumpTarget::Relative(0),
+            k: 0x40000000,
+        });
+    }
+
+    // Block clone3 (args are in struct pointer, return ENOSYS so glibc falls back to clone)
+    insts.push(Inst {
+        code: BPF_JMP | BPF_JEQ | BPF_K,
+        jt: JumpTarget::Enosys,
+        jf: JumpTarget::Relative(0),
+        k: sys_clone3,
+    });
+
+    // Check blacklisted syscalls
+    for &sys_nr in blacklist {
+        insts.push(Inst {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: JumpTarget::Eperm,
-            jf: JumpTarget::Allow,
-            k: CLONE_NAMESPACE_FLAGS,
+            jf: JumpTarget::Relative(0),
+            k: sys_nr,
         });
+    }
 
-        let allow_idx = insts.len();
-        let eperm_idx = allow_idx + 1;
-        let enosys_idx = allow_idx + 2;
+    // Check clone namespace flags
+    insts.push(Inst {
+        code: BPF_JMP | BPF_JEQ | BPF_K,
+        jt: JumpTarget::Relative(0), // fall through to next instruction (load clone_flags)
+        jf: JumpTarget::Allow,
+        k: sys_clone,
+    });
+    // Load clone_flags (args[0] lower 32 bits, offset 16 in seccomp_data)
+    insts.push(Inst {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: JumpTarget::Relative(0),
+        jf: JumpTarget::Relative(0),
+        k: 16,
+    });
+    // If any namespace flags are set, return EPERM
+    insts.push(Inst {
+        code: BPF_JMP | BPF_JSET | BPF_K,
+        jt: JumpTarget::Eperm,
+        jf: JumpTarget::Allow,
+        k: CLONE_NAMESPACE_FLAGS,
+    });
 
-        let mut filter: Vec<sock_filter> = insts
-            .iter()
-            .enumerate()
-            .map(|(i, inst)| {
-                let resolve = |target: JumpTarget| -> u8 {
-                    let dest_idx = match target {
-                        JumpTarget::Allow => allow_idx,
-                        JumpTarget::Eperm => eperm_idx,
-                        JumpTarget::Enosys => enosys_idx,
-                        JumpTarget::Relative(offset) => i + 1 + offset as usize,
-                    };
-                    assert!(dest_idx > i, "BPF jump must be forward");
-                    (dest_idx - i - 1) as u8
+    let allow_idx = insts.len();
+    let eperm_idx = allow_idx + 1;
+    let enosys_idx = allow_idx + 2;
+
+    let mut filter: Vec<sock_filter> = insts
+        .iter()
+        .enumerate()
+        .map(|(i, inst)| {
+            let resolve = |target: JumpTarget| -> u8 {
+                let dest_idx = match target {
+                    JumpTarget::Allow => allow_idx,
+                    JumpTarget::Eperm => eperm_idx,
+                    JumpTarget::Enosys => enosys_idx,
+                    JumpTarget::Relative(offset) => i + 1 + offset as usize,
                 };
+                assert!(dest_idx > i, "BPF jump must be forward");
+                (dest_idx - i - 1) as u8
+            };
 
-                sock_filter {
-                    code: inst.code,
-                    jt: resolve(inst.jt),
-                    jf: resolve(inst.jf),
-                    k: inst.k,
-                }
-            })
-            .collect();
+            sock_filter {
+                code: inst.code,
+                jt: resolve(inst.jt),
+                jf: resolve(inst.jf),
+                k: inst.k,
+            }
+        })
+        .collect();
 
-        // Terminal return instructions
-        // [allow_idx]
-        filter.push(sock_filter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ALLOW,
-        });
-        // [eperm_idx]
-        filter.push(sock_filter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ERRNO | (libc::EPERM as u32),
-        });
-        // [enosys_idx]
-        filter.push(sock_filter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ERRNO | (libc::ENOSYS as u32),
-        });
+    // Terminal return instructions
+    // [allow_idx]
+    filter.push(sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ALLOW,
+    });
+    // [eperm_idx]
+    filter.push(sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+    });
+    // [enosys_idx]
+    filter.push(sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ERRNO | (libc::ENOSYS as u32),
+    });
 
+    filter
+}
+
+pub fn apply_seccomp_filter() -> Result<(), std::io::Error> {
+    #[cfg(target_arch = "x86_64")]
+    let filter = build_bpf_filter(
+        AUDIT_ARCH_X86_64,
+        true,
+        x86_64_nr::SYS_CLONE3,
+        x86_64_nr::SYS_CLONE,
+        &x86_64_nr::BLACKLIST,
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    let filter = build_bpf_filter(
+        AUDIT_ARCH_AARCH64,
+        false,
+        aarch64_nr::SYS_CLONE3,
+        aarch64_nr::SYS_CLONE,
+        &aarch64_nr::BLACKLIST,
+    );
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Seccomp BPF filter is not supported on this CPU architecture",
+        ));
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
         let prog = sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_ptr(),
@@ -239,6 +336,133 @@ pub fn apply_seccomp_filter() -> Result<(), std::io::Error> {
                 return Err(std::io::Error::last_os_error());
             }
         }
+        Ok(())
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval_bpf(filter: &[sock_filter], nr: u32, arch: u32, arg0_lo: u32) -> u32 {
+        let mut pc = 0usize;
+        let mut a = 0u32;
+        while pc < filter.len() {
+            let ins = filter[pc];
+            match ins.code {
+                c if c == (BPF_LD | BPF_W | BPF_ABS) => {
+                    a = match ins.k {
+                        0 => nr,
+                        4 => arch,
+                        16 => arg0_lo,
+                        _ => panic!("unexpected offset {}", ins.k),
+                    };
+                    pc += 1;
+                }
+                c if c == (BPF_JMP | BPF_JEQ | BPF_K) => {
+                    if a == ins.k {
+                        pc += 1 + ins.jt as usize;
+                    } else {
+                        pc += 1 + ins.jf as usize;
+                    }
+                }
+                c if c == (BPF_JMP | BPF_JGE | BPF_K) => {
+                    if a >= ins.k {
+                        pc += 1 + ins.jt as usize;
+                    } else {
+                        pc += 1 + ins.jf as usize;
+                    }
+                }
+                c if c == (BPF_JMP | BPF_JSET | BPF_K) => {
+                    if (a & ins.k) != 0 {
+                        pc += 1 + ins.jt as usize;
+                    } else {
+                        pc += 1 + ins.jf as usize;
+                    }
+                }
+                c if c == (BPF_RET | BPF_K) => return ins.k,
+                _ => panic!("unexpected bpf opcode {}", ins.code),
+            }
+        }
+        panic!("BPF program did not terminate");
+    }
+
+    #[test]
+    fn test_bpf_bytecode_x86_64_and_aarch64() {
+        let x64_prog = build_bpf_filter(
+            AUDIT_ARCH_X86_64,
+            true,
+            x86_64_nr::SYS_CLONE3,
+            x86_64_nr::SYS_CLONE,
+            &x86_64_nr::BLACKLIST,
+        );
+        // Wrong arch -> KILL
+        assert_eq!(
+            eval_bpf(&x64_prog, 0, AUDIT_ARCH_AARCH64, 0),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        // x32 ABI -> ENOSYS
+        assert_eq!(
+            eval_bpf(&x64_prog, 0x40000001, AUDIT_ARCH_X86_64, 0),
+            SECCOMP_RET_ERRNO | (libc::ENOSYS as u32)
+        );
+        // unshare -> EPERM
+        assert_eq!(
+            eval_bpf(&x64_prog, x86_64_nr::SYS_UNSHARE, AUDIT_ARCH_X86_64, 0),
+            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
+        );
+        // clone with CLONE_NEWUSER (0x10000000) -> EPERM
+        assert_eq!(
+            eval_bpf(
+                &x64_prog,
+                x86_64_nr::SYS_CLONE,
+                AUDIT_ARCH_X86_64,
+                0x10000000
+            ),
+            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
+        );
+        // clone for normal thread -> ALLOW
+        assert_eq!(
+            eval_bpf(&x64_prog, x86_64_nr::SYS_CLONE, AUDIT_ARCH_X86_64, 0x10f00),
+            SECCOMP_RET_ALLOW
+        );
+
+        let arm64_prog = build_bpf_filter(
+            AUDIT_ARCH_AARCH64,
+            false,
+            aarch64_nr::SYS_CLONE3,
+            aarch64_nr::SYS_CLONE,
+            &aarch64_nr::BLACKLIST,
+        );
+        // Wrong arch -> KILL
+        assert_eq!(
+            eval_bpf(&arm64_prog, 0, AUDIT_ARCH_X86_64, 0),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        // unshare (97 on aarch64) -> EPERM
+        assert_eq!(
+            eval_bpf(&arm64_prog, aarch64_nr::SYS_UNSHARE, AUDIT_ARCH_AARCH64, 0),
+            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
+        );
+        // clone3 (435 on aarch64) -> ENOSYS
+        assert_eq!(
+            eval_bpf(&arm64_prog, aarch64_nr::SYS_CLONE3, AUDIT_ARCH_AARCH64, 0),
+            SECCOMP_RET_ERRNO | (libc::ENOSYS as u32)
+        );
+        // clone (220 on aarch64) with CLONE_NEWPID (0x20000000) -> EPERM
+        assert_eq!(
+            eval_bpf(
+                &arm64_prog,
+                aarch64_nr::SYS_CLONE,
+                AUDIT_ARCH_AARCH64,
+                0x20000000
+            ),
+            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
+        );
+        // normal write (64 on aarch64) -> ALLOW
+        assert_eq!(
+            eval_bpf(&arm64_prog, 64, AUDIT_ARCH_AARCH64, 0),
+            SECCOMP_RET_ALLOW
+        );
+    }
 }

@@ -586,3 +586,49 @@ fn test_contest_fail_fast_skips() {
     );
     assert_eq!(tle_count, 1, "Expected 1 TLE test, got {tle_count}");
 }
+
+#[test]
+fn test_contest_filter_problem_and_contestant() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let uj = uj_bin();
+    let temp = tempdir().unwrap();
+    let contest_dir = temp.path();
+
+    let tail_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/contests/tail");
+    if !tail_fixture.exists() {
+        return;
+    }
+    copy_dir_all(&tail_fixture, contest_dir).unwrap();
+
+    let out = Command::new(&uj)
+        .arg("--format")
+        .arg("json")
+        .arg("contest")
+        .arg(contest_dir)
+        .arg("--problem")
+        .arg("aplusb")
+        .arg("--contestant")
+        .arg("ac1,ce1")
+        .output()
+        .expect("failed to execute uj contest with filters");
+
+    assert!(
+        out.status.success(),
+        "Contest with filters failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let val: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("Must be valid JSON");
+    assert_eq!(val["ok"], true);
+    assert_eq!(val["problems_count"], 1);
+    assert_eq!(val["contestants_count"], 2);
+
+    let standings = val["standings"].as_array().unwrap();
+    assert_eq!(standings.len(), 2);
+    assert_eq!(standings[0]["name"], "ac1");
+    assert_eq!(standings[0]["total_score"], 100.0);
+    assert_eq!(standings[1]["name"], "ce1");
+    assert_eq!(standings[1]["total_score"], 0.0);
+}

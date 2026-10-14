@@ -284,6 +284,18 @@ pub enum Commands {
     Contest {
         #[arg(required = true, help = "Contest root directory")]
         dir: PathBuf,
+        #[arg(
+            long = "problem",
+            value_delimiter = ',',
+            help = "Filter by problem name(s) (comma-separated or repeated)"
+        )]
+        problems: Vec<String>,
+        #[arg(
+            long = "contestant",
+            value_delimiter = ',',
+            help = "Filter by contestant name(s) (comma-separated or repeated)"
+        )]
+        contestants: Vec<String>,
     },
 
     #[command(about = "Import problem configuration from external format (e.g., Lemon)")]

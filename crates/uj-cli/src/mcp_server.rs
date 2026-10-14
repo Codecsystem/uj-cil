@@ -13,7 +13,7 @@ use std::thread;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uj_core::config::{ProblemConfig, SolutionTag};
+use uj_core::config::ProblemConfig;
 use uj_core::run::{Limits, RunSpec, Stdio};
 use uj_core::verdict::Verdict;
 use uj_engine::compiler::CompileSession;
@@ -443,6 +443,16 @@ fn get_tools_list() -> Vec<Value> {
                     "dir": {
                         "type": "string",
                         "description": "Contest root directory"
+                    },
+                    "problems": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of problem names to filter"
+                    },
+                    "contestants": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of contestant names to filter"
                     }
                 },
                 "required": ["dir"]
@@ -498,38 +508,46 @@ fn dispatch_tool_call(
             let content = fs::read_to_string(&config_path)?;
             let cfg = ProblemConfig::from_toml_str(&content, Some(&config_path))?;
 
-            let mut targets = Vec::new();
+            let mut targets: Vec<(PathBuf, bool)> = Vec::new();
             if let Some(arr) = args.get("targets").and_then(|v| v.as_array()) {
                 for t in arr {
                     if let Some(s) = t.as_str() {
-                        targets.push(problem_dir.join(s));
+                        let p = problem_dir.join(s);
+                        let is_sol = cfg.solutions.iter().any(|sol| {
+                            problem_dir.join(&sol.path) == p || sol.path == Path::new(s)
+                        });
+                        targets.push((p, is_sol));
                     }
                 }
             } else {
                 if let Some(ref v) = cfg.validator {
-                    targets.push(problem_dir.join(v));
+                    targets.push((problem_dir.join(v), false));
                 }
                 if let Some(ref chk) = cfg.checker.path {
-                    targets.push(problem_dir.join(chk));
+                    targets.push((problem_dir.join(chk), false));
                 }
                 if let Some(ref int) = cfg.interactor {
-                    targets.push(problem_dir.join(int));
+                    targets.push((problem_dir.join(int), false));
                 }
                 for g in &cfg.tests.generators {
-                    targets.push(problem_dir.join(&g.generator));
+                    targets.push((problem_dir.join(&g.generator), false));
                 }
                 for sol in &cfg.solutions {
-                    targets.push(problem_dir.join(&sol.path));
+                    targets.push((problem_dir.join(&sol.path), true));
                 }
             }
 
             let session = CompileSession::new();
             let mut results = Vec::new();
-            for target in targets {
+            for (target, is_sol) in targets {
                 if target.extension().is_some_and(|e| e == "exe") {
                     continue;
                 }
-                let c = session.compile(&target, false)?;
+                let c = if is_sol {
+                    session.compile_problem_solution(problem_dir, &cfg, &target, false)?
+                } else {
+                    session.compile(&target, false)?
+                };
                 results.push(serde_json::json!({
                     "target": target.to_string_lossy(),
                     "duration_ms": c.duration_ms,
@@ -576,7 +594,7 @@ fn dispatch_tool_call(
             let mut reports = Vec::new();
 
             for src in &sources {
-                let compiled = session.compile(src, false)?;
+                let compiled = session.compile_problem_solution(problem_dir, &cfg, src, false)?;
                 let sub_name = src
                     .file_name()
                     .unwrap_or_default()
@@ -624,7 +642,8 @@ fn dispatch_tool_call(
 
             for sol in &cfg.solutions {
                 let sol_path = problem_dir.join(&sol.path);
-                let compiled = session.compile(&sol_path, false)?;
+                let compiled =
+                    session.compile_problem_solution(problem_dir, &cfg, &sol_path, false)?;
                 let sub_name = sol.path.to_string_lossy().to_string();
                 let report = scheduler.judge_submission(
                     problem_dir,
@@ -637,10 +656,14 @@ fn dispatch_tool_call(
                     cancel,
                 )?;
 
-                let (matched, reason) = check_solution_match(&sol.tag, &report);
-                if !matched {
+                let failures = crate::author_cmd::check_solution_tag(sol, &report, &cfg);
+                let matched = failures.is_empty();
+                let reason = if matched {
+                    format!("{:?} as expected (score: {:.1})", sol.tag, report.score)
+                } else {
                     all_match = false;
-                }
+                    failures.join("; ")
+                };
 
                 verifications.push(serde_json::json!({
                     "solution": sol.path.to_string_lossy(),
@@ -722,12 +745,99 @@ fn dispatch_tool_call(
                 .ok_or("brute required")?;
             let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
 
+            let config_path = problem_dir.join("problem.toml");
+            let cfg_opt = if config_path.exists() {
+                let content = fs::read_to_string(&config_path)?;
+                Some(ProblemConfig::from_toml_str(&content, Some(&config_path))?)
+            } else {
+                None
+            };
+
             let session = CompileSession::new();
             let compiled_gen = session.compile(&problem_dir.join(gen_str), false)?;
-            let compiled_sol = session.compile(&problem_dir.join(sol_str), false)?;
-            let compiled_brute = session.compile(&problem_dir.join(brute_str), false)?;
+            let compiled_sol = if let Some(ref cfg) = cfg_opt {
+                session.compile_problem_solution(
+                    problem_dir,
+                    cfg,
+                    &problem_dir.join(sol_str),
+                    false,
+                )?
+            } else {
+                session.compile(&problem_dir.join(sol_str), false)?
+            };
+            let compiled_brute = if let Some(ref cfg) = cfg_opt {
+                session.compile_problem_solution(
+                    problem_dir,
+                    cfg,
+                    &problem_dir.join(brute_str),
+                    false,
+                )?
+            } else {
+                session.compile(&problem_dir.join(brute_str), false)?
+            };
+            let (resolved_checker, pe_as_wa, sol_limits) = if let Some(ref cfg) = cfg_opt {
+                let lim = cfg
+                    .to_limits()
+                    .unwrap_or_else(|_| Limits::new(2000, 256 * 1024 * 1024));
+                let pe = cfg.checker.pe_as_wa;
+                let chk = match uj_engine::context::ProblemContext::prepare(
+                    0,
+                    problem_dir,
+                    cfg,
+                    &session,
+                ) {
+                    Ok(p_ctx) => p_ctx.resolved_checker.clone(),
+                    Err(_) => {
+                        let name = cfg.checker.name.as_deref().unwrap_or("wcmp");
+                        uj_engine::judge::ResolvedChecker::Builtin(
+                            uj_checker::builtin::BuiltinCheckerType::parse(name)
+                                .unwrap_or(uj_checker::builtin::BuiltinCheckerType::Wcmp),
+                        )
+                    }
+                };
+                (chk, pe, lim)
+            } else {
+                (
+                    uj_engine::judge::ResolvedChecker::Builtin(
+                        uj_checker::builtin::BuiltinCheckerType::Wcmp,
+                    ),
+                    false,
+                    Limits::new(2000, 256 * 1024 * 1024),
+                )
+            };
+            let mut brute_limits = sol_limits.clone();
+            brute_limits.cpu_time_ms = brute_limits.cpu_time_ms.saturating_mul(3).max(5000);
+            brute_limits.wall_time_ms = brute_limits.cpu_time_ms.saturating_mul(3).max(15000);
 
             let sandbox = create_sandbox("auto", false)?;
+            let slot_box = uj_sandbox::create_slot_box_dir(problem_dir, 6000)?;
+            let gen_bin = uj_sandbox::get_or_prepare_authorized_binary(
+                &compiled_gen.binary_path,
+                problem_dir,
+            )
+            .unwrap_or_else(|_| compiled_gen.binary_path.clone());
+            let sol_bin = uj_sandbox::get_or_prepare_authorized_binary(
+                &compiled_sol.binary_path,
+                problem_dir,
+            )
+            .unwrap_or_else(|_| compiled_sol.binary_path.clone());
+            let brute_bin = uj_sandbox::get_or_prepare_authorized_binary(
+                &compiled_brute.binary_path,
+                problem_dir,
+            )
+            .unwrap_or_else(|_| compiled_brute.binary_path.clone());
+            let _ = sandbox.authorize_executable(&gen_bin);
+            let _ = sandbox.authorize_executable(&sol_bin);
+            let _ = sandbox.authorize_executable(&brute_bin);
+            match &resolved_checker {
+                uj_engine::judge::ResolvedChecker::Testlib(chk_exe)
+                | uj_engine::judge::ResolvedChecker::Lemon { path: chk_exe, .. } => {
+                    let _ = sandbox.authorize_executable(chk_exe);
+                }
+                uj_engine::judge::ResolvedChecker::Builtin(_) => {}
+            }
+
+            let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
             let mut tested = 0;
 
             for seed in 1..=count {
@@ -735,14 +845,16 @@ fn dispatch_tool_call(
                     return Err("Cancelled".into());
                 }
 
-                // Run generator
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+
+                // Run generator in isolated slot box
                 let gen_spec = RunSpec {
                     argv: vec![
-                        compiled_gen.binary_path.as_os_str().to_os_string(),
+                        gen_bin.as_os_str().to_os_string(),
                         std::ffi::OsString::from(format!("{seed}")),
                     ],
                     env: vec![],
-                    work_dir: problem_dir.to_path_buf(),
+                    work_dir: slot_box.box_dir.clone(),
                     ro_binds: vec![],
                     stdin: Stdio::Null,
                     stdout: Stdio::Pipe,
@@ -755,22 +867,21 @@ fn dispatch_tool_call(
                 };
                 let gen_res = sandbox.run(&gen_spec, cancel)?;
                 let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
-                let tmp_dir = problem_dir.join(".uj").join("tmp");
-                let _ = fs::create_dir_all(&tmp_dir);
-                let tmp_in_path = tmp_dir.join(format!("stress_{seed}.in"));
+                let tmp_in_path = scratch_dir.join(format!("mcp_stress_{seed}.in"));
                 let _ = fs::write(&tmp_in_path, &in_bytes);
 
-                // Run sol
+                // Run sol in isolated slot box
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
                 let sol_spec = RunSpec {
-                    argv: vec![compiled_sol.binary_path.as_os_str().to_os_string()],
+                    argv: vec![sol_bin.as_os_str().to_os_string()],
                     env: vec![],
-                    work_dir: problem_dir.to_path_buf(),
+                    work_dir: slot_box.box_dir.clone(),
                     ro_binds: vec![],
                     stdin: Stdio::File(tmp_in_path.clone()),
                     stdout: Stdio::Pipe,
                     stderr: Stdio::Pipe,
                     extra_fds: vec![],
-                    limits: Limits::new(2000, 256 * 1024 * 1024),
+                    limits: sol_limits.clone(),
                     cpu_affinity: None,
                     seccomp_profile: Default::default(),
                     trusted: false,
@@ -778,32 +889,78 @@ fn dispatch_tool_call(
                 let sol_res = sandbox.run(&sol_spec, cancel)?;
                 let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
 
-                // Run brute
+                // Run brute in isolated slot box
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
                 let brute_spec = RunSpec {
-                    argv: vec![compiled_brute.binary_path.as_os_str().to_os_string()],
+                    argv: vec![brute_bin.as_os_str().to_os_string()],
                     env: vec![],
-                    work_dir: problem_dir.to_path_buf(),
+                    work_dir: slot_box.box_dir.clone(),
                     ro_binds: vec![],
                     stdin: Stdio::File(tmp_in_path.clone()),
                     stdout: Stdio::Pipe,
                     stderr: Stdio::Pipe,
                     extra_fds: vec![],
-                    limits: Limits::new(5000, 256 * 1024 * 1024),
+                    limits: brute_limits.clone(),
                     cpu_affinity: None,
                     seccomp_profile: Default::default(),
                     trusted: false,
                 };
                 let brute_res = sandbox.run(&brute_spec, cancel)?;
                 let brute_bytes = brute_res.stdout.map(|o| o.bytes).unwrap_or_default();
-                let _ = fs::remove_file(&tmp_in_path);
 
                 tested += 1;
 
-                // Compare with wcmp
-                let cmp_res =
-                    uj_checker::builtin::BuiltinCheckerType::Wcmp.check(&sol_bytes, &brute_bytes);
+                let cmp_res = match &resolved_checker {
+                    uj_engine::judge::ResolvedChecker::Builtin(b) => {
+                        let mut cr = b.check(&sol_bytes, &brute_bytes);
+                        if pe_as_wa && cr.verdict == Verdict::PresentationError {
+                            cr.verdict = Verdict::WrongAnswer;
+                        }
+                        cr
+                    }
+                    uj_engine::judge::ResolvedChecker::Testlib(chk_exe) => {
+                        let out_tmp = scratch_dir.join(format!("mcp_stress_{seed}.out"));
+                        let ans_tmp = scratch_dir.join(format!("mcp_stress_{seed}.ans"));
+                        let _ = fs::write(&out_tmp, &sol_bytes);
+                        let _ = fs::write(&ans_tmp, &brute_bytes);
+                        let cr = uj_checker::testlib::run_testlib_checker(
+                            sandbox.as_ref(),
+                            chk_exe,
+                            &tmp_in_path,
+                            &out_tmp,
+                            &ans_tmp,
+                            pe_as_wa,
+                            cancel,
+                        );
+                        let _ = fs::remove_file(&out_tmp);
+                        let _ = fs::remove_file(&ans_tmp);
+                        cr
+                    }
+                    uj_engine::judge::ResolvedChecker::Lemon {
+                        path: chk_exe,
+                        full_score,
+                    } => {
+                        let out_tmp = scratch_dir.join(format!("mcp_stress_{seed}.out"));
+                        let ans_tmp = scratch_dir.join(format!("mcp_stress_{seed}.ans"));
+                        let _ = fs::write(&out_tmp, &sol_bytes);
+                        let _ = fs::write(&ans_tmp, &brute_bytes);
+                        let cr = uj_checker::lemon::run_lemon_checker(
+                            sandbox.as_ref(),
+                            chk_exe,
+                            &tmp_in_path,
+                            &out_tmp,
+                            &ans_tmp,
+                            *full_score,
+                            cancel,
+                        );
+                        let _ = fs::remove_file(&out_tmp);
+                        let _ = fs::remove_file(&ans_tmp);
+                        cr
+                    }
+                };
+                let _ = fs::remove_file(&tmp_in_path);
 
-                if cmp_res.verdict != Verdict::Accepted {
+                if !cmp_res.verdict.is_accepted() {
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "ok": false,
                         "mismatch": {
@@ -865,9 +1022,34 @@ fn dispatch_tool_call(
                 return Err(format!("Contest directory '{}' not found", dir_str).into());
             }
 
+            let problems: Vec<String> = args
+                .get("problems")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let contestants: Vec<String> = args
+                .get("contestants")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let cli = Cli::parse_from(["uj", "contest", dir_str]);
-            let code =
-                crate::contest_cmd::run_contest(contest_dir, &cli, OutputFormat::Silent, cancel);
+            let code = crate::contest_cmd::run_contest(
+                contest_dir,
+                &problems,
+                &contestants,
+                &cli,
+                OutputFormat::Silent,
+                cancel,
+            );
             if code != ExitCode::from(EXIT_SUCCESS) {
                 return Err(format!("Contest judging failed for '{dir_str}'").into());
             }
@@ -910,71 +1092,5 @@ fn dispatch_tool_call(
             }))?)
         }
         _ => Err(format!("Unknown tool '{name}'").into()),
-    }
-}
-
-fn check_solution_match(tag: &SolutionTag, report: &SubmissionJudgeReport) -> (bool, String) {
-    match tag {
-        SolutionTag::Main | SolutionTag::Accepted => {
-            if report.verdict == Verdict::Accepted {
-                (true, "Accepted as expected".to_string())
-            } else {
-                (
-                    false,
-                    format!("Expected Accepted, got {:?}", report.verdict),
-                )
-            }
-        }
-        SolutionTag::WrongAnswer => {
-            if report.verdict == Verdict::WrongAnswer {
-                (true, "WrongAnswer as expected".to_string())
-            } else {
-                (
-                    false,
-                    format!("Expected WrongAnswer, got {:?}", report.verdict),
-                )
-            }
-        }
-        SolutionTag::TimeLimit => {
-            if report.verdict == Verdict::TimeLimitExceeded {
-                (true, "TLE as expected".to_string())
-            } else {
-                (false, format!("Expected TLE, got {:?}", report.verdict))
-            }
-        }
-        SolutionTag::MemoryLimit => {
-            if report.verdict == Verdict::MemoryLimitExceeded {
-                (true, "MLE as expected".to_string())
-            } else {
-                (false, format!("Expected MLE, got {:?}", report.verdict))
-            }
-        }
-        SolutionTag::RuntimeError => {
-            if report.verdict == Verdict::RuntimeError {
-                (true, "RE as expected".to_string())
-            } else {
-                (false, format!("Expected RE, got {:?}", report.verdict))
-            }
-        }
-        SolutionTag::Rejected => {
-            if report.verdict != Verdict::Accepted {
-                (true, format!("Rejected as expected ({:?})", report.verdict))
-            } else {
-                (false, "Expected rejection, but got Accepted".to_string())
-            }
-        }
-        SolutionTag::Partial => {
-            if report.score > 0.0 && report.score < 100.0 {
-                (
-                    true,
-                    format!("Partial score {:.1} as expected", report.score),
-                )
-            } else {
-                (
-                    false,
-                    format!("Expected partial score (0, 100), got {:.1}", report.score),
-                )
-            }
-        }
     }
 }

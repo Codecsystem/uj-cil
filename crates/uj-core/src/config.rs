@@ -414,14 +414,15 @@ impl ProblemConfig {
             let procs = self.processes.unwrap_or(1);
             if procs > 1 {
                 let topo = self.communication_topology.as_deref().unwrap_or("");
-                if topo != "ring" && topo != "pipeline" {
+                if topo != "ring" && topo != "pipeline" && topo != "star" {
                     return Err(ConfigErrorInfo {
                         kind: "ConfigError".to_string(),
                         message: format!(
-                            "Multi-participant communication (processes = {procs}) requires explicit supported topology (e.g. `communication_topology = \"ring\"`). Star topology is currently unsupported."
+                            "Multi-participant communication (processes = {procs}) requires explicit supported topology (`communication_topology = \"ring\"`, \"pipeline\", or \"star\")."
                         ),
                         hint: Some(
-                            "Add `communication_topology = \"ring\"` to problem.toml if ring/pipeline wiring is intended".to_string(),
+                            "Add `communication_topology = \"ring\"` or `\"star\"` to problem.toml"
+                                .to_string(),
                         ),
                         path: path_str.clone(),
                         line: None,
@@ -431,14 +432,19 @@ impl ProblemConfig {
             }
         }
 
-        // Path safety check (prevent escaping problem directory via ..)
+        // Path safety check (prevent escaping problem directory via .. or absolute paths)
         let check_path_safe = |p: &Path, field: &str| -> Result<(), ConfigErrorInfo> {
             for comp in p.components() {
-                if let std::path::Component::ParentDir = comp {
+                if matches!(
+                    comp,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                ) {
                     return Err(ConfigErrorInfo {
                         kind: "ConfigError".to_string(),
                         message: format!(
-                            "Field '{field}' contains forbidden parent reference '..': {}",
+                            "Field '{field}' contains forbidden parent reference '..' or absolute path: {}",
                             p.display()
                         ),
                         hint: Some(
@@ -460,6 +466,26 @@ impl ProblemConfig {
         }
         if let Some(ref p) = self.validator {
             check_path_safe(p, "validator")?;
+        }
+        if let Some(ref p) = self.checker.path {
+            check_path_safe(p, "checker.path")?;
+        }
+        for p in &self.tests.samples {
+            check_path_safe(p, "tests.samples")?;
+        }
+        for m in &self.tests.manual {
+            check_path_safe(&m.input, "tests.manual.input")?;
+        }
+        for g in &self.tests.generators {
+            check_path_safe(Path::new(&g.generator), "tests.gen.generator")?;
+        }
+        if let Some(ref grader) = self.grader {
+            for f in &grader.files {
+                check_path_safe(f, "grader.files")?;
+            }
+            for h in &grader.headers {
+                check_path_safe(h, "grader.headers")?;
+            }
         }
         for sol in &self.solutions {
             check_path_safe(&sol.path, "solutions.path")?;
@@ -902,21 +928,96 @@ memory = "256MiB"
 
     #[test]
     fn test_problem_validation_path_traversal() {
-        let sample = r#"
+        let cases = [
+            (
+                "interactor",
+                r#"
 name = "prob"
 type = "traditional"
 interactor = "../escape.cpp"
 [limits]
 time = "1s"
 memory = "256MiB"
+"#,
+            ),
+            (
+                "checker.path",
+                r#"
+name = "prob"
+type = "traditional"
+[limits]
+time = "1s"
+memory = "256MiB"
+[checker]
+type = "testlib"
+path = "../../outside_checker.cpp"
+"#,
+            ),
+            (
+                "tests.gen.generator",
+                r#"
+name = "prob"
+type = "traditional"
+[limits]
+time = "1s"
+memory = "256MiB"
+[[tests.gen]]
+generator = "../evil_gen.cpp"
+args = "1"
+"#,
+            ),
+            (
+                "tests.manual.input",
+                r#"
+name = "prob"
+type = "traditional"
+[limits]
+time = "1s"
+memory = "256MiB"
+[[tests.manual]]
+input = "../secret.txt"
+"#,
+            ),
+            (
+                "grader.files",
+                r#"
+name = "prob"
+type = "grader"
+[limits]
+time = "1s"
+memory = "256MiB"
+[grader]
+files = ["../outside_grader.cpp"]
+"#,
+            ),
+        ];
+
+        for (field, sample) in cases {
+            let res = ProblemConfig::from_toml_str(sample, None);
+            assert!(res.is_err(), "Expected path traversal error for {field}");
+            let msg = res.unwrap_err().message;
+            assert!(
+                msg.contains("forbidden parent reference '..'"),
+                "Unexpected error for {field}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_star_topology_config_allowed() {
+        let sample = r#"
+name = "comm_star"
+type = "communication"
+manager = "manager.cpp"
+processes = 2
+communication_topology = "star"
+[limits]
+time = "1s"
+memory = "256MiB"
 "#;
-        let res = ProblemConfig::from_toml_str(sample, None);
-        assert!(res.is_err());
-        assert!(
-            res.unwrap_err()
-                .message
-                .contains("forbidden parent reference '..'")
-        );
+        let cfg = ProblemConfig::from_toml_str(sample, None).unwrap();
+        assert_eq!(cfg.communication_topology.as_deref(), Some("star"));
+        assert_eq!(cfg.processes, Some(2));
     }
 
     #[test]

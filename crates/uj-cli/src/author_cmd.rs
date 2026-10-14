@@ -288,41 +288,64 @@ pub fn run_build_with_session(
         Err(e) => return handle_config_error(e, format == OutputFormat::Json),
     };
 
-    let mut to_compile: Vec<PathBuf> = Vec::new();
+    let mut to_compile: Vec<(PathBuf, bool)> = Vec::new();
+    let sol_paths: std::collections::HashSet<PathBuf> = cfg
+        .solutions
+        .iter()
+        .map(|sol| {
+            if sol.path.is_absolute() {
+                sol.path.clone()
+            } else {
+                problem_dir.join(&sol.path)
+            }
+        })
+        .collect();
 
     if targets.is_empty() {
         if let Some(ref v) = cfg.validator {
-            to_compile.push(if v.is_absolute() {
-                v.clone()
-            } else {
-                problem_dir.join(v)
-            });
+            to_compile.push((
+                if v.is_absolute() {
+                    v.clone()
+                } else {
+                    problem_dir.join(v)
+                },
+                false,
+            ));
         }
         if let Some(ref chk) = cfg.checker.path {
-            to_compile.push(if chk.is_absolute() {
-                chk.clone()
-            } else {
-                problem_dir.join(chk)
-            });
+            to_compile.push((
+                if chk.is_absolute() {
+                    chk.clone()
+                } else {
+                    problem_dir.join(chk)
+                },
+                false,
+            ));
         }
         if let Some(ref int) = cfg.interactor {
-            to_compile.push(if int.is_absolute() {
-                int.clone()
-            } else {
-                problem_dir.join(int)
-            });
+            to_compile.push((
+                if int.is_absolute() {
+                    int.clone()
+                } else {
+                    problem_dir.join(int)
+                },
+                false,
+            ));
         }
         if let Some(ref mgr) = cfg.manager {
-            to_compile.push(if mgr.is_absolute() {
-                mgr.clone()
-            } else {
-                problem_dir.join(mgr)
-            });
+            to_compile.push((
+                if mgr.is_absolute() {
+                    mgr.clone()
+                } else {
+                    problem_dir.join(mgr)
+                },
+                false,
+            ));
         }
         for g in &cfg.tests.generators {
             let p = problem_dir.join(&g.generator);
-            if p.exists() && !to_compile.contains(&p) {
-                to_compile.push(p);
+            if p.exists() && !to_compile.iter().any(|(tp, _)| tp == &p) {
+                to_compile.push((p, false));
             }
         }
         for sol in &cfg.solutions {
@@ -331,17 +354,19 @@ pub fn run_build_with_session(
             } else {
                 problem_dir.join(&sol.path)
             };
-            if p.exists() && !to_compile.contains(&p) {
-                to_compile.push(p);
+            if p.exists() && !to_compile.iter().any(|(tp, _)| tp == &p) {
+                to_compile.push((p, true));
             }
         }
     } else {
         for t in targets {
-            to_compile.push(problem_dir.join(t));
+            let p = problem_dir.join(t);
+            let is_sol = sol_paths.contains(&p) || t.replace('\\', "/").starts_with("solutions/");
+            to_compile.push((p, is_sol));
         }
     }
 
-    to_compile.retain(|target| {
+    to_compile.retain(|(target, _)| {
         !target
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
@@ -366,28 +391,37 @@ pub fn run_build_with_session(
         Failed { target: PathBuf, error: String },
     }
 
-    let (job_tx, job_rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<(PathBuf, bool)>();
     let (res_tx, res_rx) = crossbeam_channel::unbounded::<BuildMsg>();
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    for target in to_compile {
-        let _ = job_tx.send(target);
+    for item in to_compile {
+        let _ = job_tx.send(item);
     }
     drop(job_tx);
 
+    let cfg_arc = Arc::new(cfg);
+    let p_dir_arc = problem_dir.to_path_buf();
     let mut handles = Vec::new();
     for _ in 0..num_workers {
         let job_rx = job_rx.clone();
         let res_tx = res_tx.clone();
         let stop = stop_flag.clone();
         let session = compile_session.clone();
+        let cfg_w = Arc::clone(&cfg_arc);
+        let p_dir_w = p_dir_arc.clone();
 
         let handle = std::thread::spawn(move || {
-            while let Ok(target) = job_rx.recv() {
+            while let Ok((target, is_sol)) = job_rx.recv() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                match session.compile(&target, no_cache) {
+                let comp_res = if is_sol {
+                    session.compile_problem_solution(&p_dir_w, &cfg_w, &target, no_cache)
+                } else {
+                    session.compile(&target, no_cache)
+                };
+                match comp_res {
                     Ok(c) => {
                         let _ = res_tx.send(BuildMsg::Success {
                             target,
@@ -990,7 +1024,7 @@ pub fn run_ans_with_session(
     };
 
     let sol_path = problem_dir.join(&main_sol.path);
-    let compiled = match session.compile(&sol_path, false) {
+    let compiled = match session.compile_problem_solution(problem_dir, &cfg, &sol_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile main solution: {e}");
@@ -1025,6 +1059,7 @@ pub fn run_ans_with_session(
         name: String,
         input_path: PathBuf,
         ans_path: PathBuf,
+        in_hash: String,
     }
 
     enum AnsResult {
@@ -1076,16 +1111,19 @@ pub fn run_ans_with_session(
             name: test.name.clone(),
             input_path: test.input_path.clone(),
             ans_path,
+            in_hash,
         });
     }
     drop(job_tx);
 
-    let sol_binary = compiled.binary_path.clone();
+    let sol_binary =
+        uj_sandbox::get_or_prepare_authorized_binary(&compiled.binary_path, problem_dir)
+            .unwrap_or_else(|_| compiled.binary_path.clone());
     let prob_dir = problem_dir.to_path_buf();
     let run_limits = limits.clone();
 
     let mut handles = Vec::new();
-    for _ in 0..num_workers {
+    for worker_idx in 0..num_workers {
         let job_rx = job_rx.clone();
         let res_tx = res_tx.clone();
         let stop = stop_flag.clone();
@@ -1106,6 +1144,16 @@ pub fn run_ans_with_session(
                     return;
                 }
             };
+            let slot_box = match uj_sandbox::create_slot_box_dir(&p_dir, worker_idx) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = res_tx.send(AnsResult::Error {
+                        err: format!("Failed to create sandbox box dir: {e}"),
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
             let _ = sandbox.authorize_executable(&sol_bin);
 
             while let Ok(job) = job_rx.recv() {
@@ -1113,6 +1161,7 @@ pub fn run_ans_with_session(
                     break;
                 }
 
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
                 match crate::author_steps::exec_ans(
                     sandbox.as_ref(),
                     &sol_bin,
@@ -1120,6 +1169,8 @@ pub fn run_ans_with_session(
                     &job.input_path,
                     &job.ans_path,
                     &p_dir,
+                    &slot_box.box_dir,
+                    Some(&job.in_hash),
                     &limits,
                     force,
                     &cancel,
@@ -1467,7 +1518,12 @@ pub fn run_verify_with_session(
                     break;
                 }
                 let sol_path = problem_dir_w.join(&sol.path);
-                let compiled = match session_w.compile(&sol_path, no_cache) {
+                let compiled = match session_w.compile_problem_solution(
+                    &problem_dir_w,
+                    &p_ctx.config,
+                    &sol_path,
+                    no_cache,
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(PreparedSol::CompileError(idx, e.to_string()));
@@ -1891,6 +1947,14 @@ pub fn run_tl_with_session(
     let mut t_main = 0u64;
     let mut t_slowest_ac = 0u64;
     let mut peak_mem_kb = 0u64;
+    let mut subtask_main_ms: std::collections::BTreeMap<u32, u64> =
+        std::collections::BTreeMap::new();
+    let mut subtask_slowest_ac_ms: std::collections::BTreeMap<u32, u64> =
+        std::collections::BTreeMap::new();
+    for st in &cfg.subtasks {
+        subtask_main_ms.insert(st.id, 0);
+        subtask_slowest_ac_ms.insert(st.id, 0);
+    }
 
     let total_sols = target_solutions.len();
     for (sol_idx, sol) in target_solutions.into_iter().enumerate() {
@@ -1898,7 +1962,7 @@ pub fn run_tl_with_session(
             return ExitCode::from(EXIT_INTERRUPTED);
         }
         let sol_path = problem_dir.join(&sol.path);
-        let compiled = match session.compile(&sol_path, false) {
+        let compiled = match session.compile_problem_solution(problem_dir, &cfg, &sol_path, false) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Failed to compile solution: {e}");
@@ -2019,6 +2083,16 @@ pub fn run_tl_with_session(
                         t_main = t_main.max(max_ms);
                     }
                     t_slowest_ac = t_slowest_ac.max(max_ms);
+                    for t in &report.tests {
+                        if let Some(st_id) = t.subtask {
+                            if sol.tag == SolutionTag::Main {
+                                let e = subtask_main_ms.entry(st_id).or_insert(0);
+                                *e = (*e).max(t.time_ms);
+                            }
+                            let e_ac = subtask_slowest_ac_ms.entry(st_id).or_insert(0);
+                            *e_ac = (*e_ac).max(t.time_ms);
+                        }
+                    }
                 }
                 Err(e) => {
                     if let Some(h) = event_thread {
@@ -2057,8 +2131,8 @@ pub fn run_tl_with_session(
     };
 
     if apply {
-        let pattern = regex::Regex::new(r#"(?m)^\s*time\s*=\s*"[^"]*""#).unwrap();
-        let updated = pattern.replace(&content, format!(r#"time = "{formatted_tl}""#));
+        let pattern = regex::Regex::new(r#"(?m)^([ \t]*time\s*=\s*)"[^"]*""#).unwrap();
+        let updated = pattern.replace(&content, format!(r#"${{1}}"{formatted_tl}""#));
         if let Err(e) = fs::write(&config_path, updated.as_bytes()) {
             if format == OutputFormat::Json {
                 let err = serde_json::json!({
@@ -2076,6 +2150,18 @@ pub fn run_tl_with_session(
         }
     }
 
+    let subtask_stats_json: Vec<serde_json::Value> = subtask_slowest_ac_ms
+        .iter()
+        .map(|(&st_id, &ac_ms)| {
+            let main_ms = subtask_main_ms.get(&st_id).copied().unwrap_or(0);
+            serde_json::json!({
+                "id": st_id,
+                "t_main_ms": main_ms,
+                "t_slowest_ac_ms": ac_ms
+            })
+        })
+        .collect();
+
     if format == OutputFormat::Json {
         let res = serde_json::json!({
             "ok": true,
@@ -2084,6 +2170,7 @@ pub fn run_tl_with_session(
             "peak_memory_kb": peak_mem_kb,
             "recommended_tl_ms": rec_tl_ms,
             "recommended_tl": formatted_tl,
+            "subtask_stats": subtask_stats_json,
             "applied": apply
         });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
@@ -2097,6 +2184,13 @@ pub fn run_tl_with_session(
         println!("  Main solution peak CPU:       {t_main} ms");
         println!("  Slowest accepted peak CPU:    {t_slowest_ac} ms");
         println!("  Peak memory observed:         {mem_str}");
+        if !subtask_slowest_ac_ms.is_empty() {
+            println!("  Subtask peak CPU breakdown:");
+            for (&st_id, &ac_ms) in &subtask_slowest_ac_ms {
+                let main_ms = subtask_main_ms.get(&st_id).copied().unwrap_or(0);
+                println!("    Subtask #{st_id}: main={main_ms} ms, slowest_ac={ac_ms} ms");
+            }
+        }
         println!("  Recommended Time Limit:       {formatted_tl} ({rec_tl_ms} ms)");
         if apply {
             println!("  [Applied] Updated limits.time in problem.toml");
@@ -2119,7 +2213,7 @@ pub fn run_stress(
     count: usize,
     seed_opt: Option<u64>,
     time_budget_str: &str,
-    _cli: &Cli,
+    cli: &Cli,
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
@@ -2134,6 +2228,11 @@ pub fn run_stress(
     let sol_path = problem_dir.join(sol_src);
     let brute_path = problem_dir.join(brute_src);
 
+    let config_path = problem_dir.join("problem.toml");
+    let cfg_opt = fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|c| ProblemConfig::from_toml_str(&c, Some(&config_path)).ok());
+
     let compile_session = CompileSession::new();
     let compiled_gen = match compile_session.compile(&gen_path, false) {
         Ok(c) => c,
@@ -2142,14 +2241,22 @@ pub fn run_stress(
             return ExitCode::from(EXIT_COMPILE_ERROR);
         }
     };
-    let compiled_sol = match compile_session.compile(&sol_path, false) {
+    let compiled_sol = match if let Some(ref cfg) = cfg_opt {
+        compile_session.compile_problem_solution(problem_dir, cfg, &sol_path, false)
+    } else {
+        compile_session.compile(&sol_path, false)
+    } {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile target solution: {e}");
             return ExitCode::from(EXIT_COMPILE_ERROR);
         }
     };
-    let compiled_brute = match compile_session.compile(&brute_path, false) {
+    let compiled_brute = match if let Some(ref cfg) = cfg_opt {
+        compile_session.compile_problem_solution(problem_dir, cfg, &brute_path, false)
+    } else {
+        compile_session.compile(&brute_path, false)
+    } {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to compile brute oracle: {e}");
@@ -2157,247 +2264,495 @@ pub fn run_stress(
         }
     };
 
-    let sandbox = match create_sandbox("auto", false) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Sandbox error: {e}");
-            return ExitCode::from(EXIT_JUDGE_FAILED);
-        }
+    let (resolved_checker, pe_as_wa, sol_limits) = if let Some(ref cfg) = cfg_opt {
+        let lim = cfg
+            .to_limits()
+            .unwrap_or_else(|_| Limits::new(5000, 512 * 1024 * 1024));
+        let pe = cfg.checker.pe_as_wa;
+        let chk = match ProblemContext::prepare(0, problem_dir, cfg, &compile_session) {
+            Ok(p_ctx) => p_ctx.resolved_checker.clone(),
+            Err(_) => {
+                let name = cfg.checker.name.as_deref().unwrap_or("wcmp");
+                uj_engine::judge::ResolvedChecker::Builtin(
+                    BuiltinCheckerType::parse(name).unwrap_or(BuiltinCheckerType::Wcmp),
+                )
+            }
+        };
+        (chk, pe, lim)
+    } else {
+        (
+            uj_engine::judge::ResolvedChecker::Builtin(BuiltinCheckerType::Wcmp),
+            false,
+            Limits::new(5000, 512 * 1024 * 1024),
+        )
     };
-    let _ = sandbox.authorize_executable(&compiled_gen.binary_path);
-    let _ = sandbox.authorize_executable(&compiled_sol.binary_path);
-    let _ = sandbox.authorize_executable(&compiled_brute.binary_path);
 
-    let wcmp = BuiltinCheckerType::Wcmp;
+    let gen_bin =
+        uj_sandbox::get_or_prepare_authorized_binary(&compiled_gen.binary_path, problem_dir)
+            .unwrap_or_else(|_| compiled_gen.binary_path.clone());
+    let sol_bin =
+        uj_sandbox::get_or_prepare_authorized_binary(&compiled_sol.binary_path, problem_dir)
+            .unwrap_or_else(|_| compiled_sol.binary_path.clone());
+    let brute_bin =
+        uj_sandbox::get_or_prepare_authorized_binary(&compiled_brute.binary_path, problem_dir)
+            .unwrap_or_else(|_| compiled_brute.binary_path.clone());
+
+    let topo = uj_engine::topology::Topology::detect(sol_limits.memory_bytes, cli.jobs);
+    let num_workers = topo.slots.len().max(1).min(count.max(1));
+
     let seed_start = seed_opt.unwrap_or(1);
     let seed_counter = Arc::new(AtomicU64::new(seed_start));
+    let iter_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let mut iterations = 0;
-    while iterations < count && start_time.elapsed() < budget {
-        if cancel.is_cancelled() {
-            return ExitCode::from(EXIT_INTERRUPTED);
-        }
+    enum StressFailure {
+        GeneratorFailed {
+            seed: u64,
+            reason: String,
+        },
+        BruteFailed {
+            seed: u64,
+            reason: String,
+        },
+        ExecutionError {
+            message: String,
+        },
+        SolutionFailed {
+            seed: u64,
+            reason: String,
+            in_bytes: Vec<u8>,
+            sol_bytes: Vec<u8>,
+        },
+        Mismatch {
+            seed: u64,
+            diff: Option<String>,
+            in_bytes: Vec<u8>,
+            sol_bytes: Vec<u8>,
+            brute_bytes: Vec<u8>,
+        },
+    }
 
-        let seed = seed_counter.fetch_add(1, Ordering::SeqCst);
-        iterations += 1;
+    let (fail_tx, fail_rx) = crossbeam_channel::unbounded::<StressFailure>();
+    let mut handles = Vec::new();
 
-        // 1. Generate input
-        let limits = Limits::new(5000, 512 * 1024 * 1024);
-        let spec_gen = RunSpec {
-            argv: vec![
-                compiled_gen.binary_path.as_os_str().to_os_string(),
-                std::ffi::OsString::from(format!("{seed}")),
-            ],
-            env: vec![],
-            work_dir: problem_dir.to_path_buf(),
-            ro_binds: vec![],
-            stdin: Stdio::Null,
-            stdout: Stdio::Pipe,
-            stderr: Stdio::Pipe,
-            extra_fds: vec![],
-            limits: limits.clone(),
-            cpu_affinity: None,
-            seccomp_profile: Default::default(),
-            trusted: true,
-        };
+    for worker_idx in 0..num_workers {
+        let seed_counter = Arc::clone(&seed_counter);
+        let iter_counter = Arc::clone(&iter_counter);
+        let stop = Arc::clone(&stop_flag);
+        let cancel = cancel.clone();
+        let fail_tx = fail_tx.clone();
+        let p_dir = problem_dir.to_path_buf();
+        let gen_bin = gen_bin.clone();
+        let sol_bin = sol_bin.clone();
+        let brute_bin = brute_bin.clone();
+        let checker = resolved_checker.clone();
+        let sol_limits = sol_limits.clone();
 
-        let gen_res = match sandbox.run(&spec_gen, cancel) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Generator failed: {e}");
-                return ExitCode::from(EXIT_JUDGE_FAILED);
+        let handle = std::thread::spawn(move || {
+            let sandbox = match create_sandbox("auto", false) {
+                Ok(s) => s,
+                Err(e) => {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::ExecutionError {
+                        message: format!("Sandbox error: {e}"),
+                    });
+                    return;
+                }
+            };
+            let slot_box = match uj_sandbox::create_slot_box_dir(&p_dir, 5000 + worker_idx) {
+                Ok(b) => b,
+                Err(e) => {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::ExecutionError {
+                        message: format!("Failed to create sandbox box dir: {e}"),
+                    });
+                    return;
+                }
+            };
+            let _ = sandbox.authorize_executable(&gen_bin);
+            let _ = sandbox.authorize_executable(&sol_bin);
+            let _ = sandbox.authorize_executable(&brute_bin);
+            match &checker {
+                uj_engine::judge::ResolvedChecker::Testlib(chk_exe)
+                | uj_engine::judge::ResolvedChecker::Lemon { path: chk_exe, .. } => {
+                    let _ = sandbox.authorize_executable(chk_exe);
+                }
+                uj_engine::judge::ResolvedChecker::Builtin(_) => {}
             }
-        };
 
-        if !gen_res.status.is_success() || gen_res.killed_by.is_some() || gen_res.oom_killed {
-            let stderr_msg = String::from_utf8_lossy(&gen_res.stderr_tail);
-            let reason = format!(
-                "Generator failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
-                gen_res.status,
-                gen_res.killed_by,
-                gen_res.oom_killed,
-                stderr_msg.trim()
-            );
-            if format == OutputFormat::Json {
-                let res = serde_json::json!({
-                    "ok": false,
-                    "seed": seed,
-                    "error": {
-                        "kind": "GeneratorFailed",
-                        "message": reason
+            let gen_limits = Limits::new(5000, 512 * 1024 * 1024);
+
+            loop {
+                if stop.load(Ordering::Relaxed)
+                    || cancel.is_cancelled()
+                    || start_time.elapsed() >= budget
+                {
+                    break;
+                }
+
+                let prev_iter = iter_counter.fetch_add(1, Ordering::SeqCst);
+                if prev_iter >= count {
+                    iter_counter.fetch_sub(1, Ordering::SeqCst);
+                    break;
+                }
+                let seed = seed_counter.fetch_add(1, Ordering::SeqCst);
+
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+
+                // 1. Generate input inside isolated slot box
+                let spec_gen = RunSpec {
+                    argv: vec![
+                        gen_bin.as_os_str().to_os_string(),
+                        std::ffi::OsString::from(format!("{seed}")),
+                    ],
+                    env: vec![],
+                    work_dir: slot_box.box_dir.clone(),
+                    ro_binds: vec![],
+                    stdin: Stdio::Null,
+                    stdout: Stdio::Pipe,
+                    stderr: Stdio::Pipe,
+                    extra_fds: vec![],
+                    limits: gen_limits.clone(),
+                    cpu_affinity: None,
+                    seccomp_profile: Default::default(),
+                    trusted: true,
+                };
+
+                let gen_res = match sandbox.run(&spec_gen, &cancel) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = fail_tx.send(StressFailure::ExecutionError {
+                            message: format!("Generator failed: {e}"),
+                        });
+                        break;
                     }
-                });
-                println!("{}", serde_json::to_string_pretty(&res).unwrap());
-            } else if format == OutputFormat::Human {
-                eprintln!("{reason}");
-            }
-            return ExitCode::from(EXIT_JUDGE_FAILED);
-        }
+                };
 
-        let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
+                if !gen_res.status.is_success() || gen_res.killed_by.is_some() || gen_res.oom_killed
+                {
+                    let stderr_msg = String::from_utf8_lossy(&gen_res.stderr_tail);
+                    let reason = format!(
+                        "Generator failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
+                        gen_res.status,
+                        gen_res.killed_by,
+                        gen_res.oom_killed,
+                        stderr_msg.trim()
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::GeneratorFailed { seed, reason });
+                    break;
+                }
 
-        // Write temp input to sandbox scratch
-        let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
-        let in_tmp = scratch_dir.join(format!("stress_{seed}.in"));
-        let _ = fs::write(&in_tmp, &in_bytes);
+                let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
+                let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+                let in_tmp = scratch_dir.join(format!("stress_{worker_idx}_{seed}.in"));
+                let _ = fs::write(&in_tmp, &in_bytes);
 
-        // 2. Run target solution
-        let spec_sol = RunSpec {
-            argv: vec![compiled_sol.binary_path.as_os_str().to_os_string()],
-            env: vec![],
-            work_dir: scratch_dir.clone(),
-            ro_binds: vec![],
-            stdin: Stdio::File(in_tmp.clone()),
-            stdout: Stdio::Pipe,
-            stderr: Stdio::Pipe,
-            extra_fds: vec![],
-            limits: limits.clone(),
-            cpu_affinity: None,
-            seccomp_profile: Default::default(),
-            trusted: false,
-        };
+                // 2. Run target solution inside isolated slot box
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+                let spec_sol = RunSpec {
+                    argv: vec![sol_bin.as_os_str().to_os_string()],
+                    env: vec![],
+                    work_dir: slot_box.box_dir.clone(),
+                    ro_binds: vec![],
+                    stdin: Stdio::File(in_tmp.clone()),
+                    stdout: Stdio::Pipe,
+                    stderr: Stdio::Pipe,
+                    extra_fds: vec![],
+                    limits: sol_limits.clone(),
+                    cpu_affinity: None,
+                    seccomp_profile: Default::default(),
+                    trusted: false,
+                };
 
-        let sol_res = match sandbox.run(&spec_sol, cancel) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = fs::remove_file(&in_tmp);
-                eprintln!("Solution execution failed: {e}");
-                return ExitCode::from(EXIT_JUDGE_FAILED);
-            }
-        };
-
-        if !sol_res.status.is_success() || sol_res.killed_by.is_some() || sol_res.oom_killed {
-            let stress_dir = problem_dir.join("stress");
-            let _ = fs::create_dir_all(&stress_dir);
-            let fail_in = stress_dir.join(format!("fail-{seed}.in"));
-            let fail_sol = stress_dir.join(format!("fail-{seed}.sol.out"));
-            let _ = fs::write(&fail_in, &in_bytes);
-            let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
-            let _ = fs::write(&fail_sol, &sol_bytes);
-            let reason = format!(
-                "Solution failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
-                sol_res.status,
-                sol_res.killed_by,
-                sol_res.oom_killed,
-                String::from_utf8_lossy(&sol_res.stderr_tail).trim()
-            );
-            if format == OutputFormat::Json {
-                let res = serde_json::json!({
-                    "ok": false,
-                    "seed": seed,
-                    "diff": reason,
-                    "saved_to": stress_dir.to_string_lossy()
-                });
-                println!("{}", serde_json::to_string_pretty(&res).unwrap());
-            } else if format == OutputFormat::Human {
-                println!("=== Stress Test Failure Found on Seed {seed} ===");
-                println!("  Message:    {reason}");
-                println!("  Input:      {}", fail_in.display());
-                println!(
-                    "  Repro:      uj run -- {} < {}",
-                    compiled_sol.binary_path.display(),
-                    fail_in.display()
-                );
-            }
-            let _ = fs::remove_file(&in_tmp);
-            return ExitCode::from(EXIT_NON_AC);
-        }
-
-        // 3. Run brute oracle
-        let spec_brute = RunSpec {
-            argv: vec![compiled_brute.binary_path.as_os_str().to_os_string()],
-            env: vec![],
-            work_dir: scratch_dir,
-            ro_binds: vec![],
-            stdin: Stdio::File(in_tmp.clone()),
-            stdout: Stdio::Pipe,
-            stderr: Stdio::Pipe,
-            extra_fds: vec![],
-            limits,
-            cpu_affinity: None,
-            seccomp_profile: Default::default(),
-            trusted: false,
-        };
-
-        let brute_res = match sandbox.run(&spec_brute, cancel) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = fs::remove_file(&in_tmp);
-                eprintln!("Brute execution failed: {e}");
-                return ExitCode::from(EXIT_JUDGE_FAILED);
-            }
-        };
-
-        let _ = fs::remove_file(&in_tmp);
-
-        if !brute_res.status.is_success() || brute_res.killed_by.is_some() || brute_res.oom_killed {
-            let stderr_msg = String::from_utf8_lossy(&brute_res.stderr_tail);
-            let reason = format!(
-                "Brute oracle failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
-                brute_res.status,
-                brute_res.killed_by,
-                brute_res.oom_killed,
-                stderr_msg.trim()
-            );
-            if format == OutputFormat::Json {
-                let res = serde_json::json!({
-                    "ok": false,
-                    "seed": seed,
-                    "error": {
-                        "kind": "BruteFailed",
-                        "message": reason
+                let sol_res = match sandbox.run(&spec_sol, &cancel) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = fs::remove_file(&in_tmp);
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = fail_tx.send(StressFailure::ExecutionError {
+                            message: format!("Solution execution failed: {e}"),
+                        });
+                        break;
                     }
-                });
-                println!("{}", serde_json::to_string_pretty(&res).unwrap());
-            } else if format == OutputFormat::Human {
-                eprintln!("{reason}");
+                };
+
+                if !sol_res.status.is_success() || sol_res.killed_by.is_some() || sol_res.oom_killed
+                {
+                    let _ = fs::remove_file(&in_tmp);
+                    let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
+                    let reason = format!(
+                        "Solution failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
+                        sol_res.status,
+                        sol_res.killed_by,
+                        sol_res.oom_killed,
+                        String::from_utf8_lossy(&sol_res.stderr_tail).trim()
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::SolutionFailed {
+                        seed,
+                        reason,
+                        in_bytes,
+                        sol_bytes,
+                    });
+                    break;
+                }
+
+                // 3. Run brute oracle inside isolated slot box
+                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+                let mut brute_limits = sol_limits.clone();
+                brute_limits.cpu_time_ms = brute_limits.cpu_time_ms.max(5000);
+                brute_limits.wall_time_ms = brute_limits.wall_time_ms.max(15000);
+                let spec_brute = RunSpec {
+                    argv: vec![brute_bin.as_os_str().to_os_string()],
+                    env: vec![],
+                    work_dir: slot_box.box_dir.clone(),
+                    ro_binds: vec![],
+                    stdin: Stdio::File(in_tmp.clone()),
+                    stdout: Stdio::Pipe,
+                    stderr: Stdio::Pipe,
+                    extra_fds: vec![],
+                    limits: brute_limits,
+                    cpu_affinity: None,
+                    seccomp_profile: Default::default(),
+                    trusted: false,
+                };
+
+                let brute_res = match sandbox.run(&spec_brute, &cancel) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = fs::remove_file(&in_tmp);
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = fail_tx.send(StressFailure::ExecutionError {
+                            message: format!("Brute execution failed: {e}"),
+                        });
+                        break;
+                    }
+                };
+
+                if !brute_res.status.is_success()
+                    || brute_res.killed_by.is_some()
+                    || brute_res.oom_killed
+                {
+                    let _ = fs::remove_file(&in_tmp);
+                    let stderr_msg = String::from_utf8_lossy(&brute_res.stderr_tail);
+                    let reason = format!(
+                        "Brute oracle failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
+                        brute_res.status,
+                        brute_res.killed_by,
+                        brute_res.oom_killed,
+                        stderr_msg.trim()
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::BruteFailed { seed, reason });
+                    break;
+                }
+
+                let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
+                let brute_bytes = brute_res.stdout.map(|o| o.bytes).unwrap_or_default();
+
+                // 4. Compare using problem's configured checker
+                let check = match &checker {
+                    uj_engine::judge::ResolvedChecker::Builtin(b) => {
+                        let mut cr = b.check(&sol_bytes, &brute_bytes);
+                        if pe_as_wa && cr.verdict == Verdict::PresentationError {
+                            cr.verdict = Verdict::WrongAnswer;
+                        }
+                        cr
+                    }
+                    uj_engine::judge::ResolvedChecker::Testlib(chk_exe) => {
+                        let out_tmp = scratch_dir.join(format!("stress_{worker_idx}_{seed}.out"));
+                        let ans_tmp = scratch_dir.join(format!("stress_{worker_idx}_{seed}.ans"));
+                        let _ = fs::write(&out_tmp, &sol_bytes);
+                        let _ = fs::write(&ans_tmp, &brute_bytes);
+                        let cr = uj_checker::testlib::run_testlib_checker(
+                            sandbox.as_ref(),
+                            chk_exe,
+                            &in_tmp,
+                            &out_tmp,
+                            &ans_tmp,
+                            pe_as_wa,
+                            &cancel,
+                        );
+                        let _ = fs::remove_file(&out_tmp);
+                        let _ = fs::remove_file(&ans_tmp);
+                        cr
+                    }
+                    uj_engine::judge::ResolvedChecker::Lemon {
+                        path: chk_exe,
+                        full_score,
+                    } => {
+                        let out_tmp = scratch_dir.join(format!("stress_{worker_idx}_{seed}.out"));
+                        let ans_tmp = scratch_dir.join(format!("stress_{worker_idx}_{seed}.ans"));
+                        let _ = fs::write(&out_tmp, &sol_bytes);
+                        let _ = fs::write(&ans_tmp, &brute_bytes);
+                        let cr = uj_checker::lemon::run_lemon_checker(
+                            sandbox.as_ref(),
+                            chk_exe,
+                            &in_tmp,
+                            &out_tmp,
+                            &ans_tmp,
+                            *full_score,
+                            &cancel,
+                        );
+                        let _ = fs::remove_file(&out_tmp);
+                        let _ = fs::remove_file(&ans_tmp);
+                        cr
+                    }
+                };
+                let _ = fs::remove_file(&in_tmp);
+
+                if !check.verdict.is_accepted() {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::Mismatch {
+                        seed,
+                        diff: check.message,
+                        in_bytes,
+                        sol_bytes,
+                        brute_bytes,
+                    });
+                    break;
+                }
             }
-            return ExitCode::from(EXIT_JUDGE_FAILED);
-        }
+        });
+        handles.push(handle);
+    }
+    drop(fail_tx);
 
-        let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
-        let brute_bytes = brute_res.stdout.map(|o| o.bytes).unwrap_or_default();
+    let mut failures: Vec<StressFailure> = fail_rx.into_iter().collect();
+    for h in handles {
+        let _ = h.join();
+    }
 
-        let check = wcmp.check(&sol_bytes, &brute_bytes);
-        if !check.verdict.is_accepted() {
-            // Mismatch found!
-            let stress_dir = problem_dir.join("stress");
-            let _ = fs::create_dir_all(&stress_dir);
-            let fail_in = stress_dir.join(format!("fail-{seed}.in"));
-            let fail_sol = stress_dir.join(format!("fail-{seed}.sol.out"));
-            let fail_brute = stress_dir.join(format!("fail-{seed}.brute.out"));
+    if cancel.is_cancelled() {
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
 
-            let _ = fs::write(&fail_in, &in_bytes);
-            let _ = fs::write(&fail_sol, &sol_bytes);
-            let _ = fs::write(&fail_brute, &brute_bytes);
-
-            if format == OutputFormat::Json {
-                let res = serde_json::json!({
-                    "ok": false,
-                    "seed": seed,
-                    "diff": check.message,
-                    "saved_to": stress_dir.to_string_lossy()
-                });
-                println!("{}", serde_json::to_string_pretty(&res).unwrap());
-            } else {
-                println!("=== Stress Test Mismatch Found on Seed {seed} ===");
-                println!(
-                    "  Message:    {}",
-                    check.message.as_deref().unwrap_or("Output mismatch")
-                );
-                println!("  Input:      {}", fail_in.display());
-                println!("  Target:     {}", fail_sol.display());
-                println!("  Expected:   {}", fail_brute.display());
-                println!(
-                    "  Repro:      uj run -- {} < {}",
-                    compiled_sol.binary_path.display(),
-                    fail_in.display()
-                );
+    if !failures.is_empty() {
+        // Pick failure with smallest seed for deterministic reporting
+        failures.sort_by_key(|f| match f {
+            StressFailure::GeneratorFailed { seed, .. }
+            | StressFailure::BruteFailed { seed, .. }
+            | StressFailure::SolutionFailed { seed, .. }
+            | StressFailure::Mismatch { seed, .. } => *seed,
+            StressFailure::ExecutionError { .. } => 0,
+        });
+        match failures.remove(0) {
+            StressFailure::ExecutionError { message } => {
+                eprintln!("{message}");
+                return ExitCode::from(EXIT_JUDGE_FAILED);
             }
-            return ExitCode::from(EXIT_NON_AC);
+            StressFailure::GeneratorFailed { seed, reason } => {
+                if format == OutputFormat::Json {
+                    let res = serde_json::json!({
+                        "ok": false,
+                        "seed": seed,
+                        "error": {
+                            "kind": "GeneratorFailed",
+                            "message": reason
+                        }
+                    });
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                } else if format == OutputFormat::Human {
+                    eprintln!("{reason}");
+                }
+                return ExitCode::from(EXIT_JUDGE_FAILED);
+            }
+            StressFailure::BruteFailed { seed, reason } => {
+                if format == OutputFormat::Json {
+                    let res = serde_json::json!({
+                        "ok": false,
+                        "seed": seed,
+                        "error": {
+                            "kind": "BruteFailed",
+                            "message": reason
+                        }
+                    });
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                } else if format == OutputFormat::Human {
+                    eprintln!("{reason}");
+                }
+                return ExitCode::from(EXIT_JUDGE_FAILED);
+            }
+            StressFailure::SolutionFailed {
+                seed,
+                reason,
+                in_bytes,
+                sol_bytes,
+            } => {
+                let stress_dir = problem_dir.join("stress");
+                let _ = fs::create_dir_all(&stress_dir);
+                let fail_in = stress_dir.join(format!("fail-{seed}.in"));
+                let fail_sol = stress_dir.join(format!("fail-{seed}.sol.out"));
+                let _ = fs::write(&fail_in, &in_bytes);
+                let _ = fs::write(&fail_sol, &sol_bytes);
+                if format == OutputFormat::Json {
+                    let res = serde_json::json!({
+                        "ok": false,
+                        "seed": seed,
+                        "diff": reason,
+                        "saved_to": stress_dir.to_string_lossy()
+                    });
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                } else if format == OutputFormat::Human {
+                    println!("=== Stress Test Failure Found on Seed {seed} ===");
+                    println!("  Message:    {reason}");
+                    println!("  Input:      {}", fail_in.display());
+                    println!(
+                        "  Repro:      uj run -- {} < {}",
+                        compiled_sol.binary_path.display(),
+                        fail_in.display()
+                    );
+                }
+                return ExitCode::from(EXIT_NON_AC);
+            }
+            StressFailure::Mismatch {
+                seed,
+                diff,
+                in_bytes,
+                sol_bytes,
+                brute_bytes,
+            } => {
+                let stress_dir = problem_dir.join("stress");
+                let _ = fs::create_dir_all(&stress_dir);
+                let fail_in = stress_dir.join(format!("fail-{seed}.in"));
+                let fail_sol = stress_dir.join(format!("fail-{seed}.sol.out"));
+                let fail_brute = stress_dir.join(format!("fail-{seed}.brute.out"));
+
+                let _ = fs::write(&fail_in, &in_bytes);
+                let _ = fs::write(&fail_sol, &sol_bytes);
+                let _ = fs::write(&fail_brute, &brute_bytes);
+
+                if format == OutputFormat::Json {
+                    let res = serde_json::json!({
+                        "ok": false,
+                        "seed": seed,
+                        "diff": diff,
+                        "saved_to": stress_dir.to_string_lossy()
+                    });
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                } else {
+                    println!("=== Stress Test Mismatch Found on Seed {seed} ===");
+                    println!(
+                        "  Message:    {}",
+                        diff.as_deref().unwrap_or("Output mismatch")
+                    );
+                    println!("  Input:      {}", fail_in.display());
+                    println!("  Target:     {}", fail_sol.display());
+                    println!("  Expected:   {}", fail_brute.display());
+                    println!(
+                        "  Repro:      uj run -- {} < {}",
+                        compiled_sol.binary_path.display(),
+                        fail_in.display()
+                    );
+                }
+                return ExitCode::from(EXIT_NON_AC);
+            }
         }
     }
 
+    let iterations = iter_counter.load(Ordering::SeqCst);
     if format == OutputFormat::Json {
         let res = serde_json::json!({
             "ok": true,

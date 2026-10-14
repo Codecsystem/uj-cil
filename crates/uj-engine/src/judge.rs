@@ -397,109 +397,8 @@ pub fn judge_single_test(
                                     spec.limits.output_bytes.saturating_mul(2),
                                     Limits::DEFAULT_OUTPUT_BYTES,
                                 );
-                                #[allow(clippy::type_complexity)]
-                                static ANSWER_FILE_CACHE: std::sync::LazyLock<
-                                    parking_lot::Mutex<
-                                        std::collections::HashMap<
-                                            PathBuf,
-                                            (
-                                                std::time::SystemTime,
-                                                u64,
-                                                std::sync::Arc<uj_checker::FileBytes>,
-                                            ),
-                                        >,
-                                    >,
-                                > = std::sync::LazyLock::new(|| {
-                                    parking_lot::Mutex::new(std::collections::HashMap::new())
-                                });
-
-                                #[allow(clippy::type_complexity, clippy::result_large_err)]
-                                let ans_bytes_res = (|| -> Result<
-                                    std::sync::Arc<uj_checker::FileBytes>,
-                                    (
-                                        Verdict,
-                                        f64,
-                                        Option<String>,
-                                        Option<String>,
-                                        Option<DiffSummary>,
-                                    ),
-                                > {
-                                    let meta = match fs::metadata(ans_path) {
-                                        Ok(m) => m,
-                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                            return Err((
-                                                Verdict::JudgeFailed,
-                                                0.0,
-                                                Some(format!(
-                                                    "Answer file not found: {}",
-                                                    ans_path.display()
-                                                )),
-                                                None,
-                                                None,
-                                            ));
-                                        }
-                                        Err(e)
-                                            if e.kind() == std::io::ErrorKind::PermissionDenied =>
-                                        {
-                                            return Err((
-                                                Verdict::JudgeFailed,
-                                                0.0,
-                                                Some(format!(
-                                                    "Permission denied reading answer file: {}",
-                                                    ans_path.display()
-                                                )),
-                                                None,
-                                                None,
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            return Err((
-                                                Verdict::JudgeFailed,
-                                                0.0,
-                                                Some(format!("Failed to read answer file: {e}")),
-                                                None,
-                                                None,
-                                            ));
-                                        }
-                                    };
-                                    let len = meta.len();
-                                    if len > ans_limit {
-                                        return Err((
-                                            Verdict::JudgeFailed,
-                                            0.0,
-                                            Some(format!(
-                                                "Answer file exceeded limit: {len} bytes > {ans_limit} bytes"
-                                            )),
-                                            None,
-                                            None,
-                                        ));
-                                    }
-                                    let mtime = meta
-                                        .modified()
-                                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                    let mut cache = ANSWER_FILE_CACHE.lock();
-                                    if let Some((c_mtime, c_len, c_bytes)) = cache.get(ans_path)
-                                        && *c_mtime == mtime
-                                        && *c_len == len
-                                    {
-                                        return Ok(c_bytes.clone());
-                                    }
-                                    let fb = uj_checker::read_file_bytes(ans_path).map_err(|e| {
-                                        (
-                                            Verdict::JudgeFailed,
-                                            0.0,
-                                            Some(format!("Failed to read answer file: {e}")),
-                                            None,
-                                            None,
-                                        )
-                                    })?;
-                                    let arc = std::sync::Arc::new(fb);
-                                    cache.insert(ans_path.to_path_buf(), (mtime, len, arc.clone()));
-                                    Ok(arc)
-                                })();
-
-                                match ans_bytes_res {
-                                    Err(fail_tuple) => fail_tuple,
+                                match read_answer_cached(ans_path, ans_limit) {
+                                    Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg), None, None),
                                     Ok(ans_artifact) => {
                                         let ans_slice = &ans_artifact[..];
 
@@ -620,8 +519,68 @@ pub fn judge_single_test(
     }
 }
 
+/// Read and cache an answer file using zero-copy mmap (or buffered fallback) without holding the
+/// global cache lock across disk I/O.
+pub fn read_answer_cached(
+    ans_path: &Path,
+    ans_limit: u64,
+) -> Result<std::sync::Arc<uj_checker::FileBytes>, String> {
+    #[allow(clippy::type_complexity)]
+    static ANSWER_FILE_CACHE: std::sync::LazyLock<
+        parking_lot::Mutex<
+            std::collections::HashMap<
+                PathBuf,
+                (
+                    std::time::SystemTime,
+                    u64,
+                    std::sync::Arc<uj_checker::FileBytes>,
+                ),
+            >,
+        >,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+    let meta = match fs::metadata(ans_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("Answer file not found: {}", ans_path.display()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(format!(
+                "Permission denied reading answer file: {}",
+                ans_path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!("Failed to read answer file: {e}"));
+        }
+    };
+    let len = meta.len();
+    if len > ans_limit {
+        return Err(format!(
+            "Answer file exceeded limit: {len} bytes > {ans_limit} bytes"
+        ));
+    }
+    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    {
+        let cache = ANSWER_FILE_CACHE.lock();
+        if let Some((c_mtime, c_len, c_bytes)) = cache.get(ans_path)
+            && *c_mtime == mtime
+            && *c_len == len
+        {
+            return Ok(c_bytes.clone());
+        }
+    }
+    let fb = uj_checker::read_file_bytes(ans_path)
+        .map_err(|e| format!("Failed to read answer file: {e}"))?;
+    let arc = std::sync::Arc::new(fb);
+    ANSWER_FILE_CACHE
+        .lock()
+        .insert(ans_path.to_path_buf(), (mtime, len, arc.clone()));
+    Ok(arc)
+}
+
 /// Compute deterministic topological order of subtask configurations.
-fn topological_subtask_order(subtasks: &[uj_core::config::SubtaskConfig]) -> Vec<usize> {
+pub(crate) fn topological_subtask_order(subtasks: &[uj_core::config::SubtaskConfig]) -> Vec<usize> {
     let n = subtasks.len();
     if n <= 1 {
         return (0..n).collect();
@@ -1009,6 +968,7 @@ pub fn judge_interactive_test(
                 to_proc: 1,
             },
         ],
+        star_manager_proc: None,
     };
 
     let start_instant = Instant::now();
@@ -1182,44 +1142,82 @@ pub fn judge_interactive_test(
             if let Some(chk) = checker
                 && tout_file.is_file()
             {
-                // Run post-checker on tout_file if configured
-                let empty_path = PathBuf::new();
-                let ans_file = test.answer_path.as_ref().unwrap_or(&empty_path);
-                match chk {
-                    ResolvedChecker::Builtin(b) => {
-                        let tout_bytes = fs::read(&tout_file).unwrap_or_default();
-                        let ans_bytes = uj_checker::read_file_bytes(ans_file).ok();
-                        let ans_slice = ans_bytes.as_deref().unwrap_or(b"");
-                        let check_res = b.check(&tout_bytes, ans_slice);
-                        (check_res.verdict, check_res.score_ratio, check_res.message)
-                    }
-                    ResolvedChecker::Testlib(chk_exe) => {
-                        let check_res = uj_checker::testlib::run_testlib_checker(
-                            sandbox,
-                            chk_exe,
-                            &test.input_path,
-                            &tout_file,
-                            ans_file,
-                            pe_as_wa,
-                            cancel,
-                        );
-                        (check_res.verdict, check_res.score_ratio, check_res.message)
-                    }
-                    ResolvedChecker::Lemon {
-                        path: chk_exe,
-                        full_score,
-                    } => {
-                        let check_res = uj_checker::lemon::run_lemon_checker(
-                            sandbox,
-                            chk_exe,
-                            &test.input_path,
-                            &tout_file,
-                            ans_file,
-                            *full_score,
-                            cancel,
-                        );
-                        (check_res.verdict, check_res.score_ratio, check_res.message)
-                    }
+                // Run post-checker on tout_file if configured (VULN-08: fail-closed if answer is missing)
+                match &test.answer_path {
+                    None => (
+                        Verdict::JudgeFailed,
+                        0.0,
+                        Some("No answer file specified for interactive post-checker".to_string()),
+                    ),
+                    Some(ans_file) => match chk {
+                        ResolvedChecker::Builtin(b) => {
+                            let ans_limit = std::cmp::max(
+                                limits.output_bytes.saturating_mul(2),
+                                Limits::DEFAULT_OUTPUT_BYTES,
+                            );
+                            match read_answer_cached(ans_file, ans_limit) {
+                                Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg)),
+                                Ok(ans_bytes) => match fs::read(&tout_file) {
+                                    Ok(tout_bytes) => {
+                                        let check_res = b.check(&tout_bytes, &ans_bytes[..]);
+                                        (
+                                            check_res.verdict,
+                                            check_res.score_ratio,
+                                            check_res.message,
+                                        )
+                                    }
+                                    Err(e) => (
+                                        Verdict::JudgeFailed,
+                                        0.0,
+                                        Some(format!("Failed to read interactor tout file: {e}")),
+                                    ),
+                                },
+                            }
+                        }
+                        ResolvedChecker::Testlib(chk_exe) => {
+                            if !ans_file.is_file() {
+                                (
+                                    Verdict::JudgeFailed,
+                                    0.0,
+                                    Some(format!("Answer file not found: {}", ans_file.display())),
+                                )
+                            } else {
+                                let check_res = uj_checker::testlib::run_testlib_checker(
+                                    sandbox,
+                                    chk_exe,
+                                    &test.input_path,
+                                    &tout_file,
+                                    ans_file,
+                                    pe_as_wa,
+                                    cancel,
+                                );
+                                (check_res.verdict, check_res.score_ratio, check_res.message)
+                            }
+                        }
+                        ResolvedChecker::Lemon {
+                            path: chk_exe,
+                            full_score,
+                        } => {
+                            if !ans_file.is_file() {
+                                (
+                                    Verdict::JudgeFailed,
+                                    0.0,
+                                    Some(format!("Answer file not found: {}", ans_file.display())),
+                                )
+                            } else {
+                                let check_res = uj_checker::lemon::run_lemon_checker(
+                                    sandbox,
+                                    chk_exe,
+                                    &test.input_path,
+                                    &tout_file,
+                                    ans_file,
+                                    *full_score,
+                                    cancel,
+                                );
+                                (check_res.verdict, check_res.score_ratio, check_res.message)
+                            }
+                        }
+                    },
                 }
             } else {
                 (
@@ -1429,32 +1427,32 @@ pub fn judge_output_only_test(
 
     let (mut verdict, score_ratio, checker_msg, diff) = match checker {
         ResolvedChecker::Builtin(b) => {
-            let ans_artifact =
-                match uj_core::read_artifact_bounded(ans_path, Limits::DEFAULT_OUTPUT_BYTES * 2) {
-                    Ok(art) => art,
-                    Err(e) => {
-                        return SingleTestResult {
-                            id: test.name.clone(),
-                            subtask: test.subtask_id,
-                            verdict: Verdict::JudgeFailed,
-                            score: 0.0,
-                            time_ms: 0,
-                            wall_ms: 0,
-                            memory_kb: 0,
-                            exit: ExitInfo::default(),
-                            message: Some(format!("Failed to read answer file: {e}")),
-                            checker: None,
-                            diff: None,
-                            timing: TimingInfo {
-                                rejudged: false,
-                                confidence: "high".to_string(),
-                                samples_ms: vec![0],
-                            },
-                            sandbox_tier: Some(Tier::None),
-                        };
-                    }
-                };
-            let check_res = b.check(&out_artifact.bytes, &ans_artifact.bytes);
+            let ans_artifact = match read_answer_cached(ans_path, Limits::DEFAULT_OUTPUT_BYTES * 2)
+            {
+                Ok(art) => art,
+                Err(msg) => {
+                    return SingleTestResult {
+                        id: test.name.clone(),
+                        subtask: test.subtask_id,
+                        verdict: Verdict::JudgeFailed,
+                        score: 0.0,
+                        time_ms: 0,
+                        wall_ms: 0,
+                        memory_kb: 0,
+                        exit: ExitInfo::default(),
+                        message: Some(msg),
+                        checker: None,
+                        diff: None,
+                        timing: TimingInfo {
+                            rejudged: false,
+                            confidence: "high".to_string(),
+                            samples_ms: vec![0],
+                        },
+                        sandbox_tier: Some(Tier::None),
+                    };
+                }
+            };
+            let check_res = b.check(&out_artifact.bytes, &ans_artifact[..]);
             let diff = check_res.diff.map(|d| DiffSummary {
                 line: d.line,
                 column: d.column,
@@ -1672,7 +1670,12 @@ pub fn judge_communication_test(
         specs.push(spec_sol.clone());
     }
 
-    let wiring = if num_participants == 1 {
+    let wiring = if topology == Some("star") {
+        Wiring {
+            connections: Vec::new(),
+            star_manager_proc: Some(0),
+        }
+    } else if num_participants == 1 {
         Wiring {
             connections: vec![
                 PipeConnection {
@@ -1684,6 +1687,7 @@ pub fn judge_communication_test(
                     to_proc: 0,
                 },
             ],
+            star_manager_proc: None,
         }
     } else if topology == Some("ring") || topology == Some("pipeline") {
         let mut connections = Vec::new();
@@ -1701,7 +1705,10 @@ pub fn judge_communication_test(
             from_proc: num_participants,
             to_proc: 0,
         });
-        Wiring { connections }
+        Wiring {
+            connections,
+            star_manager_proc: None,
+        }
     } else {
         if is_reused_box {
             let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
