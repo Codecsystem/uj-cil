@@ -211,13 +211,36 @@ pub struct SubtaskConfig {
 #[serde(rename_all = "snake_case")]
 pub enum SolutionTag {
     Main,
+    #[serde(alias = "ac")]
     Accepted,
+    #[serde(alias = "wa")]
     WrongAnswer,
+    #[serde(alias = "tle")]
     TimeLimit,
+    #[serde(alias = "mle")]
     MemoryLimit,
+    #[serde(alias = "re")]
     RuntimeError,
+    #[serde(alias = "wa_or_tle", alias = "tle_or_wa")]
+    WrongAnswerOrTimeLimit,
     Rejected,
     Partial,
+}
+
+impl SolutionTag {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Accepted => "accepted",
+            Self::WrongAnswer => "wrong_answer",
+            Self::TimeLimit => "time_limit",
+            Self::MemoryLimit => "memory_limit",
+            Self::RuntimeError => "runtime_error",
+            Self::WrongAnswerOrTimeLimit => "wa_or_tle",
+            Self::Rejected => "rejected",
+            Self::Partial => "partial",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -226,6 +249,8 @@ pub struct SolutionConfig {
     pub tag: SolutionTag,
     #[serde(default)]
     pub expect_subtasks: Option<HashMap<u32, Verdict>>,
+    #[serde(default)]
+    pub allow_verdicts: Option<Vec<Verdict>>,
 }
 
 /// Root problem.toml configuration.
@@ -1029,5 +1054,88 @@ memory = "256MiB"
         assert!(parse_bytes("NaNMiB").is_err());
         assert!(parse_bytes("infGiB").is_err());
         assert!(parse_bytes("-512MiB").is_err());
+    }
+
+    #[test]
+    fn test_solution_tag_aliases_and_allow_verdicts() {
+        let sample = r#"
+name = "alias_test"
+[limits]
+time = "1s"
+memory = "256MiB"
+
+[[solutions]]
+path = "solutions/std.cpp"
+tag = "main"
+
+[[solutions]]
+path = "solutions/ac2.cpp"
+tag = "ac"
+
+[[solutions]]
+path = "solutions/wa.cpp"
+tag = "wa"
+
+[[solutions]]
+path = "solutions/tle.cpp"
+tag = "tle"
+
+[[solutions]]
+path = "solutions/mle.cpp"
+tag = "mle"
+
+[[solutions]]
+path = "solutions/re.cpp"
+tag = "re"
+
+[[solutions]]
+path = "solutions/wa_tle.cpp"
+tag = "wa_or_tle"
+
+[[solutions]]
+path = "solutions/wa_custom.cpp"
+tag = "wa"
+allow_verdicts = ["WA", "TLE"]
+"#;
+        let cfg = ProblemConfig::from_toml_str(sample, None).unwrap();
+        assert_eq!(cfg.solutions.len(), 8);
+        assert_eq!(cfg.solutions[0].tag, SolutionTag::Main);
+        assert_eq!(cfg.solutions[1].tag, SolutionTag::Accepted);
+        assert_eq!(cfg.solutions[2].tag, SolutionTag::WrongAnswer);
+        assert_eq!(cfg.solutions[3].tag, SolutionTag::TimeLimit);
+        assert_eq!(cfg.solutions[4].tag, SolutionTag::MemoryLimit);
+        assert_eq!(cfg.solutions[5].tag, SolutionTag::RuntimeError);
+        assert_eq!(cfg.solutions[6].tag, SolutionTag::WrongAnswerOrTimeLimit);
+        assert_eq!(cfg.solutions[7].tag, SolutionTag::WrongAnswer);
+        assert_eq!(
+            cfg.solutions[7].allow_verdicts,
+            Some(vec![Verdict::WrongAnswer, Verdict::TimeLimitExceeded])
+        );
+
+        // Verify serialization outputs canonical snake_case names
+        assert_eq!(
+            serde_json::to_string(&SolutionTag::Accepted).unwrap(),
+            "\"accepted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SolutionTag::WrongAnswer).unwrap(),
+            "\"wrong_answer\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SolutionTag::TimeLimit).unwrap(),
+            "\"time_limit\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SolutionTag::MemoryLimit).unwrap(),
+            "\"memory_limit\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SolutionTag::RuntimeError).unwrap(),
+            "\"runtime_error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SolutionTag::WrongAnswerOrTimeLimit).unwrap(),
+            "\"wrong_answer_or_time_limit\""
+        );
     }
 }

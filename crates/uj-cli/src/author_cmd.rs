@@ -1298,6 +1298,14 @@ pub fn check_solution_tag(
     let mut failures = Vec::new();
     let mut matches_tag = true;
 
+    let is_extra_allowed = |v: Verdict| -> bool {
+        !matches!(v, Verdict::JudgeFailed | Verdict::CompileError)
+            && sol
+                .allow_verdicts
+                .as_ref()
+                .is_some_and(|list| list.contains(&v))
+    };
+
     match sol.tag {
         SolutionTag::Main | SolutionTag::Accepted => {
             if report.verdict != Verdict::Accepted {
@@ -1317,10 +1325,15 @@ pub fn check_solution_tag(
                         | Verdict::RuntimeError
                         | Verdict::OutputLimitExceeded
                         | Verdict::RestrictedFunction
+                        | Verdict::CompileError
                         | Verdict::JudgeFailed
-                )
+                ) && !is_extra_allowed(t.verdict)
             });
-            if !has_wa || has_fatal {
+            if report.verdict == Verdict::Accepted
+                || report.verdict == Verdict::JudgeFailed
+                || !has_wa
+                || has_fatal
+            {
                 matches_tag = false;
             }
         }
@@ -1337,10 +1350,15 @@ pub fn check_solution_tag(
                         | Verdict::RuntimeError
                         | Verdict::OutputLimitExceeded
                         | Verdict::RestrictedFunction
+                        | Verdict::CompileError
                         | Verdict::JudgeFailed
-                )
+                ) && !is_extra_allowed(t.verdict)
             });
-            if !has_tle || has_other {
+            if report.verdict == Verdict::Accepted
+                || report.verdict == Verdict::JudgeFailed
+                || !has_tle
+                || has_other
+            {
                 matches_tag = false;
             }
         }
@@ -1357,10 +1375,15 @@ pub fn check_solution_tag(
                         | Verdict::RuntimeError
                         | Verdict::OutputLimitExceeded
                         | Verdict::RestrictedFunction
+                        | Verdict::CompileError
                         | Verdict::JudgeFailed
-                )
+                ) && !is_extra_allowed(t.verdict)
             });
-            if !has_mle || has_other {
+            if report.verdict == Verdict::Accepted
+                || report.verdict == Verdict::JudgeFailed
+                || !has_mle
+                || has_other
+            {
                 matches_tag = false;
             }
         }
@@ -1377,22 +1400,72 @@ pub fn check_solution_tag(
                         | Verdict::MemoryLimitExceeded
                         | Verdict::OutputLimitExceeded
                         | Verdict::RestrictedFunction
+                        | Verdict::CompileError
                         | Verdict::JudgeFailed
-                )
+                ) && !is_extra_allowed(t.verdict)
             });
-            if !has_re || has_other {
+            if report.verdict == Verdict::Accepted
+                || report.verdict == Verdict::JudgeFailed
+                || !has_re
+                || has_other
+            {
+                matches_tag = false;
+            }
+        }
+        SolutionTag::WrongAnswerOrTimeLimit => {
+            let has_wa = report
+                .tests
+                .iter()
+                .any(|t| t.verdict == Verdict::WrongAnswer);
+            let has_disallowed = report.tests.iter().any(|t| {
+                !matches!(
+                    t.verdict,
+                    Verdict::Accepted
+                        | Verdict::Skipped
+                        | Verdict::WrongAnswer
+                        | Verdict::TimeLimitExceeded
+                ) && !is_extra_allowed(t.verdict)
+            });
+            if report.verdict == Verdict::Accepted
+                || report.verdict == Verdict::JudgeFailed
+                || !has_wa
+                || has_disallowed
+            {
                 matches_tag = false;
             }
         }
         SolutionTag::Rejected => {
             if report.verdict == Verdict::Accepted || report.verdict == Verdict::JudgeFailed {
                 matches_tag = false;
+            } else if let Some(ref allowed) = sol.allow_verdicts
+                && !allowed.is_empty()
+            {
+                let has_any_allowed = report.tests.iter().any(|t| is_extra_allowed(t.verdict));
+                let has_disallowed = report.tests.iter().any(|t| {
+                    !matches!(t.verdict, Verdict::Accepted | Verdict::Skipped)
+                        && !is_extra_allowed(t.verdict)
+                });
+                if !has_any_allowed || has_disallowed {
+                    matches_tag = false;
+                }
             }
         }
         SolutionTag::Partial => {
             let max_score = cfg.max_score();
             if report.score <= 0.0 || report.score >= max_score {
                 matches_tag = false;
+            } else if let Some(ref allowed) = sol.allow_verdicts
+                && !allowed.is_empty()
+            {
+                let has_disallowed = report.tests.iter().any(|t| {
+                    !matches!(
+                        t.verdict,
+                        Verdict::Accepted | Verdict::PartiallyCorrect | Verdict::Skipped
+                    ) && !is_extra_allowed(t.verdict)
+                });
+                if has_disallowed {
+                    matches_tag = false;
+                }
             }
         }
     }
@@ -1433,6 +1506,77 @@ pub fn check_solution_tag(
     failures
 }
 
+pub(crate) fn summarize_solution_report(
+    sol: &SolutionConfig,
+    report: &SubmissionJudgeReport,
+    matches_tag: bool,
+) -> serde_json::Value {
+    let mut max_time_ms = 0u64;
+    let mut max_time_test: Option<String> = None;
+    let mut max_memory_kb = report.max_memory_kb;
+    let mut first_fail_test: Option<String> = None;
+    let mut first_fail_verdict: Option<Verdict> = None;
+
+    for t in &report.tests {
+        if max_time_test.is_none() || t.time_ms > max_time_ms {
+            max_time_ms = t.time_ms;
+            max_time_test = Some(t.id.clone());
+        }
+        if t.memory_kb > max_memory_kb {
+            max_memory_kb = t.memory_kb;
+        }
+        if first_fail_test.is_none() && !t.verdict.is_accepted() && t.verdict != Verdict::Skipped {
+            first_fail_test = Some(t.id.clone());
+            first_fail_verdict = Some(t.verdict);
+        }
+    }
+    if report.tests.is_empty() {
+        max_time_ms = report.max_time_ms;
+    }
+
+    serde_json::json!({
+        "path": sol.path.to_string_lossy().replace('\\', "/"),
+        "tag": sol.tag.as_str(),
+        "matches_tag": matches_tag,
+        "verdict": report.verdict,
+        "score": report.score,
+        "max_time_ms": max_time_ms,
+        "max_time_test": max_time_test,
+        "max_memory_kb": max_memory_kb,
+        "first_fail_test": first_fail_test,
+        "first_fail_verdict": first_fail_verdict,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedVerifyTlEntry {
+    path: String,
+    tag: SolutionTag,
+    binary_hash: String,
+    report: SubmissionJudgeReport,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedVerifyTlState {
+    tests_fingerprint: String,
+    entries: Vec<CachedVerifyTlEntry>,
+}
+
+fn compute_tests_fingerprint(tests: &[uj_core::tests::TestCase]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for t in tests {
+        hasher.update(t.name.as_bytes());
+        hasher.update(&[0]);
+        if let Some(st) = t.subtask_id {
+            hasher.update(&st.to_le_bytes());
+        }
+        if let Ok(meta) = fs::metadata(&t.input_path) {
+            hasher.update(&meta.len().to_le_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 pub fn run_verify_with_session(
     problem_dir: &Path,
     cli: &Cli,
@@ -1471,7 +1615,7 @@ pub fn run_verify_with_session(
     let total_sols = cfg.solutions.len();
     if total_sols == 0 {
         if format == OutputFormat::Json {
-            let res = serde_json::json!({ "ok": true, "verified": 0 });
+            let res = serde_json::json!({ "ok": true, "verified": 0, "solutions": [] });
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
         } else if format == OutputFormat::Human {
             println!("All 0 solution(s) passed verification!");
@@ -1764,11 +1908,15 @@ pub fn run_verify_with_session(
     }
 
     let mut verification_failures = Vec::new();
+    let mut solutions_summary = Vec::with_capacity(cfg.solutions.len());
+    let mut cached_tl_entries = Vec::new();
+    let mut verified_ok_count = 0usize;
 
     // Verification result reporting in deterministic cfg.solutions order
     for (idx, sol) in cfg.solutions.iter().enumerate() {
         let sol_num = idx + 1;
         let tag_name = format!("{:?}", sol.tag);
+        let path_norm = sol.path.to_string_lossy().replace('\\', "/");
 
         if let Some(err) = compile_errors.get(&idx) {
             if format == OutputFormat::Human {
@@ -1779,6 +1927,18 @@ pub fn run_verify_with_session(
             }
             verification_failures
                 .push(format!("{}: compilation failed: {err}", sol.path.display()));
+            solutions_summary.push(serde_json::json!({
+                "path": path_norm,
+                "tag": sol.tag.as_str(),
+                "matches_tag": false,
+                "verdict": Verdict::CompileError,
+                "score": 0.0,
+                "max_time_ms": 0,
+                "max_time_test": serde_json::Value::Null,
+                "max_memory_kb": 0,
+                "first_fail_test": serde_json::Value::Null,
+                "first_fail_verdict": serde_json::Value::Null,
+            }));
             continue;
         }
 
@@ -1790,6 +1950,18 @@ pub fn run_verify_with_session(
                 );
             }
             verification_failures.push(format!("{}: prepare failed: {err}", sol.path.display()));
+            solutions_summary.push(serde_json::json!({
+                "path": path_norm,
+                "tag": sol.tag.as_str(),
+                "matches_tag": false,
+                "verdict": Verdict::JudgeFailed,
+                "score": 0.0,
+                "max_time_ms": 0,
+                "max_time_test": serde_json::Value::Null,
+                "max_memory_kb": 0,
+                "first_fail_test": serde_json::Value::Null,
+                "first_fail_verdict": serde_json::Value::Null,
+            }));
             continue;
         }
 
@@ -1797,7 +1969,25 @@ pub fn run_verify_with_session(
             Some(Ok(report)) => {
                 let sol_failures = check_solution_tag(sol, &report, &cfg);
                 let matches_tag = sol_failures.is_empty();
+                if matches_tag {
+                    verified_ok_count += 1;
+                }
                 verification_failures.extend(sol_failures);
+                solutions_summary.push(summarize_solution_report(sol, &report, matches_tag));
+
+                if matches!(sol.tag, SolutionTag::Main | SolutionTag::Accepted)
+                    && report.verdict.is_accepted()
+                    && let Some(sub_ctx) = ready_map.get(&idx)
+                    && let Ok(bin_hash) =
+                        crate::author_steps::hash_file_streaming(&sub_ctx.compiled_binary_path)
+                {
+                    cached_tl_entries.push(CachedVerifyTlEntry {
+                        path: path_norm,
+                        tag: sol.tag,
+                        binary_hash: bin_hash,
+                        report: report.clone(),
+                    });
+                }
 
                 if format == OutputFormat::Human {
                     let max_time = report.tests.iter().map(|t| t.time_ms).max().unwrap_or(0);
@@ -1831,11 +2021,49 @@ pub fn run_verify_with_session(
                     );
                 }
                 verification_failures.push(format!("{}: judging failed: {e}", sol.path.display()));
+                solutions_summary.push(serde_json::json!({
+                    "path": path_norm,
+                    "tag": sol.tag.as_str(),
+                    "matches_tag": false,
+                    "verdict": Verdict::JudgeFailed,
+                    "score": 0.0,
+                    "max_time_ms": 0,
+                    "max_time_test": serde_json::Value::Null,
+                    "max_memory_kb": 0,
+                    "first_fail_test": serde_json::Value::Null,
+                    "first_fail_verdict": serde_json::Value::Null,
+                }));
             }
             None => {
                 verification_failures
                     .push(format!("{}: missing evaluation result", sol.path.display()));
+                solutions_summary.push(serde_json::json!({
+                    "path": path_norm,
+                    "tag": sol.tag.as_str(),
+                    "matches_tag": false,
+                    "verdict": Verdict::JudgeFailed,
+                    "score": 0.0,
+                    "max_time_ms": 0,
+                    "max_time_test": serde_json::Value::Null,
+                    "max_memory_kb": 0,
+                    "first_fail_test": serde_json::Value::Null,
+                    "first_fail_verdict": serde_json::Value::Null,
+                }));
             }
+        }
+    }
+
+    if !cached_tl_entries.is_empty() && !cli.no_cache {
+        let state = CachedVerifyTlState {
+            tests_fingerprint: compute_tests_fingerprint(&tests),
+            entries: cached_tl_entries,
+        };
+        let cache_file = problem_dir
+            .join(".uj")
+            .join("cache")
+            .join("verify_tl_cache.json");
+        if let Ok(json_bytes) = serde_json::to_vec(&state) {
+            let _ = safe_write_file(&cache_file, &json_bytes);
         }
     }
 
@@ -1843,6 +2071,8 @@ pub fn run_verify_with_session(
         if format == OutputFormat::Json {
             let err = serde_json::json!({
                 "ok": false,
+                "verified": verified_ok_count,
+                "solutions": solutions_summary,
                 "error": {
                     "kind": "VerifyMismatch",
                     "failures": verification_failures
@@ -1862,7 +2092,11 @@ pub fn run_verify_with_session(
     }
 
     if format == OutputFormat::Json {
-        let res = serde_json::json!({ "ok": true, "verified": cfg.solutions.len() });
+        let res = serde_json::json!({
+            "ok": true,
+            "verified": cfg.solutions.len(),
+            "solutions": solutions_summary
+        });
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
     } else if format == OutputFormat::Human {
         println!(
@@ -1945,8 +2179,11 @@ pub fn run_tl_with_session(
     let scheduler = Scheduler::with_session(options, session.clone());
 
     let mut t_main = 0u64;
+    let mut main_slowest_test: Option<String> = None;
     let mut t_slowest_ac = 0u64;
+    let mut slowest_ac_test: Option<String> = None;
     let mut peak_mem_kb = 0u64;
+    let mut peak_memory_test: Option<String> = None;
     let mut subtask_main_ms: std::collections::BTreeMap<u32, u64> =
         std::collections::BTreeMap::new();
     let mut subtask_slowest_ac_ms: std::collections::BTreeMap<u32, u64> =
@@ -1955,6 +2192,55 @@ pub fn run_tl_with_session(
         subtask_main_ms.insert(st.id, 0);
         subtask_slowest_ac_ms.insert(st.id, 0);
     }
+
+    let cached_verify_state: Option<CachedVerifyTlState> = if !cli.no_cache {
+        let cache_file = problem_dir
+            .join(".uj")
+            .join("cache")
+            .join("verify_tl_cache.json");
+        fs::read(&cache_file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CachedVerifyTlState>(&bytes).ok())
+            .filter(|st| st.tests_fingerprint == compute_tests_fingerprint(&tests))
+    } else {
+        None
+    };
+
+    let mut accumulate_report = |sol: &SolutionConfig, report: &SubmissionJudgeReport| {
+        for t in &report.tests {
+            if t.memory_kb > peak_mem_kb
+                || (peak_memory_test.is_none() && t.memory_kb == peak_mem_kb)
+            {
+                peak_mem_kb = t.memory_kb;
+                peak_memory_test = Some(t.id.clone());
+            }
+            if sol.tag == SolutionTag::Main
+                && (t.time_ms > t_main || (main_slowest_test.is_none() && t.time_ms == t_main))
+            {
+                t_main = t.time_ms;
+                main_slowest_test = Some(t.id.clone());
+            }
+            if t.time_ms > t_slowest_ac || (slowest_ac_test.is_none() && t.time_ms == t_slowest_ac)
+            {
+                t_slowest_ac = t.time_ms;
+                slowest_ac_test = Some(t.id.clone());
+            }
+            if let Some(st_id) = t.subtask {
+                if sol.tag == SolutionTag::Main {
+                    let e = subtask_main_ms.entry(st_id).or_insert(0);
+                    *e = (*e).max(t.time_ms);
+                }
+                let e_ac = subtask_slowest_ac_ms.entry(st_id).or_insert(0);
+                *e_ac = (*e_ac).max(t.time_ms);
+            }
+        }
+        let max_ms = report.max_time_ms;
+        peak_mem_kb = peak_mem_kb.max(report.max_memory_kb);
+        if sol.tag == SolutionTag::Main {
+            t_main = t_main.max(max_ms);
+        }
+        t_slowest_ac = t_slowest_ac.max(max_ms);
+    };
 
     let total_sols = target_solutions.len();
     for (sol_idx, sol) in target_solutions.into_iter().enumerate() {
@@ -1969,6 +2255,19 @@ pub fn run_tl_with_session(
                 return ExitCode::from(EXIT_COMPILE_ERROR);
             }
         };
+
+        let path_norm = sol.path.to_string_lossy().replace('\\', "/");
+        if let Some(ref state) = cached_verify_state
+            && let Ok(bin_hash) = crate::author_steps::hash_file_streaming(&compiled.binary_path)
+            && let Some(entry) = state
+                .entries
+                .iter()
+                .find(|e| e.path == path_norm && e.binary_hash == bin_hash)
+            && entry.report.verdict.is_accepted()
+        {
+            accumulate_report(sol, &entry.report);
+            continue;
+        }
 
         let sol_name = sol.path.file_name().unwrap_or_default().to_string_lossy();
         let sol_disp = sol.path.display().to_string();
@@ -2077,22 +2376,7 @@ pub fn run_tl_with_session(
                         }
                         return ExitCode::from(EXIT_NON_AC);
                     }
-                    let max_ms = report.max_time_ms;
-                    peak_mem_kb = peak_mem_kb.max(report.max_memory_kb);
-                    if sol.tag == SolutionTag::Main {
-                        t_main = t_main.max(max_ms);
-                    }
-                    t_slowest_ac = t_slowest_ac.max(max_ms);
-                    for t in &report.tests {
-                        if let Some(st_id) = t.subtask {
-                            if sol.tag == SolutionTag::Main {
-                                let e = subtask_main_ms.entry(st_id).or_insert(0);
-                                *e = (*e).max(t.time_ms);
-                            }
-                            let e_ac = subtask_slowest_ac_ms.entry(st_id).or_insert(0);
-                            *e_ac = (*e_ac).max(t.time_ms);
-                        }
-                    }
+                    accumulate_report(sol, &report);
                 }
                 Err(e) => {
                     if let Some(h) = event_thread {
@@ -2166,8 +2450,11 @@ pub fn run_tl_with_session(
         let res = serde_json::json!({
             "ok": true,
             "t_main_ms": t_main,
+            "main_slowest_test": main_slowest_test,
             "t_slowest_ac_ms": t_slowest_ac,
+            "slowest_ac_test": slowest_ac_test,
             "peak_memory_kb": peak_mem_kb,
+            "peak_memory_test": peak_memory_test,
             "recommended_tl_ms": rec_tl_ms,
             "recommended_tl": formatted_tl,
             "subtask_stats": subtask_stats_json,
@@ -2180,10 +2467,22 @@ pub fn run_tl_with_session(
         } else {
             format!("{} KiB", peak_mem_kb)
         };
+        let main_test_suffix = main_slowest_test
+            .as_deref()
+            .map(|id| format!(" (test {id})"))
+            .unwrap_or_default();
+        let ac_test_suffix = slowest_ac_test
+            .as_deref()
+            .map(|id| format!(" (test {id})"))
+            .unwrap_or_default();
+        let mem_test_suffix = peak_memory_test
+            .as_deref()
+            .map(|id| format!(" (test {id})"))
+            .unwrap_or_default();
         println!("=== CPU Time Limit Calibration ===");
-        println!("  Main solution peak CPU:       {t_main} ms");
-        println!("  Slowest accepted peak CPU:    {t_slowest_ac} ms");
-        println!("  Peak memory observed:         {mem_str}");
+        println!("  Main solution peak CPU:       {t_main} ms{main_test_suffix}");
+        println!("  Slowest accepted peak CPU:    {t_slowest_ac} ms{ac_test_suffix}");
+        println!("  Peak memory observed:         {mem_str}{mem_test_suffix}");
         if !subtask_slowest_ac_ms.is_empty() {
             println!("  Subtask peak CPU breakdown:");
             for (&st_id, &ac_ms) in &subtask_slowest_ac_ms {
@@ -2212,6 +2511,7 @@ pub fn run_stress(
     brute_src: &str,
     count: usize,
     seed_opt: Option<u64>,
+    gen_args_template: &str,
     time_budget_str: &str,
     cli: &Cli,
     format: OutputFormat,
@@ -2304,6 +2604,7 @@ pub fn run_stress(
     let seed_counter = Arc::new(AtomicU64::new(seed_start));
     let iter_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gen_args_tmpl = gen_args_template.to_string();
 
     enum StressFailure {
         GeneratorFailed {
@@ -2347,6 +2648,7 @@ pub fn run_stress(
         let brute_bin = brute_bin.clone();
         let checker = resolved_checker.clone();
         let sol_limits = sol_limits.clone();
+        let gen_args_tmpl = gen_args_tmpl.clone();
 
         let handle = std::thread::spawn(move || {
             let sandbox = match create_sandbox("auto", false) {
@@ -2395,17 +2697,26 @@ pub fn run_stress(
                     iter_counter.fetch_sub(1, Ordering::SeqCst);
                     break;
                 }
+                let iter_num = prev_iter + 1;
                 let seed = seed_counter.fetch_add(1, Ordering::SeqCst);
 
                 let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
 
+                let rendered_args = gen_args_tmpl
+                    .replace("{seed}", &seed.to_string())
+                    .replace("{iter}", &iter_num.to_string());
+                let mut gen_argv = vec![gen_bin.as_os_str().to_os_string()];
+                for arg in rendered_args.split_whitespace() {
+                    gen_argv.push(std::ffi::OsString::from(arg));
+                }
+
                 // 1. Generate input inside isolated slot box
                 let spec_gen = RunSpec {
-                    argv: vec![
-                        gen_bin.as_os_str().to_os_string(),
-                        std::ffi::OsString::from(format!("{seed}")),
-                    ],
-                    env: vec![],
+                    argv: gen_argv,
+                    env: vec![(
+                        std::ffi::OsString::from("UJ_STRESS"),
+                        std::ffi::OsString::from("1"),
+                    )],
                     work_dir: slot_box.box_dir.clone(),
                     ro_binds: vec![],
                     stdin: Stdio::Null,
@@ -2445,6 +2756,14 @@ pub fn run_stress(
                 }
 
                 let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
+                if in_bytes.is_empty() {
+                    let reason = format!(
+                        "Generator produced empty stdout on seed {seed} (hint: check if gen.cpp ignores seeds outside fixed test IDs)"
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::GeneratorFailed { seed, reason });
+                    break;
+                }
                 let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
                 let in_tmp = scratch_dir.join(format!("stress_{worker_idx}_{seed}.in"));
                 let _ = fs::write(&in_tmp, &in_bytes);
@@ -3143,6 +3462,315 @@ pub fn run_pipeline(
     runner.final_code
 }
 
+// ============================================================================
+// 10. uj pack
+// ============================================================================
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+pub(crate) fn build_flat_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut central_dir = Vec::new();
+
+    for (name, data) in entries {
+        let name_bytes = name.as_bytes();
+        let crc = crc32_ieee(data);
+        let size = data.len() as u32;
+        let offset = buf.len() as u32;
+
+        // Local file header (30 bytes + filename)
+        buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes()); // signature
+        buf.extend_from_slice(&20u16.to_le_bytes()); // version needed (2.0)
+        buf.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 filename flag
+        buf.extend_from_slice(&0u16.to_le_bytes()); // compression method: 0 (Store)
+        buf.extend_from_slice(&0u16.to_le_bytes()); // last mod time
+        buf.extend_from_slice(&0x0021u16.to_le_bytes()); // last mod date (1980-01-01)
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes()); // compressed size
+        buf.extend_from_slice(&size.to_le_bytes()); // uncompressed size
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // extra field length
+        buf.extend_from_slice(name_bytes);
+        buf.extend_from_slice(data);
+
+        // Central directory header (46 bytes + filename)
+        central_dir.extend_from_slice(&0x0201_4b50u32.to_le_bytes()); // signature
+        central_dir.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        central_dir.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central_dir.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 flag
+        central_dir.extend_from_slice(&0u16.to_le_bytes()); // method: Store
+        central_dir.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        central_dir.extend_from_slice(&0x0021u16.to_le_bytes()); // mod date
+        central_dir.extend_from_slice(&crc.to_le_bytes());
+        central_dir.extend_from_slice(&size.to_le_bytes());
+        central_dir.extend_from_slice(&size.to_le_bytes());
+        central_dir.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        central_dir.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        central_dir.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        central_dir.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        central_dir.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        central_dir.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        central_dir.extend_from_slice(&offset.to_le_bytes()); // local header offset
+        central_dir.extend_from_slice(name_bytes);
+    }
+
+    let cd_offset = buf.len() as u32;
+    let cd_size = central_dir.len() as u32;
+    let entry_count = entries.len() as u16;
+
+    buf.extend_from_slice(&central_dir);
+
+    // End of central directory record (22 bytes)
+    buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes()); // EOCD signature
+    buf.extend_from_slice(&0u16.to_le_bytes()); // number of this disk
+    buf.extend_from_slice(&0u16.to_le_bytes()); // disk where CD starts
+    buf.extend_from_slice(&entry_count.to_le_bytes());
+    buf.extend_from_slice(&entry_count.to_le_bytes());
+    buf.extend_from_slice(&cd_size.to_le_bytes());
+    buf.extend_from_slice(&cd_offset.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // comment length
+
+    buf
+}
+
+pub fn run_pack(problem_dir: &Path, output: &Path, clean: bool, format: OutputFormat) -> ExitCode {
+    let config_path = problem_dir.join("problem.toml");
+    let content = match fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            if format == OutputFormat::Json {
+                let err = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "kind": "ConfigError",
+                        "message": format!("Cannot read problem.toml: {e}")
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            } else {
+                eprintln!("Cannot read problem.toml: {e}");
+            }
+            return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+        }
+    };
+    let cfg = match ProblemConfig::from_toml_str(&content, Some(&config_path)) {
+        Ok(c) => c,
+        Err(e) => return handle_config_error(e, format == OutputFormat::Json),
+    };
+
+    let discovered = match uj_core::tests::discover_tests(problem_dir, &cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            if format == OutputFormat::Json {
+                let err = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "kind": "DiscoverError",
+                        "message": format!("Failed to discover tests: {e}")
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            } else {
+                eprintln!("Failed to discover tests: {e}");
+            }
+            return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+        }
+    };
+
+    let total_gen_count: u64 = cfg.tests.generators.iter().map(|g| g.count as u64).sum();
+    let non_wildcard_patterns: Vec<String> = cfg
+        .subtasks
+        .iter()
+        .flat_map(|s| s.tests.iter().filter(|p| p.trim() != "*").cloned())
+        .collect();
+
+    let valid_tests: Vec<_> = discovered
+        .into_iter()
+        .filter(|tc| {
+            if !cfg.subtasks.is_empty() && tc.subtask_id.is_none() {
+                return false;
+            }
+            if total_gen_count > 0
+                && let Ok(num) = tc.name.parse::<u64>()
+                && num > total_gen_count
+                && !uj_core::tests::test_matches_patterns(&tc.name, &non_wildcard_patterns)
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let tests_dir = problem_dir.join(&cfg.tests.dir);
+    let mut cleaned_files: Vec<String> = Vec::new();
+    if clean && tests_dir.is_dir() {
+        let mut expected_names = std::collections::HashSet::new();
+        for tc in &valid_tests {
+            expected_names.insert(format!("{}.in", tc.name));
+            expected_names.insert(format!("{}.ans", tc.name));
+        }
+        if let Ok(entries) = fs::read_dir(&tests_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && let Some(fname) = path.file_name().and_then(|n| n.to_str())
+                    && !expected_names.contains(fname)
+                    && fs::remove_file(&path).is_ok()
+                {
+                    cleaned_files.push(fname.to_string());
+                }
+            }
+        }
+        cleaned_files.sort_by(|a, b| uj_core::tests::natural_cmp(a, b));
+    }
+
+    if valid_tests.is_empty() {
+        if format == OutputFormat::Json {
+            let err = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "kind": "EmptyTests",
+                    "message": "No valid test cases found to pack"
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&err).unwrap());
+        } else {
+            eprintln!("No valid test cases found to pack");
+        }
+        return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+    }
+
+    let mut zip_entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(valid_tests.len() * 2);
+    for tc in &valid_tests {
+        let in_path = &tc.input_path;
+        let ans_path = tests_dir.join(format!("{}.ans", tc.name));
+        if !ans_path.is_file() {
+            let msg = format!(
+                "Missing answer file for test '{}' (expected {}; run 'uj ans' first)",
+                tc.name,
+                ans_path.display()
+            );
+            if format == OutputFormat::Json {
+                let err = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "kind": "MissingAnswerFile",
+                        "test": tc.name,
+                        "message": msg
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            } else {
+                eprintln!("{msg}");
+            }
+            return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+        }
+
+        let in_bytes = match fs::read(in_path) {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!("Failed to read '{}': {e}", in_path.display());
+                if format == OutputFormat::Json {
+                    let err = serde_json::json!({
+                        "ok": false,
+                        "error": { "kind": "IoError", "message": msg }
+                    });
+                    println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                } else {
+                    eprintln!("{msg}");
+                }
+                return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+            }
+        };
+        let ans_bytes = match fs::read(&ans_path) {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!("Failed to read '{}': {e}", ans_path.display());
+                if format == OutputFormat::Json {
+                    let err = serde_json::json!({
+                        "ok": false,
+                        "error": { "kind": "IoError", "message": msg }
+                    });
+                    println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                } else {
+                    eprintln!("{msg}");
+                }
+                return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+            }
+        };
+
+        zip_entries.push((format!("{}.in", tc.name), in_bytes));
+        zip_entries.push((format!("{}.ans", tc.name), ans_bytes));
+    }
+
+    let zip_bytes = build_flat_zip(&zip_entries);
+    let out_path = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        problem_dir.join(output)
+    };
+
+    if let Err(e) = safe_write_file(&out_path, &zip_bytes) {
+        let msg = format!("Failed to write archive '{}': {e}", out_path.display());
+        if format == OutputFormat::Json {
+            let err = serde_json::json!({
+                "ok": false,
+                "error": { "kind": "IoError", "message": msg }
+            });
+            println!("{}", serde_json::to_string_pretty(&err).unwrap());
+        } else {
+            eprintln!("{msg}");
+        }
+        return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+    }
+
+    let size_bytes = zip_bytes.len() as u64;
+    if format == OutputFormat::Json {
+        let res = serde_json::json!({
+            "ok": true,
+            "output": output.to_string_lossy(),
+            "output_path": out_path.to_string_lossy(),
+            "test_count": valid_tests.len(),
+            "size_bytes": size_bytes,
+            "cleaned_files": cleaned_files
+        });
+        println!("{}", serde_json::to_string_pretty(&res).unwrap());
+    } else if format == OutputFormat::Human {
+        if !cleaned_files.is_empty() {
+            println!(
+                "Cleaned {} orphan file(s) from {}:",
+                cleaned_files.len(),
+                tests_dir.display()
+            );
+            for f in &cleaned_files {
+                println!("  - {f}");
+            }
+        }
+        println!(
+            "Packed {} test cases ({} files, {} bytes) -> {}",
+            valid_tests.len(),
+            zip_entries.len(),
+            size_bytes,
+            out_path.display()
+        );
+    }
+
+    ExitCode::from(EXIT_SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3196,9 +3824,9 @@ mod tests {
                     id: format!("{}", i + 1),
                     subtask: None,
                     verdict: v,
-                    time_ms: 10,
-                    wall_ms: 10,
-                    memory_kb: 1024,
+                    time_ms: 10 + (i as u64) * 5,
+                    wall_ms: 10 + (i as u64) * 5,
+                    memory_kb: 1024 + (i as u64) * 128,
                     score: if v == Verdict::Accepted { 10.0 } else { 0.0 },
                     exit: uj_report::result::ExitInfo {
                         code: Some(0),
@@ -3222,11 +3850,13 @@ mod tests {
             path: PathBuf::from("main.cpp"),
             tag: SolutionTag::Main,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
         let sol_ac = SolutionConfig {
             path: PathBuf::from("ac.cpp"),
             tag: SolutionTag::Accepted,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
 
         let rep_ac = make_report(Verdict::Accepted, 100.0, vec![Verdict::Accepted], vec![]);
@@ -3251,6 +3881,7 @@ mod tests {
             path: PathBuf::from("wa.cpp"),
             tag: SolutionTag::WrongAnswer,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
 
         // Passes when there's WA and no fatal
@@ -3277,12 +3908,119 @@ mod tests {
     }
 
     #[test]
+    fn test_tag_wrong_answer_or_time_limit_and_allow_verdicts() {
+        let cfg = make_cfg();
+        let sol_wa_or_tle = SolutionConfig {
+            path: PathBuf::from("wrong_greedy.cpp"),
+            tag: SolutionTag::WrongAnswerOrTimeLimit,
+            expect_subtasks: None,
+            allow_verdicts: None,
+        };
+
+        // Mixed WA + TLE passes for WrongAnswerOrTimeLimit
+        let rep_mixed = make_report(
+            Verdict::TimeLimitExceeded,
+            20.0,
+            vec![
+                Verdict::Accepted,
+                Verdict::WrongAnswer,
+                Verdict::TimeLimitExceeded,
+            ],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol_wa_or_tle, &rep_mixed, &cfg).is_empty());
+
+        // Pure WA also passes for WrongAnswerOrTimeLimit
+        let rep_pure_wa = make_report(
+            Verdict::WrongAnswer,
+            20.0,
+            vec![Verdict::Accepted, Verdict::WrongAnswer],
+            vec![],
+        );
+        assert!(check_solution_tag(&sol_wa_or_tle, &rep_pure_wa, &cfg).is_empty());
+
+        // Pure TLE without any WA fails for WrongAnswerOrTimeLimit (requires at least one WA)
+        let rep_pure_tle = make_report(
+            Verdict::TimeLimitExceeded,
+            20.0,
+            vec![Verdict::Accepted, Verdict::TimeLimitExceeded],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol_wa_or_tle, &rep_pure_tle, &cfg).is_empty());
+
+        // Unexpected RE fails for WrongAnswerOrTimeLimit
+        let rep_with_re = make_report(
+            Verdict::RuntimeError,
+            0.0,
+            vec![Verdict::WrongAnswer, Verdict::RuntimeError],
+            vec![],
+        );
+        assert!(!check_solution_tag(&sol_wa_or_tle, &rep_with_re, &cfg).is_empty());
+
+        // Custom allow_verdicts on tag = "wa" allowing TLE
+        let sol_custom_allow = SolutionConfig {
+            path: PathBuf::from("custom_wa_tle.cpp"),
+            tag: SolutionTag::WrongAnswer,
+            expect_subtasks: None,
+            allow_verdicts: Some(vec![Verdict::WrongAnswer, Verdict::TimeLimitExceeded]),
+        };
+        assert!(check_solution_tag(&sol_custom_allow, &rep_mixed, &cfg).is_empty());
+        assert!(!check_solution_tag(&sol_custom_allow, &rep_with_re, &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_summarize_solution_report() {
+        let sol = SolutionConfig {
+            path: PathBuf::from("solutions/tle.cpp"),
+            tag: SolutionTag::TimeLimit,
+            expect_subtasks: None,
+            allow_verdicts: None,
+        };
+        let rep = make_report(
+            Verdict::TimeLimitExceeded,
+            50.0,
+            vec![
+                Verdict::Accepted,
+                Verdict::TimeLimitExceeded,
+                Verdict::Accepted,
+            ],
+            vec![],
+        );
+        let summary = summarize_solution_report(&sol, &rep, true);
+        assert_eq!(summary["path"], "solutions/tle.cpp");
+        assert_eq!(summary["tag"], "time_limit");
+        assert_eq!(summary["matches_tag"], true);
+        assert_eq!(summary["verdict"], "TLE");
+        assert_eq!(summary["max_time_test"], "3");
+        assert_eq!(summary["first_fail_test"], "2");
+        assert_eq!(summary["first_fail_verdict"], "TLE");
+    }
+
+    #[test]
+    fn test_build_flat_zip_signature_and_entries() {
+        let entries = vec![
+            ("1.in".to_string(), b"1 2\n".to_vec()),
+            ("1.ans".to_string(), b"3\n".to_vec()),
+        ];
+        let zip_bytes = build_flat_zip(&entries);
+        // Starts with PK\x03\x04 local file header signature
+        assert_eq!(&zip_bytes[0..4], &[0x50, 0x4b, 0x03, 0x04]);
+        // Ends with EOCD record (22 bytes starting with PK\x05\x06)
+        let eocd_start = zip_bytes.len() - 22;
+        assert_eq!(
+            &zip_bytes[eocd_start..eocd_start + 4],
+            &[0x50, 0x4b, 0x05, 0x06]
+        );
+    }
+
+    #[test]
     fn test_tag_time_limit() {
         let cfg = make_cfg();
         let sol = SolutionConfig {
             path: PathBuf::from("tle.cpp"),
             tag: SolutionTag::TimeLimit,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
 
         let rep_tle = make_report(
@@ -3314,6 +4052,7 @@ mod tests {
             path: PathBuf::from("mle.cpp"),
             tag: SolutionTag::MemoryLimit,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
 
         let rep_mle = make_report(
@@ -3340,6 +4079,7 @@ mod tests {
             path: PathBuf::from("re.cpp"),
             tag: SolutionTag::RuntimeError,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
 
         let rep_re = make_report(
@@ -3366,6 +4106,7 @@ mod tests {
             path: PathBuf::from("bad.cpp"),
             tag: SolutionTag::Rejected,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
 
         let rep_wa = make_report(
@@ -3395,6 +4136,7 @@ mod tests {
             path: PathBuf::from("partial.cpp"),
             tag: SolutionTag::Partial,
             expect_subtasks: None,
+            allow_verdicts: None,
         };
 
         let rep_part = make_report(
@@ -3428,6 +4170,7 @@ mod tests {
             path: PathBuf::from("subtasks.cpp"),
             tag: SolutionTag::TimeLimit,
             expect_subtasks: Some(expect),
+            allow_verdicts: None,
         };
 
         let rep_ok = make_report(

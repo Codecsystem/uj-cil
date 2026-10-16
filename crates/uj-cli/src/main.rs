@@ -350,6 +350,7 @@ fn main() -> ExitCode {
             brute,
             count,
             seed,
+            gen_args,
             time_budget,
         } => {
             let cancel = uj_sandbox::CancelToken::new();
@@ -364,12 +365,18 @@ fn main() -> ExitCode {
                 brute,
                 *count,
                 *seed,
+                gen_args,
                 time_budget,
                 &args,
                 format,
                 &cancel,
             )
         }
+        Commands::Pack {
+            problem,
+            output,
+            clean,
+        } => author_cmd::run_pack(problem, output, *clean, format),
         Commands::Pipeline { problem } => {
             let cancel = uj_sandbox::CancelToken::new();
             let cancel_clone = cancel.clone();

@@ -257,11 +257,41 @@ pub enum Commands {
         #[arg(long = "seed", help = "Initial random seed")]
         seed: Option<u64>,
         #[arg(
+            long = "gen-args",
+            default_value = "{seed}",
+            help = "Generator argument template (supports {seed} and {iter})"
+        )]
+        gen_args: String,
+        #[arg(
             long = "time-budget",
             default_value = "60s",
             help = "Time budget (e.g. 60s)"
         )]
         time_budget: String,
+    },
+
+    #[command(about = "Clean orphan test files and package test data into a flat ZIP archive")]
+    Pack {
+        #[arg(
+            short = 'p',
+            long = "problem",
+            default_value = ".",
+            help = "Problem directory"
+        )]
+        problem: PathBuf,
+        #[arg(
+            short = 'o',
+            long = "output",
+            default_value = "data.zip",
+            help = "Output ZIP archive path"
+        )]
+        output: PathBuf,
+        #[arg(
+            long = "clean",
+            default_value_t = false,
+            help = "Remove orphan/stale files in tests/ not matching current problem.toml"
+        )]
+        clean: bool,
     },
 
     #[command(about = "Perform system and problem environment health checks")]

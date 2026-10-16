@@ -395,6 +395,14 @@ fn get_tools_list() -> Vec<Value> {
                     "count": {
                         "type": "integer",
                         "description": "Maximum test iterations (default: 100)"
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Starting random seed (default: 1)"
+                    },
+                    "gen_args": {
+                        "type": "string",
+                        "description": "Generator argument template; placeholders {seed} and {iter} are expanded (default: '{seed}')"
                     }
                 },
                 "required": ["generator", "solution", "brute"]
@@ -665,12 +673,30 @@ fn dispatch_tool_call(
                     failures.join("; ")
                 };
 
+                let max_time_test = report
+                    .tests
+                    .iter()
+                    .max_by_key(|t| t.time_ms)
+                    .map(|t| t.id.clone());
+                let first_fail = report
+                    .tests
+                    .iter()
+                    .find(|t| t.verdict != Verdict::Accepted && t.verdict != Verdict::Skipped);
+
                 verifications.push(serde_json::json!({
                     "solution": sol.path.to_string_lossy(),
-                    "tag": format!("{:?}", sol.tag),
+                    "path": sol.path.to_string_lossy().replace('\\', "/"),
+                    "tag": sol.tag.as_str(),
                     "actual_verdict": report.verdict,
+                    "verdict": report.verdict,
                     "score": report.score,
+                    "max_time_ms": report.max_time_ms,
+                    "max_time_test": max_time_test,
+                    "max_memory_kb": report.max_memory_kb,
+                    "first_fail_test": first_fail.map(|t| t.id.clone()),
+                    "first_fail_verdict": first_fail.map(|t| t.verdict),
                     "matched": matched,
+                    "matches_tag": matched,
                     "reason": reason
                 }));
             }
@@ -744,6 +770,11 @@ fn dispatch_tool_call(
                 .and_then(|v| v.as_str())
                 .ok_or("brute required")?;
             let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let seed_start = args.get("seed").and_then(|v| v.as_u64()).unwrap_or(1);
+            let gen_args_tmpl = args
+                .get("gen_args")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{seed}");
 
             let config_path = problem_dir.join("problem.toml");
             let cfg_opt = if config_path.exists() {
@@ -840,20 +871,30 @@ fn dispatch_tool_call(
             let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
             let mut tested = 0;
 
-            for seed in 1..=count {
+            for iter_idx in 0..count {
                 if cancel.is_cancelled() {
                     return Err("Cancelled".into());
                 }
 
+                let iter_num = iter_idx + 1;
+                let seed = seed_start + iter_idx as u64;
                 let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+
+                let rendered_args = gen_args_tmpl
+                    .replace("{seed}", &seed.to_string())
+                    .replace("{iter}", &iter_num.to_string());
+                let mut gen_argv = vec![gen_bin.as_os_str().to_os_string()];
+                for arg in rendered_args.split_whitespace() {
+                    gen_argv.push(std::ffi::OsString::from(arg));
+                }
 
                 // Run generator in isolated slot box
                 let gen_spec = RunSpec {
-                    argv: vec![
-                        gen_bin.as_os_str().to_os_string(),
-                        std::ffi::OsString::from(format!("{seed}")),
-                    ],
-                    env: vec![],
+                    argv: gen_argv,
+                    env: vec![(
+                        std::ffi::OsString::from("UJ_STRESS"),
+                        std::ffi::OsString::from("1"),
+                    )],
                     work_dir: slot_box.box_dir.clone(),
                     ro_binds: vec![],
                     stdin: Stdio::Null,
@@ -866,7 +907,25 @@ fn dispatch_tool_call(
                     trusted: true,
                 };
                 let gen_res = sandbox.run(&gen_spec, cancel)?;
+                if !gen_res.status.is_success() || gen_res.killed_by.is_some() || gen_res.oom_killed
+                {
+                    let stderr_msg = String::from_utf8_lossy(&gen_res.stderr_tail);
+                    return Err(format!(
+                        "Generator failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
+                        gen_res.status,
+                        gen_res.killed_by,
+                        gen_res.oom_killed,
+                        stderr_msg.trim()
+                    )
+                    .into());
+                }
                 let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
+                if in_bytes.is_empty() {
+                    return Err(format!(
+                        "Generator produced empty stdout on seed {seed} (hint: check if gen.cpp ignores seeds outside fixed test IDs)"
+                    )
+                    .into());
+                }
                 let tmp_in_path = scratch_dir.join(format!("mcp_stress_{seed}.in"));
                 let _ = fs::write(&tmp_in_path, &in_bytes);
 

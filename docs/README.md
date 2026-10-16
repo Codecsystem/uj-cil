@@ -38,6 +38,8 @@ docs/
 | [plans/PLAN.md](plans/PLAN.md) | **项目工程规划底稿**：系统设计哲学、阶段性实施路线与初始设计规范。 |
 | [plans/IMPROVEMENT_PLAN.md](plans/IMPROVEMENT_PLAN.md) | **专项改进方案**：针对并发信号安全、编译依赖感知、NDJSON 终结事件、答案内存映射等 P0-P2 缺陷与性能项的改进实施方案。 |
 | [plans/ROUND11_EXECUTION_PLAN.md](plans/ROUND11_EXECUTION_PLAN.md) | **Round 11 综合演进执行计划**：覆盖 10 项安全/正确性漏洞修复、6 项核心热路径性能优化与 4 项新功能扩展的详细拆解与验证规范。 |
+| [plans/ROUND12_FIELD_VERIFICATION_IMPROVEMENT_PLAN.md](plans/ROUND12_FIELD_VERIFICATION_IMPROVEMENT_PLAN.md) | **Round 12 实战验题驱动演进计划**：基于校赛 11 题全链路验题复盘，涵盖 `SolutionTag` 别名与混合判定、`uj verify` JSON 完整指标矩阵、`uj stress` 参数模板与空输入拦截及 `uj pack` 归档子命令。 |
+
 
 ---
 

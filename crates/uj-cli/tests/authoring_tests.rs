@@ -574,3 +574,303 @@ tag = "main"
 
     let _ = fs::remove_dir_all(&test_dir);
 }
+
+#[test]
+fn test_r12_verify_aliases_mixed_wa_tle_and_json_matrix_and_tl() {
+    let _guard = lock_test();
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let test_dir = scratch_dir.join("test_r12_verify_matrix");
+    let _ = fs::remove_dir_all(&test_dir);
+
+    let aplusb_src = get_workspace_root().join("tests/problems/aplusb");
+    copy_dir_all(&aplusb_src, &test_dir).unwrap();
+
+    // Create a mixed WA+TLE solution: on test 1 (1 2), outputs wrong answer; on test 2 (10 20), loops forever
+    let mixed_cpp = r#"#include <iostream>
+int main() {
+    long long a, b;
+    if (std::cin >> a >> b) {
+        if (a == 1 && b == 2) {
+            std::cout << -999 << "\n";
+            return 0;
+        }
+        volatile long long s = 0;
+        while (true) { s += a; }
+    }
+    return 0;
+}
+"#;
+    fs::write(test_dir.join("solutions/mixed_wa_tle.cpp"), mixed_cpp).unwrap();
+
+    let p_toml = test_dir.join("problem.toml");
+    fs::write(
+        &p_toml,
+        r#"name = "aplusb_r12"
+type = "traditional"
+
+[limits]
+time = "500ms"
+memory = "256MB"
+
+[[subtasks]]
+id = 1
+score = 100.0
+tests = ["*"]
+
+[[solutions]]
+path = "solutions/ac.cpp"
+tag = "main"
+
+[[solutions]]
+path = "solutions/wa.cpp"
+tag = "wa"
+
+[[solutions]]
+path = "solutions/tle.cpp"
+tag = "tle"
+
+[[solutions]]
+path = "solutions/mixed_wa_tle.cpp"
+tag = "wa_or_tle"
+"#,
+    )
+    .unwrap();
+
+    let out = uj_cmd()
+        .arg("verify")
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj verify --format json");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "uj verify failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let res: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["verified"], 4);
+
+    let sols = res["solutions"]
+        .as_array()
+        .expect("solutions array missing");
+    assert_eq!(sols.len(), 4);
+
+    assert_eq!(sols[0]["path"], "solutions/ac.cpp");
+    assert_eq!(sols[0]["tag"], "main");
+    assert_eq!(sols[0]["matches_tag"], true);
+    assert_eq!(sols[0]["verdict"], "AC");
+    assert!(sols[0]["max_time_test"].is_string());
+    assert!(sols[0]["first_fail_test"].is_null());
+
+    assert_eq!(sols[3]["path"], "solutions/mixed_wa_tle.cpp");
+    assert_eq!(sols[3]["tag"], "wa_or_tle");
+    assert_eq!(sols[3]["matches_tag"], true);
+    assert!(sols[3]["first_fail_test"].is_string());
+    assert!(sols[3]["first_fail_verdict"].is_string());
+
+    // Verify cache file was written for uj tl reuse
+    assert!(test_dir.join(".uj/cache/verify_tl_cache.json").is_file());
+
+    // Run uj tl --format json and verify slowest test IDs are reported
+    let tl_out = uj_cmd()
+        .arg("tl")
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj tl --format json");
+
+    assert_eq!(
+        tl_out.status.code(),
+        Some(0),
+        "uj tl failed: {}",
+        String::from_utf8_lossy(&tl_out.stderr)
+    );
+    let tl_res: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&tl_out.stdout)).unwrap();
+    assert_eq!(tl_res["ok"], true);
+    assert!(tl_res["main_slowest_test"].is_string());
+    assert!(tl_res["slowest_ac_test"].is_string());
+    assert!(tl_res["peak_memory_test"].is_string());
+
+    let _ = fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_r12_stress_empty_stdout_and_gen_args_and_env() {
+    let _guard = lock_test();
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let test_dir = scratch_dir.join("test_r12_stress_gen_args");
+    let _ = fs::remove_dir_all(&test_dir);
+
+    let _ = uj_cmd()
+        .arg("init")
+        .arg(&test_dir)
+        .output()
+        .expect("Failed to execute uj init");
+
+    // Generator that mimics T10 fixed-ID dispatch unless argv[1] == "random" and UJ_STRESS == "1"
+    let custom_gen = r#"#include <cstdlib>
+#include <cstring>
+#include <iostream>
+
+int main(int argc, char* argv[]) {
+    if (argc >= 3 && std::strcmp(argv[1], "random") == 0) {
+        const char* stress_env = std::getenv("UJ_STRESS");
+        if (stress_env && std::strcmp(stress_env, "1") == 0) {
+            long long seed = std::atoll(argv[2]);
+            std::cout << (seed % 100) << " " << ((seed * 7) % 100) << "\n";
+            return 0;
+        }
+    }
+    int tid = (argc >= 2) ? std::atoi(argv[1]) : 0;
+    if (tid >= 1 && tid <= 3) {
+        std::cout << tid << " " << (tid + 1) << "\n";
+    }
+    // Outside 1..3, outputs nothing and exits 0!
+    return 0;
+}
+"#;
+    fs::write(test_dir.join("gen.cpp"), custom_gen).unwrap();
+
+    // 1. Calling uj stress with --seed 100 (default --gen-args "{seed}") must detect empty stdout immediately
+    let fail_out = uj_cmd()
+        .arg("stress")
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("--gen")
+        .arg("gen.cpp")
+        .arg("--sol")
+        .arg("solutions/std.cpp")
+        .arg("--brute")
+        .arg("solutions/brute.cpp")
+        .arg("-n")
+        .arg("1")
+        .arg("--seed")
+        .arg("100")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj stress");
+
+    assert_ne!(fail_out.status.code(), Some(0));
+    let fail_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&fail_out.stdout)).unwrap();
+    assert_eq!(fail_json["ok"], false);
+    assert_eq!(fail_json["error"]["kind"], "GeneratorFailed");
+    assert!(
+        fail_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Generator produced empty stdout on seed 100")
+    );
+
+    // 2. Calling uj stress with --gen-args "random {seed}" and --seed 100 succeeds
+    let ok_out = uj_cmd()
+        .arg("stress")
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("--gen")
+        .arg("gen.cpp")
+        .arg("--sol")
+        .arg("solutions/std.cpp")
+        .arg("--brute")
+        .arg("solutions/brute.cpp")
+        .arg("-n")
+        .arg("5")
+        .arg("--seed")
+        .arg("100")
+        .arg("--gen-args")
+        .arg("random {seed}")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj stress with --gen-args");
+
+    assert_eq!(
+        ok_out.status.code(),
+        Some(0),
+        "uj stress with --gen-args failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&ok_out.stdout),
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
+    let ok_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&ok_out.stdout)).unwrap();
+    assert_eq!(ok_json["ok"], true);
+    assert_eq!(ok_json["iterations"], 5);
+
+    let _ = fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_r12_pack_and_clean_orphans() {
+    let _guard = lock_test();
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+    let test_dir = scratch_dir.join("test_r12_pack");
+    let _ = fs::remove_dir_all(&test_dir);
+
+    let _ = uj_cmd()
+        .arg("init")
+        .arg(&test_dir)
+        .output()
+        .expect("Failed to execute uj init");
+
+    // Generate 3 tests and answers via pipeline
+    let pipe_out = uj_cmd()
+        .arg("pipeline")
+        .arg("-p")
+        .arg(&test_dir)
+        .output()
+        .expect("Failed to execute uj pipeline");
+    assert_eq!(pipe_out.status.code(), Some(0));
+
+    // Inject orphan files in tests/ (e.g. from an earlier larger generator count + stray .ans)
+    fs::write(test_dir.join("tests/99.in"), "1 1\n").unwrap();
+    fs::write(test_dir.join("tests/99.ans"), "2\n").unwrap();
+    fs::write(test_dir.join("tests/orphan.ans"), "0\n").unwrap();
+
+    let pack_out = uj_cmd()
+        .arg("pack")
+        .arg("-p")
+        .arg(&test_dir)
+        .arg("-o")
+        .arg("data.zip")
+        .arg("--clean")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to execute uj pack");
+
+    assert_eq!(
+        pack_out.status.code(),
+        Some(0),
+        "uj pack failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&pack_out.stdout),
+        String::from_utf8_lossy(&pack_out.stderr)
+    );
+
+    let pack_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&pack_out.stdout)).unwrap();
+    assert_eq!(pack_json["ok"], true);
+    assert_eq!(pack_json["output"], "data.zip");
+    assert_eq!(pack_json["test_count"], 3);
+    assert!(pack_json["size_bytes"].as_u64().unwrap() > 0);
+
+    let cleaned = pack_json["cleaned_files"].as_array().unwrap();
+    assert_eq!(cleaned.len(), 3);
+    assert!(!test_dir.join("tests/99.in").exists());
+    assert!(!test_dir.join("tests/99.ans").exists());
+    assert!(!test_dir.join("tests/orphan.ans").exists());
+    assert!(test_dir.join("data.zip").is_file());
+
+    let _ = fs::remove_dir_all(&test_dir);
+}
