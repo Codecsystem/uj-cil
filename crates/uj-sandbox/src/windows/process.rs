@@ -1042,20 +1042,48 @@ fn read_pipe_to_end(
     buf
 }
 
-fn build_windows_cmd_line(argv: &[std::ffi::OsString]) -> String {
+/// Build a Windows command line string adhering to the MSVC CRT / `CommandLineToArgvW`
+/// escaping rules:
+/// - Quote arguments that are empty or contain spaces, tabs, newlines, vertical tabs, or `"`.
+/// - Inside quotes, double any backslashes immediately preceding `"` and escape `"` as `\"`.
+/// - Double any trailing backslashes immediately preceding the closing `"`.
+pub(crate) fn build_windows_cmd_line(argv: &[std::ffi::OsString]) -> String {
     let mut line = String::new();
     for (i, arg) in argv.iter().enumerate() {
         if i > 0 {
             line.push(' ');
         }
         let s = arg.to_string_lossy();
-        if s.contains(' ') || s.contains('\t') || s.is_empty() {
-            line.push('"');
-            line.push_str(&s.replace('"', "\\\""));
-            line.push('"');
-        } else {
+        let needs_quotes = s.is_empty()
+            || s.chars()
+                .any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\x0b' || c == '"');
+        if !needs_quotes {
             line.push_str(&s);
+            continue;
         }
+        line.push('"');
+        let mut backslashes = 0usize;
+        for c in s.chars() {
+            if c == '\\' {
+                backslashes += 1;
+            } else if c == '"' {
+                for _ in 0..(backslashes * 2 + 1) {
+                    line.push('\\');
+                }
+                line.push('"');
+                backslashes = 0;
+            } else {
+                for _ in 0..backslashes {
+                    line.push('\\');
+                }
+                line.push(c);
+                backslashes = 0;
+            }
+        }
+        for _ in 0..(backslashes * 2) {
+            line.push('\\');
+        }
+        line.push('"');
     }
     line
 }
@@ -1113,25 +1141,13 @@ fn build_environment_block(
     block
 }
 
-/// Pre-warm newly prepared binary to trigger Windows Defender scan ahead of timed execution.
-/// Runs the binary briefly inside AppContainer with CREATE_NO_WINDOW and waits up to 100ms or until it finishes,
-/// then cleanly terminates it.
+/// Pre-warm newly prepared binary to trigger Windows Defender (`WdFilter.sys`) synchronous image
+/// section scan ahead of timed execution.
+/// Spawns the process with `CREATE_SUSPENDED | CREATE_NO_WINDOW` (which maps the image section
+/// and completes Defender's synchronous kernel callback inside `NtCreateUserProcess`) and
+/// immediately terminates it WITHOUT ever calling `ResumeThread`, so zero instructions of
+/// untrusted code execute during prewarm.
 pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
-    let app_container = match AppContainerProfile::get_shared() {
-        Ok(ac) => ac,
-        Err(e) => {
-            tracing::debug!("Skipping Windows prewarm: AppContainer creation failed: {e}");
-            return;
-        }
-    };
-    let job = match JobObject::create(None) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::debug!("Skipping Windows prewarm: JobObject creation failed: {e}");
-            return;
-        }
-    };
-
     let spec = RunSpec {
         argv: vec![exe_path.into()],
         env: vec![],
@@ -1144,13 +1160,8 @@ pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
         limits: uj_core::run::Limits::new(500, 256 * 1024 * 1024),
         cpu_affinity: None,
         seccomp_profile: Default::default(),
-        trusted: false,
+        trusted: true,
     };
-
-    if let Err(e) = job.set_limits(spec.limits.memory_bytes, 1, spec.cpu_affinity.as_deref()) {
-        tracing::debug!("Skipping Windows prewarm: Job set_limits failed: {e}");
-        return;
-    }
 
     let (h_stdin, c1) = match prepare_stdin(&spec.stdin) {
         Ok(v) => v,
@@ -1165,38 +1176,18 @@ pub fn prewarm_binary(exe_path: &Path, work_dir: &Path) {
         Err(_) => return,
     };
 
-    let pi = unsafe {
-        spawn_suspended_process(&spec, h_stdin, h_stdout, h_stderr, Some(&app_container))
-    };
+    let pi = unsafe { spawn_suspended_process(&spec, h_stdin, h_stdout, h_stderr, None) };
 
     drop(c1);
     drop(c2);
     drop(c3);
 
-    let pi = match pi {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("Skipping Windows prewarm: spawn_suspended_process failed: {e}");
-            return;
-        }
-    };
-
-    if let Err(e) = job.assign_process(pi.hProcess) {
-        tracing::debug!("Skipping Windows prewarm: assign_process failed: {e}");
+    if let Ok(pi) = pi {
         unsafe {
-            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = TerminateProcess(pi.hProcess, 0);
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
         }
-        return;
-    }
-
-    unsafe {
-        let _ = ResumeThread(pi.hThread);
-        let _ = WaitForSingleObject(pi.hProcess, 50);
-        let _ = job.terminate(0);
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
     }
 }
 
@@ -1280,6 +1271,38 @@ mod tests {
     use super::*;
     use crate::{PipeConnection, Wiring};
     use uj_core::run::Limits;
+
+    #[test]
+    fn test_build_windows_cmd_line_msvc_escaping() {
+        use std::ffi::OsString;
+        // 1. Simple args without spaces or quotes
+        assert_eq!(
+            build_windows_cmd_line(&[OsString::from("prog.exe"), OsString::from("arg1")]),
+            "prog.exe arg1"
+        );
+        // 2. Trailing backslash with space (must double trailing backslash before closing quote)
+        assert_eq!(
+            build_windows_cmd_line(&[
+                OsString::from("prog.exe"),
+                OsString::from(r"C:\dir with space\"),
+            ]),
+            r#"prog.exe "C:\dir with space\\""#
+        );
+        // 3. Embedded quotes and backslashes preceding quotes
+        assert_eq!(
+            build_windows_cmd_line(&[
+                OsString::from("prog.exe"),
+                OsString::from(r#"a\"b"#),
+                OsString::from(r#"he said "hi""#),
+            ]),
+            r#"prog.exe "a\\\"b" "he said \"hi\"""#
+        );
+        // 4. Empty argument and newline/tab
+        assert_eq!(
+            build_windows_cmd_line(&[OsString::from(""), OsString::from("line1\nline2")]),
+            "\"\" \"line1\nline2\""
+        );
+    }
 
     #[test]
     fn test_execute_group_partial_spawn_failure_no_handle_leak() {

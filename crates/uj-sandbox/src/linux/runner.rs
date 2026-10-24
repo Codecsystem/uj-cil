@@ -1,8 +1,9 @@
 //! Process runner and namespace isolation for Linux sandbox.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio as StdProcessStdio};
 use std::sync::Arc;
@@ -25,6 +26,25 @@ struct SandboxStatusPacket {
     ru_stime_us: u64,
     ru_maxrss_kb: u64,
 }
+
+#[repr(C)]
+struct CapUserHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapUserData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+// SECBIT_NOROOT (1) | SECBIT_NOROOT_LOCKED (2) | SECBIT_NO_SETUID_FIXUP (4)
+// | SECBIT_NO_SETUID_FIXUP_LOCKED (8) | SECBIT_KEEP_CAPS_LOCKED (32) = 0x2f
+const SECUREBITS_LOCKED_NO_ROOT: libc::c_ulong = 0x2f;
 
 #[derive(Clone)]
 struct SendSyncPtrs {
@@ -66,6 +86,31 @@ fn pidfd_open(pid: i32) -> Result<i32, std::io::Error> {
     }
 }
 
+/// Waits for a child PID using `wait4` to capture `rusage` alongside `ExitStatus`.
+fn wait4_pid(
+    pid: i32,
+    options: i32,
+) -> std::io::Result<Option<(std::process::ExitStatus, libc::rusage)>> {
+    unsafe {
+        let mut status: libc::c_int = 0;
+        let mut rusage: libc::rusage = std::mem::zeroed();
+        loop {
+            let ret = libc::wait4(pid, &mut status, options, &mut rusage);
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ret == 0 {
+                return Ok(None);
+            }
+            return Ok(Some((std::process::ExitStatus::from_raw(status), rusage)));
+        }
+    }
+}
+
 /// Executes a single process in Linux sandbox (cgroup v2 + namespaces).
 pub fn execute_in_sandbox(
     spec: &RunSpec,
@@ -82,13 +127,16 @@ pub fn execute_in_sandbox_with_stdio(
     cgroup_base: Option<&Path>,
     cancel: &CancelToken,
     tier: Tier,
-    custom_stdin: Option<std::os::unix::io::OwnedFd>,
-    custom_stdout: Option<std::os::unix::io::OwnedFd>,
-    extra_owned_fds: Vec<std::os::unix::io::OwnedFd>,
+    custom_stdin: Option<OwnedFd>,
+    custom_stdout: Option<OwnedFd>,
+    extra_owned_fds: Vec<OwnedFd>,
 ) -> Result<RunResult, SandboxError> {
     if spec.argv.is_empty() {
         return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
     }
+
+    let is_trusted = spec.trusted;
+    let used_namespaces = !is_trusted && (tier == Tier::Full || tier == Tier::Degraded);
 
     // 1. Create dedicated cgroup v2 if cgroup_base is provided
     let cgroup = if let Some(base) = cgroup_base {
@@ -114,6 +162,11 @@ pub fn execute_in_sandbox_with_stdio(
     }
 
     // Stdio
+    // For untrusted namespace runs with Stdio::File(path), we do NOT pass a host rw-mount fd
+    // directly into the container (which would allow reopening /proc/self/fd/0 with O_RDWR).
+    // Instead, we validate readability here, bind-mount the input file read-only inside the jail,
+    // open it O_RDONLY from the read-only bind mount after pivot_root, and detach/unlink the mount point.
+    let mut jail_stdin_host_path: Option<PathBuf> = None;
     if let Some(fd) = custom_stdin {
         cmd.stdin(StdProcessStdio::from(fd));
     } else {
@@ -122,8 +175,20 @@ pub fn execute_in_sandbox_with_stdio(
                 cmd.stdin(StdProcessStdio::null());
             }
             Stdio::File(path) => {
-                let file = File::open(path)?;
-                cmd.stdin(StdProcessStdio::from(file));
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    spec.work_dir.join(path)
+                };
+                if used_namespaces {
+                    // Verify input file exists and is readable before spawning
+                    let _ = File::open(&resolved)?;
+                    jail_stdin_host_path = Some(resolved);
+                    cmd.stdin(StdProcessStdio::null());
+                } else {
+                    let file = File::open(&resolved)?;
+                    cmd.stdin(StdProcessStdio::from(file));
+                }
             }
             Stdio::Pipe => {
                 cmd.stdin(StdProcessStdio::piped());
@@ -165,7 +230,6 @@ pub fn execute_in_sandbox_with_stdio(
             .saturating_sub(4 * 1024 * 1024)
             .max(8 * 1024 * 1024)
     });
-    let is_trusted = spec.trusted;
     let extra_raw_fds: Vec<i32> = spec.extra_fds.iter().map(|f| f.0 as i32).collect();
 
     let host_exe = if exe_path.is_absolute() {
@@ -198,50 +262,76 @@ pub fn execute_in_sandbox_with_stdio(
         .collect();
 
     let cgroup_procs_file = cgroup.as_ref().map(|cg| cg.path().join("cgroup.procs"));
+    let cgroup_mem_peak_file = cgroup.as_ref().map(|cg| cg.path().join("memory.peak"));
     let mem_limit_bytes = spec.limits.memory_bytes;
     let cpu_limit_ms = spec.limits.cpu_time_ms;
     let max_procs = spec.limits.max_processes;
     let output_limit_bytes = spec.limits.output_bytes;
     let has_cgroup = cgroup.is_some();
 
+    let cpu_set_opt: Option<libc::cpu_set_t> = spec.cpu_affinity.as_ref().and_then(|cpus| {
+        if cpus.is_empty() {
+            return None;
+        }
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            let mut any = false;
+            for &cpu in cpus {
+                if cpu < libc::CPU_SETSIZE as usize {
+                    libc::CPU_SET(cpu, &mut set);
+                    any = true;
+                }
+            }
+            if any { Some(set) } else { None }
+        }
+    });
+
     let mut status_pipe = [0i32; 2];
     if unsafe { libc::pipe2(status_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(SandboxError::Io(std::io::Error::last_os_error()));
     }
-    let status_read_fd = status_pipe[0];
-    let status_write_fd = status_pipe[1];
+    let status_read_owned = unsafe { OwnedFd::from_raw_fd(status_pipe[0]) };
+    let status_write_owned = unsafe { OwnedFd::from_raw_fd(status_pipe[1]) };
+    let status_write_fd = status_write_owned.as_raw_fd();
 
     // Pre-calculate all resources, CStrings, and file system skeletons in the parent thread
     // BEFORE fork, so the child running in pre_exec strictly executes async-signal-safe syscalls.
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
-    let uid_map_bytes = format!("0 {real_uid} 1\n");
-    let gid_map_bytes = format!("0 {real_gid} 1\n");
+    // Map a non-zero UID/GID inside the user namespace so execve does not grant root capabilities.
+    let inner_uid = if real_uid == 0 { 1000 } else { real_uid };
+    let inner_gid = if real_gid == 0 { 1000 } else { real_gid };
+    let uid_map_bytes = format!("{inner_uid} {real_uid} 1\n");
+    let gid_map_bytes = format!("{inner_gid} {real_gid} 1\n");
     let cgroup_procs_cpath = cgroup_procs_file
         .as_ref()
         .and_then(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).ok());
+    let cgroup_mem_peak_cpath = cgroup_mem_peak_file
+        .as_ref()
+        .and_then(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).ok());
 
-    let jail_rootfs_path = if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
-        let rootfs = if Path::new("/dev/shm").is_dir() {
-            PathBuf::from(format!(
-                "/dev/shm/.uj_rootfs_{}_{}",
-                std::process::id(),
-                rustix::thread::gettid().as_raw_nonzero()
-            ))
+    let jail_rootfs_guard: Option<tempfile::TempDir> = if used_namespaces {
+        let base = if Path::new("/dev/shm").is_dir() {
+            Path::new("/dev/shm")
         } else if Path::new("/run").is_dir() {
-            PathBuf::from(format!(
-                "/run/.uj_rootfs_{}_{}",
-                std::process::id(),
-                rustix::thread::gettid().as_raw_nonzero()
-            ))
+            Path::new("/run")
         } else {
-            PathBuf::from(format!(
-                "/tmp/.uj_rootfs_{}_{}",
-                std::process::id(),
-                rustix::thread::gettid().as_raw_nonzero()
-            ))
+            Path::new("/tmp")
         };
-        Some(rootfs)
+        let prefix = format!(".uj_rootfs_{}_", std::process::id());
+        let td = tempfile::Builder::new()
+            .prefix(&prefix)
+            .rand_bytes(8)
+            .tempdir_in(base)
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix(&prefix)
+                    .rand_bytes(8)
+                    .tempdir()
+            })
+            .map_err(SandboxError::Io)?;
+        Some(td)
     } else {
         None
     };
@@ -260,6 +350,7 @@ pub fn execute_in_sandbox_with_stdio(
         c_lib64,
         c_workdir,
         target_exe_pair,
+        stdin_bind_pair,
         ro_bind_pairs,
         dev_pairs,
         ld_so_pair,
@@ -267,8 +358,8 @@ pub fn execute_in_sandbox_with_stdio(
         c_argv_ptrs,
         c_env_ptrs,
         c_exe,
-    ) = if let Some(ref rootfs) = jail_rootfs_path {
-        let _ = fs::create_dir_all(rootfs);
+    ) = if let Some(ref rootfs_guard) = jail_rootfs_guard {
+        let rootfs = rootfs_guard.path();
 
         let c_rootfs = std::ffi::CString::new(rootfs.to_string_lossy().as_bytes())
             .map_err(|e| SandboxError::Internal(format!("Invalid rootfs path: {e}")))?;
@@ -307,6 +398,17 @@ pub fn execute_in_sandbox_with_stdio(
                     .map_err(|e| SandboxError::Internal(format!("Invalid host exe: {e}")))?;
                 ("/__uj_bin".to_string(), Some((c_host_exe, c_target_exe)))
             };
+
+        let stdin_bind_pair = if let Some(ref host_in) = jail_stdin_host_path {
+            let target_in = rootfs.join("__uj_stdin");
+            let c_host_in = std::ffi::CString::new(host_in.to_string_lossy().as_bytes())
+                .map_err(|e| SandboxError::Internal(format!("Invalid stdin path: {e}")))?;
+            let c_target_in = std::ffi::CString::new(target_in.to_string_lossy().as_bytes())
+                .map_err(|e| SandboxError::Internal(format!("Invalid target stdin: {e}")))?;
+            Some((c_host_in, c_target_in))
+        } else {
+            None
+        };
 
         let mut ro_bind_pairs = Vec::new();
         for ro_bind in &ro_binds {
@@ -398,6 +500,7 @@ pub fn execute_in_sandbox_with_stdio(
             Some(c_lib64),
             Some(c_workdir),
             target_exe_pair,
+            stdin_bind_pair,
             ro_bind_pairs,
             dev_pairs,
             ld_so_pair,
@@ -408,6 +511,7 @@ pub fn execute_in_sandbox_with_stdio(
         )
     } else {
         (
+            None,
             None,
             None,
             None,
@@ -466,12 +570,68 @@ pub fn execute_in_sandbox_with_stdio(
                 Ok(())
             }
 
+            // Remount a bind-mounted path as read-only while preserving locked mount flags
+            // (such as MS_NODEV, MS_NOSUID, MS_NOEXEC, MS_RELATIME/MS_NOATIME) required by userns.
+            unsafe fn remount_bind_rdonly(
+                target: *const libc::c_char,
+                extra_flags: libc::c_ulong,
+            ) -> std::io::Result<()> {
+                let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+                let mut preserve: libc::c_ulong = 0;
+                if unsafe { libc::statvfs(target, &mut st) } == 0 {
+                    if (st.f_flag & libc::ST_NOSUID) != 0 {
+                        preserve |= libc::MS_NOSUID;
+                    }
+                    if (st.f_flag & libc::ST_NODEV) != 0 {
+                        preserve |= libc::MS_NODEV;
+                    }
+                    if (st.f_flag & libc::ST_NOEXEC) != 0 {
+                        preserve |= libc::MS_NOEXEC;
+                    }
+                    if (st.f_flag & libc::ST_NOATIME) != 0 {
+                        preserve |= libc::MS_NOATIME;
+                    }
+                    if (st.f_flag & libc::ST_NODIRATIME) != 0 {
+                        preserve |= libc::MS_NODIRATIME;
+                    }
+                    if (st.f_flag & libc::ST_RELATIME) != 0 {
+                        preserve |= libc::MS_RELATIME;
+                    }
+                    if (st.f_flag & libc::ST_SYNCHRONOUS) != 0 {
+                        preserve |= libc::MS_SYNCHRONOUS;
+                    }
+                }
+                let flags =
+                    preserve | libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | extra_flags;
+                if unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        target,
+                        std::ptr::null(),
+                        flags,
+                        std::ptr::null(),
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+
             // 1. Immediately join cgroup v2 before unsharing
             if let Some(ref procs_cpath) = cgroup_procs_cpath {
                 raw_write_all(procs_cpath.as_ptr(), b"0\n")?;
             }
 
-            if !is_trusted && (tier == Tier::Full || tier == Tier::Degraded) {
+            // Open optional memory.peak fd (O_WRONLY | O_CLOEXEC) before pivot_root so PID 2
+            // can attempt a kernel 6.12+ per-fd peak reset right before execve.
+            let mem_peak_reset_fd = if let Some(ref peak_cpath) = cgroup_mem_peak_cpath {
+                libc::open(peak_cpath.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
+            } else {
+                -1
+            };
+
+            if used_namespaces {
                 // 1. Unshare user, pid, mount, net, ipc, uts namespaces
                 if libc::unshare(
                     libc::CLONE_NEWUSER
@@ -489,6 +649,9 @@ pub fn execute_in_sandbox_with_stdio(
                 raw_write_all(c"/proc/self/setgroups".as_ptr(), b"deny\n")?;
                 raw_write_all(c"/proc/self/uid_map".as_ptr(), uid_map_bytes.as_bytes())?;
                 raw_write_all(c"/proc/self/gid_map".as_ptr(), gid_map_bytes.as_bytes())?;
+
+                // Mark intermediate process non-dumpable after writing uid_map/gid_map
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
 
                 // 3. Make all mounts private so rootfs mounts don't propagate to host
                 if libc::mount(
@@ -560,20 +723,7 @@ pub fn execute_in_sandbox_with_stdio(
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::mount(
-                    std::ptr::null(),
-                    c_usr_ptr,
-                    std::ptr::null(),
-                    libc::MS_BIND
-                        | libc::MS_REMOUNT
-                        | libc::MS_RDONLY
-                        | libc::MS_REC
-                        | libc::MS_NOSUID,
-                    std::ptr::null(),
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
+                remount_bind_rdonly(c_usr_ptr, libc::MS_REC | libc::MS_NOSUID)?;
 
                 // Bind mount /box (work_dir) read-write
                 if libc::mount(
@@ -604,13 +754,27 @@ pub fn execute_in_sandbox_with_stdio(
                     {
                         return Err(std::io::Error::last_os_error());
                     }
-                    let _ = libc::mount(
+                    remount_bind_rdonly(c_target_exe.as_ptr(), libc::MS_NOSUID)?;
+                }
+
+                // Bind mount stdin input file read-only so /proc/self/fd/0 is backed by an MS_RDONLY mount
+                if let Some((ref c_host_in, ref c_target_in)) = stdin_bind_pair {
+                    let fd =
+                        libc::open(c_target_in.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o444);
+                    if fd >= 0 {
+                        libc::close(fd);
+                    }
+                    if libc::mount(
+                        c_host_in.as_ptr(),
+                        c_target_in.as_ptr(),
                         std::ptr::null(),
-                        c_target_exe.as_ptr(),
+                        libc::MS_BIND,
                         std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                        std::ptr::null(),
-                    );
+                    ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    remount_bind_rdonly(c_target_in.as_ptr(), libc::MS_NOSUID | libc::MS_NODEV)?;
                 }
 
                 // Ro binds
@@ -623,20 +787,17 @@ pub fn execute_in_sandbox_with_stdio(
                             libc::close(fd);
                         }
                     }
-                    let _ = libc::mount(
+                    if libc::mount(
                         c_src.as_ptr(),
                         c_dst.as_ptr(),
                         std::ptr::null(),
-                        libc::MS_BIND,
+                        libc::MS_BIND | libc::MS_REC,
                         std::ptr::null(),
-                    );
-                    let _ = libc::mount(
-                        std::ptr::null(),
-                        c_dst.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                        std::ptr::null(),
-                    );
+                    ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    remount_bind_rdonly(c_dst.as_ptr(), libc::MS_REC | libc::MS_NOSUID)?;
                 }
 
                 // Private /tmp
@@ -675,13 +836,7 @@ pub fn execute_in_sandbox_with_stdio(
                         libc::MS_BIND,
                         std::ptr::null(),
                     );
-                    let _ = libc::mount(
-                        std::ptr::null(),
-                        c_dst.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                        std::ptr::null(),
-                    );
+                    let _ = remount_bind_rdonly(c_dst.as_ptr(), 0);
                 }
 
                 if let Some((ref c_src, ref c_dst)) = ld_so_pair {
@@ -696,13 +851,7 @@ pub fn execute_in_sandbox_with_stdio(
                         libc::MS_BIND,
                         std::ptr::null(),
                     );
-                    let _ = libc::mount(
-                        std::ptr::null(),
-                        c_dst.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                        std::ptr::null(),
-                    );
+                    let _ = remount_bind_rdonly(c_dst.as_ptr(), 0);
                 }
 
                 if let Some((ref c_src, ref c_dst)) = alt_pair {
@@ -728,14 +877,35 @@ pub fn execute_in_sandbox_with_stdio(
                 }
                 let _ = libc::rmdir(c"/old_root".as_ptr());
 
+                // Open stdin from the read-only bind mount inside the jail, then detach and unlink it
+                if stdin_bind_pair.is_some() {
+                    let in_fd = libc::open(c"/__uj_stdin".as_ptr(), libc::O_RDONLY);
+                    if in_fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if in_fd != 0 {
+                        if libc::dup2(in_fd, 0) < 0 {
+                            let err = std::io::Error::last_os_error();
+                            libc::close(in_fd);
+                            return Err(err);
+                        }
+                        libc::close(in_fd);
+                    }
+                    let _ = libc::umount2(c"/__uj_stdin".as_ptr(), libc::MNT_DETACH);
+                    let _ = libc::unlink(c"/__uj_stdin".as_ptr());
+                }
+
                 // Remount rootfs as read-only, ensuring only /box and /tmp are writable
-                let _ = libc::mount(
+                if libc::mount(
                     std::ptr::null(),
                     c"/".as_ptr(),
                     std::ptr::null(),
                     libc::MS_REMOUNT | libc::MS_RDONLY,
                     std::ptr::null(),
-                );
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
 
                 if libc::chdir(c"/box".as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -749,6 +919,9 @@ pub fn execute_in_sandbox_with_stdio(
 
                 if init_pid == 0 {
                     // Child is now PID 1 in the new PID namespace!
+                    // Mark PID 1 non-dumpable immediately so /proc/1/{fd,mem,maps,environ} are root-owned
+                    // and inaccessible to the contestant (PID 2).
+                    libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
 
                     let num_extra = extra_raw_fds.len().min(64);
@@ -767,6 +940,11 @@ pub fn execute_in_sandbox_with_stdio(
                     if temp_status_fd < 0 {
                         libc::_exit(124);
                     }
+                    let temp_mem_peak_fd = if mem_peak_reset_fd >= 0 {
+                        libc::fcntl(mem_peak_reset_fd, libc::F_DUPFD_CLOEXEC, min_safe)
+                    } else {
+                        -1
+                    };
                     for (i, &tfd) in temp_fds.iter().enumerate().take(num_extra) {
                         let target_fd = 3 + i as i32;
                         if libc::dup2(tfd, target_fd) < 0 {
@@ -781,9 +959,26 @@ pub fn execute_in_sandbox_with_stdio(
                     if status_write_fd > status_tx_fd {
                         libc::close(status_write_fd);
                     }
+                    let peak_fd_target = status_tx_fd + 1;
+                    let has_peak_fd = if temp_mem_peak_fd >= 0 {
+                        if libc::dup2(temp_mem_peak_fd, peak_fd_target) >= 0 {
+                            libc::fcntl(peak_fd_target, libc::F_SETFD, libc::FD_CLOEXEC);
+                            libc::close(temp_mem_peak_fd);
+                            true
+                        } else {
+                            libc::close(temp_mem_peak_fd);
+                            false
+                        }
+                    } else {
+                        false
+                    };
 
-                    // Close all fds > status_tx_fd so parent Command::spawn() error pipe reaches EOF
-                    let close_from = (status_tx_fd + 1) as u32;
+                    // Close all fds > highest internal fd so parent Command::spawn() error pipe reaches EOF
+                    let close_from = if has_peak_fd {
+                        (peak_fd_target + 1) as u32
+                    } else {
+                        (status_tx_fd + 1) as u32
+                    };
                     if libc::syscall(libc::SYS_close_range, close_from, !0u32, 0) != 0 {
                         for fd in (close_from as i32)..256 {
                             libc::close(fd);
@@ -794,7 +989,7 @@ pub fn execute_in_sandbox_with_stdio(
                         c"proc".as_ptr(),
                         c"/proc".as_ptr(),
                         c"proc".as_ptr(),
-                        0,
+                        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                         c"subset=pid".as_ptr() as *const libc::c_void,
                     ) != 0
                     {
@@ -802,7 +997,7 @@ pub fn execute_in_sandbox_with_stdio(
                             c"proc".as_ptr(),
                             c"/proc".as_ptr(),
                             c"proc".as_ptr(),
-                            0,
+                            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                             std::ptr::null(),
                         );
                     }
@@ -815,7 +1010,24 @@ pub fn execute_in_sandbox_with_stdio(
 
                     if contestant_pid == 0 {
                         libc::close(status_tx_fd);
+                        if has_peak_fd {
+                            // Best-effort reset of cgroup memory.peak (supported on Linux 6.12+)
+                            let _ = libc::write(
+                                peak_fd_target,
+                                b"0\n".as_ptr() as *const libc::c_void,
+                                2,
+                            );
+                            libc::close(peak_fd_target);
+                        }
                         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+
+                        if let Some(ref set) = cpu_set_opt {
+                            let _ = libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                set,
+                            );
+                        }
 
                         let rlim = libc::rlimit {
                             rlim_cur: stack_limit,
@@ -828,6 +1040,16 @@ pub fn execute_in_sandbox_with_stdio(
                             rlim_max: 0,
                         };
                         libc::setrlimit(libc::RLIMIT_CORE, &rlim_zero);
+
+                        // Always enforce RLIMIT_FSIZE regardless of tier (Full or Degraded)
+                        // so contestant cannot fill host disk via /box writes.
+                        if output_limit_bytes > 0 {
+                            let rlim_fsize = libc::rlimit {
+                                rlim_cur: output_limit_bytes,
+                                rlim_max: output_limit_bytes,
+                            };
+                            libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
+                        }
 
                         if tier == Tier::Degraded || !has_cgroup {
                             if mem_limit_bytes > 0 {
@@ -845,19 +1067,57 @@ pub fn execute_in_sandbox_with_stdio(
                                 };
                                 libc::setrlimit(libc::RLIMIT_CPU, &rlim_cpu);
                             }
-                            let nproc = if max_procs > 0 { max_procs } else { 32 };
+                            // Match cgroup.rs pids.max accounting: intermediate process + PID 1 + PID 2
+                            // all share this user_namespace ucounts, plus a small buffer for runtime helpers.
+                            let nproc = if max_procs > 0 {
+                                max_procs.saturating_add(4)
+                            } else {
+                                32
+                            };
                             let rlim_nproc = libc::rlimit {
                                 rlim_cur: nproc as u64,
                                 rlim_max: nproc as u64,
                             };
                             libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc);
-                            if output_limit_bytes > 0 {
-                                let rlim_fsize = libc::rlimit {
-                                    rlim_cur: output_limit_bytes,
-                                    rlim_max: output_limit_bytes,
-                                };
-                                libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
+                        }
+
+                        // Drop all capabilities (ambient, bounding set, effective/permitted/inheritable)
+                        // and lock securebits before applying seccomp and execve.
+                        let _ = libc::prctl(
+                            libc::PR_CAP_AMBIENT,
+                            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                            0,
+                            0,
+                            0,
+                        );
+                        for cap in 0..=63 {
+                            if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 {
+                                break;
                             }
+                        }
+                        let _ = libc::prctl(
+                            libc::PR_SET_SECUREBITS,
+                            SECUREBITS_LOCKED_NO_ROOT,
+                            0,
+                            0,
+                            0,
+                        );
+                        let cap_hdr = CapUserHeader {
+                            version: LINUX_CAPABILITY_VERSION_3,
+                            pid: 0,
+                        };
+                        let cap_data = [CapUserData {
+                            effective: 0,
+                            permitted: 0,
+                            inheritable: 0,
+                        }; 2];
+                        if libc::syscall(
+                            libc::SYS_capset,
+                            &cap_hdr as *const CapUserHeader,
+                            cap_data.as_ptr(),
+                        ) != 0
+                        {
+                            libc::_exit(125);
                         }
 
                         if crate::linux::seccomp::apply_seccomp_filter().is_err() {
@@ -869,6 +1129,9 @@ pub fn execute_in_sandbox_with_stdio(
                         libc::execve(c_exe_ptr, c_argv_ptrs.as_ptr(), c_env_ptrs.as_ptr());
                         libc::_exit(127);
                     } else {
+                        if has_peak_fd {
+                            libc::close(peak_fd_target);
+                        }
                         // PID 1 init process: wait for contestant PID 2, then reap any zombies
                         let mut status = 0;
                         let mut rusage: libc::rusage = std::mem::zeroed();
@@ -965,7 +1228,17 @@ pub fn execute_in_sandbox_with_stdio(
                     }
                 }
             } else {
-                // Trusted or Degraded mode:
+                // Trusted mode:
+                if mem_peak_reset_fd >= 0 {
+                    let _ =
+                        libc::write(mem_peak_reset_fd, b"0\n".as_ptr() as *const libc::c_void, 2);
+                    libc::close(mem_peak_reset_fd);
+                }
+
+                if let Some(ref set) = cpu_set_opt {
+                    let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set);
+                }
+
                 let rlim = libc::rlimit {
                     rlim_cur: stack_limit,
                     rlim_max: stack_limit,
@@ -1007,10 +1280,6 @@ pub fn execute_in_sandbox_with_stdio(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            unsafe {
-                libc::close(status_read_fd);
-                libc::close(status_write_fd);
-            }
             return Err(SandboxError::Internal(format!(
                 "Failed to spawn child: {e}"
             )));
@@ -1018,11 +1287,8 @@ pub fn execute_in_sandbox_with_stdio(
     };
 
     drop(extra_owned_fds);
-
     // Close supervisor's write end of the status pipe
-    unsafe {
-        libc::close(status_write_fd);
-    }
+    drop(status_write_owned);
 
     // 4. Attach child to cgroup v2 if available
     if let Some(ref cg) = cgroup {
@@ -1077,10 +1343,11 @@ pub fn execute_in_sandbox_with_stdio(
         }))
     };
 
-    // 6. Monitor child process using pidfd_open or wait loop
+    // 6. Monitor child process using pidfd_open or wait4 loop
     let pid = child.id() as i32;
     let pidfd = pidfd_open(pid).ok();
     let mut killed_by: Option<KillReason> = None;
+    let mut waited_result: Option<(std::process::ExitStatus, libc::rusage)> = None;
 
     loop {
         if cancel.is_cancelled() {
@@ -1131,7 +1398,7 @@ pub fn execute_in_sandbox_with_stdio(
             break;
         }
 
-        // Poll pidfd or try_wait
+        // Poll pidfd or wait4(WNOHANG)
         if let Some(pfd) = pidfd {
             let mut pfd_poll = libc::pollfd {
                 fd: pfd,
@@ -1143,8 +1410,11 @@ pub fn execute_in_sandbox_with_stdio(
                 break;
             }
         } else {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
+            match wait4_pid(pid, libc::WNOHANG) {
+                Ok(Some(res)) => {
+                    waited_result = Some(res);
+                    break;
+                }
                 Ok(None) => thread::sleep(std::time::Duration::from_millis(10)),
                 Err(_) => break,
             }
@@ -1157,7 +1427,13 @@ pub fn execute_in_sandbox_with_stdio(
         }
     }
 
-    let status = child.wait()?;
+    let (status, wait_rusage) = match waited_result {
+        Some(res) => res,
+        None => match wait4_pid(pid, 0)? {
+            Some(res) => res,
+            None => (child.wait()?, unsafe { std::mem::zeroed() }),
+        },
+    };
     let wall_time_us = start_time.elapsed().as_micros() as u64;
 
     // Immediately kill any surviving child/orphan processes in this cgroup
@@ -1166,28 +1442,42 @@ pub fn execute_in_sandbox_with_stdio(
         cg.kill();
     }
 
-    // Read status packet from pipe
+    // Read status packet from pipe: accept ONLY if exactly one packet followed by EOF.
     let status_from_packet = unsafe {
-        let mut packet = std::mem::zeroed::<SandboxStatusPacket>();
+        const PKT_SIZE: usize = std::mem::size_of::<SandboxStatusPacket>();
+        let mut raw_buf = [0u8; PKT_SIZE + 1];
         let mut read_bytes = 0;
-        let packet_buf = std::slice::from_raw_parts_mut(
-            &mut packet as *mut _ as *mut u8,
-            std::mem::size_of::<SandboxStatusPacket>(),
-        );
-        while read_bytes < packet_buf.len() {
+        let status_read_fd = status_read_owned.as_raw_fd();
+        while read_bytes < raw_buf.len() {
             let n = libc::read(
                 status_read_fd,
-                packet_buf[read_bytes..].as_mut_ptr() as *mut libc::c_void,
-                packet_buf.len() - read_bytes,
+                raw_buf[read_bytes..].as_mut_ptr() as *mut libc::c_void,
+                raw_buf.len() - read_bytes,
             );
-            if n <= 0 {
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
                 break;
             }
             read_bytes += n as usize;
         }
-        libc::close(status_read_fd);
-        if read_bytes == std::mem::size_of::<SandboxStatusPacket>() {
-            Some(packet)
+        drop(status_read_owned);
+        if read_bytes == PKT_SIZE {
+            let mut packet = std::mem::zeroed::<SandboxStatusPacket>();
+            std::ptr::copy_nonoverlapping(
+                raw_buf.as_ptr(),
+                &mut packet as *mut _ as *mut u8,
+                PKT_SIZE,
+            );
+            if packet.is_signaled <= 1 && packet.pad == [0; 3] {
+                Some(packet)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1206,7 +1496,12 @@ pub fn execute_in_sandbox_with_stdio(
             false,
         )
     } else {
-        (wall_time_us, 0, false)
+        let cpu_us = (wait_rusage.ru_utime.tv_sec as u64) * 1_000_000
+            + (wait_rusage.ru_utime.tv_usec as u64)
+            + (wait_rusage.ru_stime.tv_sec as u64) * 1_000_000
+            + (wait_rusage.ru_stime.tv_usec as u64);
+        let mem_bytes = (wait_rusage.ru_maxrss as u64) * 1024;
+        (cpu_us, mem_bytes, false)
     };
 
     // Join readers
@@ -1232,9 +1527,7 @@ pub fn execute_in_sandbox_with_stdio(
     if let Some(ref cg) = cgroup {
         cg.kill();
     }
-    if let Some(ref rootfs) = jail_rootfs_path {
-        let _ = fs::remove_dir_all(rootfs);
-    }
+    drop(jail_rootfs_guard);
 
     let exit_status = if let Some(ref pkt) = status_from_packet {
         if pkt.is_signaled != 0 {
@@ -1242,15 +1535,16 @@ pub fn execute_in_sandbox_with_stdio(
         } else {
             ExitStatus::Exited(pkt.code_or_sig)
         }
+    } else if let Some(sig) = status.signal() {
+        ExitStatus::Signaled(sig)
     } else if let Some(code) = status.code() {
-        if code > 128 && code <= 128 + 64 {
+        if used_namespaces && code > 128 && code <= 128 + 64 {
             ExitStatus::Signaled(code - 128)
         } else {
             ExitStatus::Exited(code)
         }
     } else {
-        use std::os::unix::process::ExitStatusExt;
-        ExitStatus::Signaled(status.signal().unwrap_or(0))
+        ExitStatus::Signaled(0)
     };
 
     if (oom_killed
@@ -1296,8 +1590,6 @@ pub fn execute_group_in_sandbox(
     cancel: &CancelToken,
     tier: Tier,
 ) -> Result<Vec<RunResult>, SandboxError> {
-    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-
     if specs.is_empty() {
         return Ok(Vec::new());
     }
@@ -1558,6 +1850,65 @@ mod tests {
             res.unwrap_err()
                 .to_string()
                 .contains("Duplicate stdio wiring")
+        );
+    }
+
+    #[test]
+    fn test_trusted_exit_code_above_128_not_misreported_as_signal() {
+        let temp_dir = std::env::temp_dir();
+        let spec = RunSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), "exit 130".into()],
+            env: vec![],
+            work_dir: temp_dir,
+            ro_binds: vec![],
+            stdin: Stdio::Null,
+            stdout: Stdio::Null,
+            stderr: Stdio::Null,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+        let cancel = CancelToken::new();
+        let res = execute_in_sandbox(&spec, None, &cancel, Tier::Degraded).unwrap();
+        assert_eq!(res.status, ExitStatus::Exited(130));
+    }
+
+    #[test]
+    fn test_spawn_failure_cleans_up_rootfs_dir() {
+        let temp_dir = std::env::temp_dir();
+        let prefix = format!(".uj_rootfs_{}_", std::process::id());
+        let count_rootfs = || -> usize {
+            std::fs::read_dir("/dev/shm")
+                .map(|it| {
+                    it.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let before = count_rootfs();
+        let spec = RunSpec {
+            argv: vec!["/nonexistent_binary_that_fails_spawn_12345".into()],
+            env: vec![],
+            work_dir: temp_dir,
+            ro_binds: vec![],
+            stdin: Stdio::Null,
+            stdout: Stdio::Null,
+            stderr: Stdio::Null,
+            extra_fds: vec![],
+            limits: Limits::new(1000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: false,
+        };
+        let cancel = CancelToken::new();
+        let _ = execute_in_sandbox(&spec, None, &cancel, Tier::Degraded);
+        let after = count_rootfs();
+        assert_eq!(
+            before, after,
+            "Rootfs temp dir leaked in /dev/shm! before={before}, after={after}"
         );
     }
 }

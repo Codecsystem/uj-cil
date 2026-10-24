@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use uj_core::run::{CapturedOutput, ExitStatus, KillReason, RunResult, RunSpec, Stdio, Tier};
 
+#[cfg(not(unix))]
 use crate::ntstatus::is_ntstatus_exception;
 use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
 
@@ -164,6 +165,7 @@ impl NoneSandbox {
         }
 
         let start_time = Instant::now();
+        #[allow(unused_mut)]
         let mut child = cmd
             .spawn()
             .map_err(|e| SandboxError::Internal(format!("Failed to spawn child: {e}")))?;
@@ -225,56 +227,116 @@ impl NoneSandbox {
         let mut killed_by: Option<KillReason> = None;
         let poll_interval = Duration::from_millis(5);
 
-        let final_status = loop {
-            // Check cancellation
-            if cancel.is_cancelled() {
-                killed_by = Some(KillReason::UserCancel);
-                let _ = child.kill();
-                break child.wait()?;
-            }
+        #[cfg(unix)]
+        let (status, cpu_time_us, memory_peak_bytes) = {
+            let pid = child.id() as i32;
+            let (raw_status, cpu_us, mem_bytes) = loop {
+                if cancel.is_cancelled() {
+                    killed_by = Some(KillReason::UserCancel);
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    break wait4_child_unix(pid, false)?.unwrap_or((libc::SIGKILL, 0, 0));
+                }
 
-            // Check output limit
-            if ole_flag.load(Ordering::SeqCst) {
-                killed_by = Some(KillReason::OutputLimit);
-                let _ = child.kill();
-                break child.wait()?;
-            }
+                if ole_flag.load(Ordering::SeqCst) {
+                    killed_by = Some(KillReason::OutputLimit);
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    break wait4_child_unix(pid, false)?.unwrap_or((libc::SIGKILL, 0, 0));
+                }
 
-            // Check wall clock time
-            let elapsed_wall_ms = start_time.elapsed().as_millis() as u64;
-            if elapsed_wall_ms > spec.limits.wall_time_ms {
-                killed_by = Some(KillReason::WallLimit);
-                let _ = child.kill();
-                break child.wait()?;
-            }
+                let elapsed_wall_ms = start_time.elapsed().as_millis() as u64;
+                if elapsed_wall_ms > spec.limits.wall_time_ms {
+                    killed_by = Some(KillReason::WallLimit);
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    break wait4_child_unix(pid, false)?.unwrap_or((libc::SIGKILL, 0, 0));
+                }
 
-            // Check CPU time if supported on platform
-            #[cfg(windows)]
-            {
-                if let Some(cpu_us) = get_child_cpu_time_us(&child)
-                    && (cpu_us / 1000) > spec.limits.cpu_time_ms
-                {
-                    killed_by = Some(KillReason::CpuLimit);
+                if let Some(res) = wait4_child_unix(pid, true)? {
+                    break res;
+                }
+
+                thread::sleep(poll_interval);
+            };
+
+            let exit_status = if libc::WIFSIGNALED(raw_status) {
+                ExitStatus::Signaled(libc::WTERMSIG(raw_status))
+            } else if libc::WIFEXITED(raw_status) {
+                ExitStatus::Exited(libc::WEXITSTATUS(raw_status))
+            } else {
+                ExitStatus::Exited(-1)
+            };
+
+            (exit_status, cpu_us, mem_bytes)
+        };
+
+        #[cfg(not(unix))]
+        let (status, cpu_time_us, memory_peak_bytes) = {
+            let final_status = loop {
+                // Check cancellation
+                if cancel.is_cancelled() {
+                    killed_by = Some(KillReason::UserCancel);
                     let _ = child.kill();
                     break child.wait()?;
                 }
-            }
 
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
+                // Check output limit
+                if ole_flag.load(Ordering::SeqCst) {
+                    killed_by = Some(KillReason::OutputLimit);
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
 
-            thread::sleep(poll_interval);
+                // Check wall clock time
+                let elapsed_wall_ms = start_time.elapsed().as_millis() as u64;
+                if elapsed_wall_ms > spec.limits.wall_time_ms {
+                    killed_by = Some(KillReason::WallLimit);
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
+
+                // Check CPU time if supported on platform
+                #[cfg(windows)]
+                {
+                    if let Some(cpu_us) = get_child_cpu_time_us(&child)
+                        && (cpu_us / 1000) > spec.limits.cpu_time_ms
+                    {
+                        killed_by = Some(KillReason::CpuLimit);
+                        let _ = child.kill();
+                        break child.wait()?;
+                    }
+                }
+
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+
+                thread::sleep(poll_interval);
+            };
+
+            let wall_us_now = start_time.elapsed().as_micros() as u64;
+            #[cfg(windows)]
+            let (cpu_us, mem_bytes) =
+                get_child_cpu_and_mem_windows(&child).unwrap_or((wall_us_now, 0));
+            #[cfg(not(windows))]
+            let (cpu_us, mem_bytes) = (wall_us_now, 0);
+
+            let exit_code = final_status.code().unwrap_or(-1);
+            let raw_code = exit_code as u32;
+            let exit_status = if is_ntstatus_exception(raw_code) {
+                ExitStatus::NtStatus(raw_code)
+            } else {
+                ExitStatus::Exited(exit_code)
+            };
+
+            (exit_status, cpu_us, mem_bytes)
         };
 
         let wall_time_us = start_time.elapsed().as_micros() as u64;
-
-        // Query final CPU and memory usage
-        #[cfg(windows)]
-        let (cpu_time_us, memory_peak_bytes) =
-            get_child_cpu_and_mem_windows(&child).unwrap_or((wall_time_us, 0));
-        #[cfg(not(windows))]
-        let (cpu_time_us, memory_peak_bytes) = (wall_time_us, 0);
 
         let captured_stdout = if let Some(h) = stdout_handle {
             let bytes = h.join().unwrap_or_default();
@@ -289,15 +351,6 @@ impl NoneSandbox {
         }
 
         let stderr_tail = stderr_handle.join().unwrap_or_default();
-
-        let exit_code = final_status.code().unwrap_or(-1);
-        let raw_code = exit_code as u32;
-
-        let status = if is_ntstatus_exception(raw_code) {
-            ExitStatus::NtStatus(raw_code)
-        } else {
-            ExitStatus::Exited(exit_code)
-        };
 
         let oom_killed = killed_by == Some(KillReason::MemoryLimit);
 
@@ -493,6 +546,35 @@ impl Sandbox for NoneSandbox {
     }
 }
 
+#[cfg(unix)]
+fn wait4_child_unix(pid: i32, nohang: bool) -> std::io::Result<Option<(i32, u64, u64)>> {
+    let options = if nohang { libc::WNOHANG } else { 0 };
+    let mut status: i32 = 0;
+    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        let ret = unsafe { libc::wait4(pid, &mut status, options, &mut rusage) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if ret == 0 {
+            return Ok(None);
+        }
+        let utime_us = (rusage.ru_utime.tv_sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add(rusage.ru_utime.tv_usec as u64);
+        let stime_us = (rusage.ru_stime.tv_sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add(rusage.ru_stime.tv_usec as u64);
+        let cpu_us = utime_us.saturating_add(stime_us);
+        let mem_bytes = (rusage.ru_maxrss as u64).saturating_mul(1024);
+        return Ok(Some((status, cpu_us, mem_bytes)));
+    }
+}
+
 #[cfg(windows)]
 fn get_child_cpu_time_us(child: &Child) -> Option<u64> {
     use std::os::windows::io::AsRawHandle;
@@ -556,4 +638,33 @@ fn get_child_cpu_and_mem_windows(child: &Child) -> Option<(u64, u64)> {
     };
 
     Some((cpu_us, mem_bytes))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use uj_core::run::Limits;
+
+    #[test]
+    fn test_none_sandbox_unix_signal_and_rusage() {
+        let sb = NoneSandbox::new();
+        let cancel = CancelToken::new();
+        let spec = RunSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), "kill -SEGV $$".into()],
+            env: vec![],
+            work_dir: std::env::temp_dir(),
+            ro_binds: vec![],
+            stdin: Stdio::Null,
+            stdout: Stdio::Pipe,
+            stderr: Stdio::Pipe,
+            extra_fds: vec![],
+            limits: Limits::new(2000, 128 * 1024 * 1024),
+            cpu_affinity: None,
+            seccomp_profile: Default::default(),
+            trusted: true,
+        };
+        let res = sb.run(&spec, &cancel).unwrap();
+        assert_eq!(res.status, ExitStatus::Signaled(libc::SIGSEGV));
+        assert!(res.memory_peak_bytes > 0);
+    }
 }

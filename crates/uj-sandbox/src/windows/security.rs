@@ -1,10 +1,17 @@
 //! AppContainer and token isolation for Windows sandbox.
 
+use std::ffi::OsString;
+use std::mem::size_of;
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{FreeSid, PSID};
-use windows_core::PCWSTR;
+use windows::Win32::System::Threading::{
+    CREATE_NO_WINDOW, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
+    STARTUPINFOW, WaitForSingleObject,
+};
+use windows_core::{PCWSTR, PWSTR};
 
 pub struct AppContainerProfile {
     sid: PSID,
@@ -22,6 +29,59 @@ use std::sync::{Arc, OnceLock};
 
 static SHARED_PROFILE: OnceLock<Result<Arc<AppContainerProfile>, String>> = OnceLock::new();
 static PROFILE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Execute `icacls.exe` with `bInheritHandles = FALSE` and `CREATE_NO_WINDOW` so that
+/// concurrent worker threads never leak inheritable pipe handles into `icacls.exe`.
+fn run_icacls(args: &[OsString]) -> Result<(), std::io::Error> {
+    let mut full_argv = Vec::with_capacity(args.len() + 1);
+    full_argv.push(OsString::from("icacls.exe"));
+    full_argv.extend_from_slice(args);
+
+    let cmd_line_str = crate::windows::process::build_windows_cmd_line(&full_argv);
+    let mut cmd_line_utf16: Vec<u16> = cmd_line_str.encode_utf16().chain(Some(0)).collect();
+
+    let si = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+
+    let spawn_res = unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            PWSTR(cmd_line_utf16.as_mut_ptr()),
+            None,
+            None,
+            false, // CRITICAL: bInheritHandles = FALSE prevents inheriting any pipe handles
+            CREATE_NO_WINDOW,
+            None,
+            PCWSTR::null(),
+            &si,
+            &mut pi,
+        )
+    };
+
+    if let Err(e) = spawn_res {
+        return Err(std::io::Error::other(format!(
+            "Failed to spawn icacls.exe: {e}"
+        )));
+    }
+
+    let mut exit_code: u32 = 1;
+    unsafe {
+        let _ = WaitForSingleObject(pi.hProcess, INFINITE);
+        let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
+    }
+
+    if exit_code != 0 {
+        return Err(std::io::Error::other(format!(
+            "icacls failed with exit code {exit_code}"
+        )));
+    }
+    Ok(())
+}
 
 impl AppContainerProfile {
     pub const DEFAULT_NAME: &'static str = "uj.sandbox";
@@ -111,7 +171,6 @@ impl AppContainerProfile {
 
     pub fn sid_string(&self) -> Result<String, std::io::Error> {
         use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-        use windows_core::PWSTR;
 
         let mut str_ptr = PWSTR::null();
         unsafe {
@@ -136,7 +195,12 @@ impl AppContainerProfile {
     }
 
     pub fn grant_path_access(path: &std::path::Path, sid_str: &str) -> Result<(), std::io::Error> {
-        if path.join("problem.toml").exists() {
+        let is_problem_dir = path.join("problem.toml").exists();
+        let is_problem_tests_dir = path.file_name().is_some_and(|n| n == "tests")
+            && path
+                .parent()
+                .is_some_and(|p| p.join("problem.toml").exists());
+        if is_problem_dir || is_problem_tests_dir {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
@@ -145,42 +209,38 @@ impl AppContainerProfile {
                 ),
             ));
         }
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/grant")
-            .arg(format!("*{sid_str}:(OI)(CI)F"))
-            .arg("/T")
-            .arg("/C")
-            .arg("/Q")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(std::io::Error::other(format!(
-                "icacls failed with status {status}"
-            )));
-        }
-        Ok(())
+        run_icacls(&[
+            path.as_os_str().to_os_string(),
+            OsString::from("/grant"),
+            OsString::from(format!("*{sid_str}:(OI)(CI)F")),
+            OsString::from("/T"),
+            OsString::from("/C"),
+            OsString::from("/Q"),
+        ])
     }
 
     pub fn grant_path_read_execute(
         path: &std::path::Path,
         sid_str: &str,
     ) -> Result<(), std::io::Error> {
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/grant")
-            .arg(format!("*{sid_str}:RX"))
-            .arg("/Q")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(std::io::Error::other(format!(
-                "icacls RX failed with status {status}"
-            )));
+        run_icacls(&[
+            path.as_os_str().to_os_string(),
+            OsString::from("/grant"),
+            OsString::from(format!("*{sid_str}:RX")),
+            OsString::from("/Q"),
+        ])
+    }
+
+    pub fn revoke_path_access(path: &std::path::Path, sid_str: &str) -> Result<(), std::io::Error> {
+        if !path.exists() {
+            return Ok(());
         }
-        Ok(())
+        run_icacls(&[
+            path.as_os_str().to_os_string(),
+            OsString::from("/remove"),
+            OsString::from(format!("*{sid_str}")),
+            OsString::from("/Q"),
+        ])
     }
 }
 
@@ -203,7 +263,6 @@ impl Drop for AppContainerProfile {
 
 /// Enumerates and removes leftover AppContainer profiles belonging to dead uj processes.
 pub fn cleanup_stale_appcontainers() -> usize {
-    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
         RegQueryValueExW,
@@ -240,10 +299,10 @@ pub fn cleanup_stale_appcontainers() -> usize {
             RegEnumKeyExW(
                 hkey,
                 index,
-                windows_core::PWSTR(key_name.as_mut_ptr()),
+                PWSTR(key_name.as_mut_ptr()),
                 &mut key_name_len,
                 None,
-                windows_core::PWSTR::null(),
+                PWSTR::null(),
                 None,
                 None,
             )

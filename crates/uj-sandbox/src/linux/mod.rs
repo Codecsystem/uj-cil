@@ -4,14 +4,14 @@ pub mod cgroup;
 pub mod runner;
 pub mod seccomp;
 
-use self::cgroup::CgroupV2;
+use self::cgroup::{CgroupBase, CgroupV2};
 use crate::{CancelToken, CleanupReport, Sandbox, SandboxError, Wiring};
-use std::path::PathBuf;
+use std::sync::Arc;
 use uj_core::run::{RunResult, RunSpec, Tier};
 
 pub struct LinuxSandbox {
     tier: Tier,
-    cgroup_base: Option<PathBuf>,
+    cgroup_base: Option<Arc<CgroupBase>>,
 }
 
 impl LinuxSandbox {
@@ -44,13 +44,13 @@ impl LinuxSandbox {
                 cgroup_base: None,
             }),
             Tier::Degraded => {
-                let base = CgroupV2::find_base_dir().ok();
+                let base = CgroupV2::find_base().ok();
                 Ok(Self {
                     tier: Tier::Degraded,
                     cgroup_base: base,
                 })
             }
-            Tier::Full => match CgroupV2::find_base_dir() {
+            Tier::Full => match CgroupV2::find_base() {
                 Ok(base) => Ok(Self {
                     tier: Tier::Full,
                     cgroup_base: Some(base),
@@ -91,7 +91,12 @@ impl Sandbox for LinuxSandbox {
             res.sandbox_tier = self.tier;
             Ok(res)
         } else {
-            runner::execute_in_sandbox(spec, self.cgroup_base.as_deref(), cancel, self.tier)
+            runner::execute_in_sandbox(
+                spec,
+                self.cgroup_base.as_deref().map(CgroupBase::path),
+                cancel,
+                self.tier,
+            )
         }
     }
 
@@ -112,7 +117,7 @@ impl Sandbox for LinuxSandbox {
             runner::execute_group_in_sandbox(
                 specs,
                 wiring,
-                self.cgroup_base.as_deref(),
+                self.cgroup_base.as_deref().map(CgroupBase::path),
                 cancel,
                 self.tier,
             )
@@ -120,17 +125,8 @@ impl Sandbox for LinuxSandbox {
     }
 
     fn cleanup_stale(&self) -> Result<CleanupReport, SandboxError> {
-        if let Some(ref base) = self.cgroup_base {
-            let _ = std::fs::remove_dir_all(base);
-        }
-        Ok(CleanupReport::default())
-    }
-}
-
-impl Drop for LinuxSandbox {
-    fn drop(&mut self) {
-        if let Some(ref base) = self.cgroup_base {
-            let _ = std::fs::remove_dir_all(base);
-        }
+        Ok(cgroup::cleanup_stale_resources(
+            self.cgroup_base.as_deref().map(CgroupBase::path),
+        ))
     }
 }

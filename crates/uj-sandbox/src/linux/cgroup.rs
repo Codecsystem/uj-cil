@@ -3,9 +3,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::SystemTime;
 
-use crate::SandboxError;
+use crate::{CleanupReport, SandboxError};
 use uj_core::run::Limits;
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -17,13 +18,47 @@ pub struct CgroupV2 {
     mem_events_file: parking_lot::Mutex<Option<fs::File>>,
 }
 
+/// Reference-counted handle to the per-process cgroup base directory (`.../uj/proc_<pid>`).
+/// When the last `LinuxSandbox` instance in this process drops, the `proc_<pid>` cgroup
+/// directory tree is removed bottom-up via `rmdir` (never `remove_dir_all`, which fails with
+/// `EPERM` on cgroupfs control files).
+#[derive(Debug)]
+pub struct CgroupBase {
+    path: PathBuf,
+}
+
+impl CgroupBase {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CgroupBase {
+    fn drop(&mut self) {
+        let mut guard = CACHED_BASE.lock();
+        if guard.as_ref().and_then(|w| w.upgrade()).is_none() {
+            *guard = None;
+            let _ = remove_cgroup_tree(&self.path);
+        }
+    }
+}
+
+fn host_has_active_swap() -> bool {
+    static HAS_SWAP: OnceLock<bool> = OnceLock::new();
+    *HAS_SWAP.get_or_init(|| {
+        fs::read_to_string("/proc/swaps")
+            .map(|s| s.lines().skip(1).any(|line| !line.trim().is_empty()))
+            .unwrap_or(false)
+    })
+}
+
 fn enable_subtree_controllers(dir: &Path) {
     let controllers_file = dir.join("cgroup.controllers");
     let Ok(available) = fs::read_to_string(&controllers_file) else {
         return;
     };
     let mut to_enable = Vec::new();
-    for c in ["cpu", "memory", "pids"] {
+    for c in ["cpu", "cpuset", "memory", "pids"] {
         if available.split_whitespace().any(|s| s == c) {
             to_enable.push(format!("+{c}"));
         }
@@ -31,7 +66,6 @@ fn enable_subtree_controllers(dir: &Path) {
     if to_enable.is_empty() {
         return;
     }
-    let control_str = to_enable.join(" ");
 
     // In cgroup v2, a non-root cgroup can only write to cgroup.subtree_control
     // if cgroup.procs is empty (no internal processes rule).
@@ -52,22 +86,199 @@ fn enable_subtree_controllers(dir: &Path) {
             }
         }
     }
-    let _ = fs::write(dir.join("cgroup.subtree_control"), &control_str);
+
+    let subtree_file = dir.join("cgroup.subtree_control");
+    let control_str = to_enable.join(" ");
+    if fs::write(&subtree_file, &control_str).is_err() {
+        for item in &to_enable {
+            let _ = fs::write(&subtree_file, item);
+        }
+    }
 }
 
-static CACHED_BASE_DIR: parking_lot::Mutex<Option<Result<PathBuf, String>>> =
-    parking_lot::Mutex::new(None);
+/// Recursively kills processes and removes a cgroup directory tree bottom-up using `fs::remove_dir`.
+pub fn remove_cgroup_tree(dir: &Path) -> bool {
+    if !dir.exists() {
+        return true;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let _ = remove_cgroup_tree(&entry.path());
+            }
+        }
+    }
+    let kill_file = dir.join("cgroup.kill");
+    let _ = fs::write(&kill_file, "1");
+    let procs_file = dir.join("cgroup.procs");
+    if let Ok(content) = fs::read_to_string(&procs_file) {
+        for line in content.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>()
+                && pid > 0
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    for _ in 0..10 {
+        if fs::remove_dir(dir).is_ok() || !dir.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+fn is_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if Path::new(&format!("/proc/{pid}")).exists() {
+        return true;
+    }
+    let ret = unsafe { libc::kill(pid, 0) };
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Removes stale `proc_<dead_pid>` cgroup directories and leftover `.uj_rootfs_<dead_pid>_*` directories.
+pub fn cleanup_stale_resources(base_opt: Option<&Path>) -> CleanupReport {
+    let mut report = CleanupReport::default();
+    let self_pid = std::process::id() as i32;
+
+    let mut uj_parents = Vec::new();
+    if let Some(base) = base_opt
+        && let Some(parent) = base.parent()
+    {
+        uj_parents.push(parent.to_path_buf());
+    }
+    if let Ok(content) = fs::read_to_string("/proc/self/cgroup") {
+        let cgroup_mount = Path::new("/sys/fs/cgroup");
+        for line in content.lines() {
+            if let Some(rel) = line.strip_prefix("0::") {
+                let mut candidate = cgroup_mount.join(rel.trim_start_matches('/'));
+                while candidate.file_name() == Some(std::ffi::OsStr::new("runner"))
+                    || candidate.file_name() == Some(std::ffi::OsStr::new("uj"))
+                    || candidate
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.starts_with("proc_"))
+                {
+                    if let Some(p) = candidate.parent() {
+                        candidate = p.to_path_buf();
+                    } else {
+                        break;
+                    }
+                }
+                let uj_dir = candidate.join("uj");
+                if uj_dir.is_dir() && !uj_parents.contains(&uj_dir) {
+                    uj_parents.push(uj_dir);
+                }
+            }
+        }
+    }
+
+    for uj_parent in uj_parents {
+        if let Ok(entries) = fs::read_dir(&uj_parent) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if let Some(pid_str) = name_str.strip_prefix("proc_")
+                    && let Ok(pid) = pid_str.parse::<i32>()
+                    && pid != self_pid
+                    && !is_pid_alive(pid)
+                    && remove_cgroup_tree(&entry.path())
+                {
+                    report.cleaned_directories += 1;
+                }
+            }
+        }
+    }
+
+    // Also clean up any leftover `.uj_rootfs_<dead_pid>_*` directories in /dev/shm, /run, /tmp
+    let self_uid = unsafe { libc::getuid() };
+    for root in [Path::new("/dev/shm"), Path::new("/run"), Path::new("/tmp")] {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name_str.strip_prefix(".uj_rootfs_") else {
+                continue;
+            };
+            let Some(pid_str) = rest.split('_').next() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<i32>() else {
+                continue;
+            };
+            if pid == self_pid || is_pid_alive(pid) {
+                continue;
+            }
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = entry.path().symlink_metadata()
+                && meta.uid() == self_uid
+                && fs::remove_dir_all(entry.path()).is_ok()
+            {
+                report.cleaned_directories += 1;
+            }
+        }
+    }
+
+    report
+}
+
+static CACHED_BASE: parking_lot::Mutex<Option<Weak<CgroupBase>>> = parking_lot::Mutex::new(None);
+
+fn verify_required_controllers(test_dir: &Path) -> Result<(), SandboxError> {
+    for required in ["cpu.stat", "memory.max", "pids.max"] {
+        if !test_dir.join(required).exists() {
+            return Err(SandboxError::Internal(format!(
+                "Required cgroup v2 controller file '{required}' is missing in {}",
+                test_dir.display()
+            )));
+        }
+    }
+    if host_has_active_swap() {
+        let swap_max = test_dir.join("memory.swap.max");
+        if !swap_max.exists() || fs::write(&swap_max, "0").is_err() {
+            return Err(SandboxError::Internal(format!(
+                "Host has active swap but 'memory.swap.max' is not writable in {}",
+                test_dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
 
 impl CgroupV2 {
+    /// Returns a reference-counted handle to the process's cgroup v2 base directory.
+    pub fn find_base() -> Result<Arc<CgroupBase>, SandboxError> {
+        let mut guard = CACHED_BASE.lock();
+        if let Some(ref weak) = *guard
+            && let Some(arc) = weak.upgrade()
+            && arc.path.is_dir()
+        {
+            return Ok(arc);
+        }
+        let path = Self::find_base_dir_uncached()?;
+        let arc = Arc::new(CgroupBase { path });
+        *guard = Some(Arc::downgrade(&arc));
+        Ok(arc)
+    }
+
     /// Detects the writable base cgroup v2 directory (supports systemd user delegation or root).
     pub fn find_base_dir() -> Result<PathBuf, SandboxError> {
-        let mut guard = CACHED_BASE_DIR.lock();
-        if let Some(ref res) = *guard {
-            return res.clone().map_err(SandboxError::Internal);
-        }
-        let res = Self::find_base_dir_uncached();
-        *guard = Some(res.as_ref().map(|p| p.clone()).map_err(|e| e.to_string()));
-        res
+        Ok(Self::find_base()?.path().to_path_buf())
     }
 
     fn find_base_dir_uncached() -> Result<PathBuf, SandboxError> {
@@ -112,9 +323,9 @@ impl CgroupV2 {
                         }
                     }
                     if candidate.is_dir() {
-                        let test_dir = candidate.join(&test_name);
-                        if fs::create_dir(&test_dir).is_ok() {
-                            let _ = fs::remove_dir(&test_dir);
+                        let probe_dir = candidate.join(&test_name);
+                        if fs::create_dir(&probe_dir).is_ok() {
+                            let _ = fs::remove_dir(&probe_dir);
                             enable_subtree_controllers(&candidate);
                             let pid = std::process::id();
                             let uj_parent = candidate.join("uj");
@@ -123,7 +334,14 @@ impl CgroupV2 {
                             let uj_base = uj_parent.join(format!("proc_{pid}"));
                             let _ = fs::create_dir_all(&uj_base);
                             enable_subtree_controllers(&uj_base);
-                            return Ok(uj_base);
+
+                            let test_dir = uj_base.join(&test_name);
+                            if fs::create_dir(&test_dir).is_ok() {
+                                let check_res = verify_required_controllers(&test_dir);
+                                let _ = fs::remove_dir(&test_dir);
+                                check_res?;
+                                return Ok(uj_base);
+                            }
                         }
                     }
                 }
@@ -142,7 +360,9 @@ impl CgroupV2 {
             enable_subtree_controllers(&root_uj);
             let test_dir = root_uj.join(&test_name);
             if fs::create_dir(&test_dir).is_ok() {
+                let check_res = verify_required_controllers(&test_dir);
                 let _ = fs::remove_dir(&test_dir);
+                check_res?;
                 return Ok(root_uj);
             }
         }
@@ -180,7 +400,7 @@ impl CgroupV2 {
         limits: &Limits,
         cpu_affinity: Option<&[usize]>,
     ) -> Result<(), SandboxError> {
-        // 1. memory.max
+        // 1. memory.max & memory.swap.max
         if limits.memory_bytes > 0 {
             let mem_file = self.path.join("memory.max");
             fs::write(&mem_file, limits.memory_bytes.to_string()).map_err(|e| {
@@ -189,11 +409,20 @@ impl CgroupV2 {
                     self.path.display()
                 ))
             })?;
-            // Enforce hard memory limit by forbidding swap
+            // Enforce hard memory limit by forbidding swap when swap exists on host
             let swap_file = self.path.join("memory.swap.max");
-            let _ = fs::write(swap_file, "0");
+            if swap_file.exists() || host_has_active_swap() {
+                fs::write(&swap_file, "0").map_err(|e| {
+                    SandboxError::Internal(format!(
+                        "Failed to set memory.swap.max in {}: {e}",
+                        self.path.display()
+                    ))
+                })?;
+            }
             let oom_group_file = self.path.join("memory.oom.group");
-            let _ = fs::write(oom_group_file, "1");
+            if oom_group_file.exists() {
+                let _ = fs::write(oom_group_file, "1");
+            }
         }
 
         // 2. pids.max
@@ -201,19 +430,27 @@ impl CgroupV2 {
             let pids_file = self.path.join("pids.max");
             // Allow max_processes + 3 for mini-init and helper
             let max_pids = limits.max_processes + 3;
-            let _ = fs::write(&pids_file, max_pids.to_string());
+            fs::write(&pids_file, max_pids.to_string()).map_err(|e| {
+                SandboxError::Internal(format!(
+                    "Failed to set pids.max in {}: {e}",
+                    self.path.display()
+                ))
+            })?;
         }
 
         // 3. cpuset.cpus (affinity)
         if let Some(cpus) = cpu_affinity
             && !cpus.is_empty()
         {
-            let mask = cpus
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = fs::write(self.path.join("cpuset.cpus"), mask);
+            let cpuset_file = self.path.join("cpuset.cpus");
+            if cpuset_file.exists() {
+                let mask = cpus
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = fs::write(cpuset_file, mask);
+            }
         }
 
         Ok(())

@@ -482,3 +482,308 @@ fn test_concurrent_untrusted_runs_share_work_dir() {
     }
     assert!(!dir.path().join("__uj_bin").exists());
 }
+
+/// Item 1: Untrusted Linux sandbox runs with a non-zero UID and zero capabilities (`CapEff == 0`).
+#[cfg(target_os = "linux")]
+#[test]
+fn test_linux_untrusted_zero_caps_and_non_root_uid() {
+    let sb = create_sandbox("auto", false).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancelToken::new();
+    let spec = RunSpec {
+        argv: vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("id -u && grep '^CapEff:' /proc/self/status"),
+        ],
+        env: vec![],
+        work_dir: dir.path().to_path_buf(),
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(2000, 128 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+    let res = sb.run(&spec, &cancel).unwrap();
+    assert!(
+        res.status.is_success(),
+        "status={:?}, stderr={}",
+        res.status,
+        String::from_utf8_lossy(&res.stderr_tail)
+    );
+    let out = String::from_utf8_lossy(&res.stdout.unwrap().bytes).into_owned();
+    let mut lines = out.lines();
+    let uid_line = lines.next().unwrap_or("").trim();
+    let cap_line = lines.next().unwrap_or("").trim();
+    assert_ne!(
+        uid_line, "0",
+        "Contestant must not run as UID 0 inside userns"
+    );
+    assert!(
+        cap_line.ends_with("0000000000000000"),
+        "Contestant must have zero effective capabilities, got: {cap_line}"
+    );
+}
+
+/// Item 2: PID 1 `/proc/1/*` is non-dumpable (root-owned) so PID 2 cannot access `/proc/1/fd/*` or `/proc/1/environ`
+/// to spoof `SandboxStatusPacket` or read host environment secrets.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_linux_pid1_proc_protected_and_status_pipe_unspoofable() {
+    let sb = create_sandbox("auto", false).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancelToken::new();
+    let spec = RunSpec {
+        argv: vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(
+                "if cat /proc/1/environ >/dev/null 2>&1 || echo spoof > /proc/1/fd/3 2>/dev/null; then exit 0; fi; kill -SEGV $$",
+            ),
+        ],
+        env: vec![],
+        work_dir: dir.path().to_path_buf(),
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(2000, 128 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+    let res = sb.run(&spec, &cancel).unwrap();
+    assert_eq!(
+        res.status,
+        uj_core::run::ExitStatus::Signaled(libc::SIGSEGV),
+        "PID 1 status pipe must report genuine SIGSEGV and block /proc/1 access"
+    );
+}
+
+/// Item 3: `Stdio::File` stdin cannot be modified or chmodded via `/proc/self/fd/0`.
+#[test]
+fn test_stdin_file_cannot_be_corrupted() {
+    let sb = create_sandbox("auto", false).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let input_path = dir.path().join("test_input.in");
+    let original = b"SECRET_IMMUTABLE_TEST_INPUT_42\n";
+    std::fs::write(&input_path, original).unwrap();
+
+    let box_dir = dir.path().join("box");
+    std::fs::create_dir_all(&box_dir).unwrap();
+
+    let argv = if cfg!(windows) {
+        vec![
+            OsString::from("cmd.exe"),
+            OsString::from("/c"),
+            OsString::from("echo ok"),
+        ]
+    } else {
+        vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(
+                "chmod 666 /proc/self/fd/0 2>/dev/null; echo CORRUPTED > /proc/self/fd/0 2>/dev/null; cat",
+            ),
+        ]
+    };
+
+    let spec = RunSpec {
+        argv,
+        env: vec![],
+        work_dir: box_dir,
+        ro_binds: vec![],
+        stdin: Stdio::File(input_path.clone()),
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(2000, 128 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+
+    let cancel = CancelToken::new();
+    let _ = sb.run(&spec, &cancel).unwrap();
+
+    let after = std::fs::read(&input_path).unwrap();
+    assert_eq!(
+        after.as_slice(),
+        original,
+        "Host input file must remain completely unmodified"
+    );
+}
+
+/// Item 5: `RLIMIT_FSIZE` is enforced in both Full and Degraded tiers on Linux so `/box` writes are capped.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_linux_rlimit_fsize_caps_box_file_writes() {
+    let sb = create_sandbox("auto", false).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = Limits::new(2000, 128 * 1024 * 1024);
+    limits.output_bytes = 64 * 1024; // 64 KiB cap
+
+    let spec = RunSpec {
+        argv: vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("dd if=/dev/zero of=/box/huge.bin bs=4096 count=256"),
+        ],
+        env: vec![],
+        work_dir: dir.path().to_path_buf(),
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits,
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+
+    let cancel = CancelToken::new();
+    let res = sb.run(&spec, &cancel).unwrap();
+    let huge_path = dir.path().join("huge.bin");
+    let written_size = std::fs::metadata(&huge_path).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        written_size <= 64 * 1024,
+        "File in /box exceeded output_bytes limit: {written_size} > 65536"
+    );
+    assert!(
+        !res.status.is_success() || res.killed_by == Some(KillReason::OutputLimit),
+        "Expected dd exceeding RLIMIT_FSIZE to fail or be killed by OutputLimit"
+    );
+}
+
+/// Item 6: Windows per-slot AppContainer isolates sibling directories (`trusted_int_*` and other slots).
+#[cfg(windows)]
+#[test]
+fn test_windows_appcontainer_parent_and_cross_slot_isolation() {
+    let sb1 = match create_sandbox("full", true) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let sb2 = match create_sandbox("full", true) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let base_dir = std::env::temp_dir().join(format!("uj_test_ac_iso_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base_dir);
+    std::fs::create_dir_all(&base_dir).unwrap();
+
+    let box1 = sb1.create_box_dir(&base_dir).unwrap();
+    let box2 = sb2.create_box_dir(&base_dir).unwrap();
+
+    // Create a sibling trusted_int directory next to box1 (inside box1.parent())
+    let trusted_int = box1.parent().unwrap().join("trusted_int_secret");
+    std::fs::create_dir_all(&trusted_int).unwrap();
+    let secret_int_file = trusted_int.join("interactor.xml");
+    std::fs::write(&secret_int_file, b"TOP_SECRET_XML").unwrap();
+
+    // Create a file in slot 2's box2
+    let secret_slot2_file = box2.join("slot2_secret.txt");
+    std::fs::write(&secret_slot2_file, b"SLOT2_SECRET").unwrap();
+
+    let cmd_str = format!(
+        "type \"{}\" 2>nul & type \"{}\" 2>nul",
+        secret_int_file.display(),
+        secret_slot2_file.display()
+    );
+    let spec = RunSpec {
+        argv: vec![
+            OsString::from("cmd.exe"),
+            OsString::from("/c"),
+            OsString::from(cmd_str),
+        ],
+        env: vec![],
+        work_dir: box1,
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(3000, 128 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+
+    let cancel = CancelToken::new();
+    let res = sb1.run(&spec, &cancel).unwrap();
+    let out = String::from_utf8_lossy(&res.stdout.unwrap().bytes).into_owned();
+    assert!(
+        !out.contains("TOP_SECRET_XML"),
+        "Slot 1 AppContainer must not be able to read trusted_int sibling directory!"
+    );
+    assert!(
+        !out.contains("SLOT2_SECRET"),
+        "Slot 1 AppContainer must not be able to read Slot 2's box directory!"
+    );
+
+    drop(sb1);
+    drop(sb2);
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+/// Item 7: Linux CPU affinity is applied via `sched_setaffinity` even in Degraded tier.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_linux_cpu_affinity_applied() {
+    let sb = create_sandbox("degraded", false).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spec = RunSpec {
+        argv: vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("grep '^Cpus_allowed_list:' /proc/self/status"),
+        ],
+        env: vec![],
+        work_dir: dir.path().to_path_buf(),
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(2000, 128 * 1024 * 1024),
+        cpu_affinity: Some(vec![0]),
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+    let cancel = CancelToken::new();
+    let res = sb.run(&spec, &cancel).unwrap();
+    assert!(
+        res.status.is_success(),
+        "status={:?}, stderr={}",
+        res.status,
+        String::from_utf8_lossy(&res.stderr_tail)
+    );
+    let out = String::from_utf8_lossy(&res.stdout.unwrap().bytes).into_owned();
+    assert!(
+        out.trim().ends_with("\t0") || out.trim().ends_with(" 0"),
+        "Expected Cpus_allowed_list to be pinned to core 0, got: {out}"
+    );
+}
+
+/// Item 8: `cleanup_stale` removes leftover `/dev/shm/.uj_rootfs_<dead_pid>_*` directories.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_linux_cleanup_stale_removes_dead_rootfs() {
+    let sb = create_sandbox("auto", false).unwrap();
+    let stale_dir = std::path::Path::new("/dev/shm").join(".uj_rootfs_99999999_deadbeef");
+    let _ = std::fs::create_dir_all(&stale_dir);
+    assert!(stale_dir.exists());
+
+    let report = sb.cleanup_stale().unwrap();
+    assert!(
+        !stale_dir.exists(),
+        "cleanup_stale should remove dead .uj_rootfs_<dead_pid>_* directory"
+    );
+    assert!(report.cleaned_directories >= 1);
+}

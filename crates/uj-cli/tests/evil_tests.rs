@@ -76,12 +76,19 @@ fn test_evil_cheat_write_blocked() {
     let _guard = lock_test();
     let hacked_path = get_workspace_root().join("tests/evil/tests/HACKED.txt");
     let _ = fs::remove_file(&hacked_path);
+    let in1_path = get_workspace_root().join("tests/evil/tests/1.in");
+    let orig_in1 = fs::read_to_string(&in1_path).expect("read 1.in");
 
     let rep = judge_evil_sol("cheat_write.cpp");
     assert_eq!(rep["verdict"], "AC");
     assert!(
         !hacked_path.exists(),
         "HACKED.txt must NOT be created in tests directory!"
+    );
+    let after_in1 = fs::read_to_string(&in1_path).expect("read 1.in after");
+    assert_eq!(
+        orig_in1, after_in1,
+        "1.in must NOT be modified via /proc/self/fd/0!"
     );
 }
 
@@ -282,7 +289,7 @@ fn test_evil_linux_seccomp() {
             .as_str()
             .expect("diff.found should be present");
 
-        // Format: unshare=-1/1,ptrace=-1/1,x32mount=-1/38
+        // Format: unshare=-1/1,ptrace=-1/1,x32mount=-1/38,ot=-1/38,ms=-1/38,iu=-1/38,u=1000,p1=-1,srw=-1
         let mut map = std::collections::HashMap::new();
         for part in found.split(',') {
             if let Some((k, v)) = part.split_once('=') {
@@ -315,6 +322,27 @@ fn test_evil_linux_seccomp() {
                 x32mount == "-1/38" || x32mount == "-1/1",
                 "x32 mount must be blocked with ENOSYS(38) or EPERM(1), got: {x32mount}"
             );
+
+            // New mount API & io_uring syscalls must fail with EPERM (1) or ENOSYS (38)
+            for key in ["ot", "ms", "iu"] {
+                let val = map.get(key).copied().unwrap_or("");
+                assert!(
+                    val == "-1/1" || val == "-1/38",
+                    "{key} must be blocked with EPERM(1) or ENOSYS(38), got: {val}"
+                );
+            }
+
+            // UID must be non-zero inside the sandbox
+            let uid = map.get("u").copied().unwrap_or("0");
+            assert_ne!(uid, "0", "UID inside sandbox must not be 0 (root)");
+
+            // PID 1 must be non-dumpable so /proc/1/fd/3 cannot be opened
+            let pid1fd = map.get("p1").copied().unwrap_or("0");
+            assert_eq!(pid1fd, "-1", "Opening /proc/1/fd/3 must fail");
+
+            // Re-opening /proc/self/fd/0 for writing must fail
+            let stdinrw = map.get("srw").copied().unwrap_or("0");
+            assert_eq!(stdinrw, "-1", "Re-opening /proc/self/fd/0 O_RDWR must fail");
         }
     }
 }
