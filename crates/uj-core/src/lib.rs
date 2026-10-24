@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod run;
+pub mod score;
 pub mod tests;
 pub mod verdict;
 
