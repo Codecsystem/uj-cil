@@ -5,12 +5,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use crossterm::{
-    cursor::Hide,
-    event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -244,12 +239,9 @@ pub fn run_pipeline_tui(
     rx: Receiver<CaseStageEvent>,
     cancel: CancelToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    enable_raw_mode()?;
-    let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen, Hide)?;
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard::enter()?;
 
-    let backend = CrosstermBackend::new(stderr);
+    let backend = CrosstermBackend::new(io::stderr());
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = PipelineApp::new(problem, case_names, has_gen, workers, cancel);

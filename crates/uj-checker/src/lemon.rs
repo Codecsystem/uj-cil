@@ -10,7 +10,20 @@ use uj_core::run::{Limits, RunSpec, Stdio};
 use uj_core::verdict::Verdict;
 use uj_sandbox::{CancelToken, Sandbox};
 
-use crate::CheckResult;
+use crate::{CheckResult, MAX_CHECKER_MESSAGE_CHARS, clip_str, reserve_scratch_file};
+
+/// Formats `full_score` for the Lemon SPJ command-line argument (`argv[4]`).
+///
+/// Integral scores are formatted without a decimal point (e.g. `100` for `100.0`) so legacy SPJs
+/// using `atoi` or `scanf("%d")` work unmodified, while fractional scores keep their exact decimal
+/// representation (e.g. `12.5`).
+pub fn format_lemon_full_score(full_score: f64) -> String {
+    if full_score.is_finite() && (full_score - full_score.round()).abs() < 1e-9 {
+        format!("{:.0}", full_score.round())
+    } else {
+        format!("{full_score}")
+    }
+}
 
 /// Parse Lemon score and message files.
 pub fn parse_lemon_output(
@@ -46,7 +59,7 @@ pub fn parse_lemon_output(
     let message_opt = if message.is_empty() {
         None
     } else {
-        Some(message.to_string())
+        Some(clip_str(message, MAX_CHECKER_MESSAGE_CHARS).0)
     };
 
     let verdict = if (raw_score - full_score).abs() < 1e-6 || ratio >= 1.0 {
@@ -76,15 +89,31 @@ pub fn run_lemon_checker(
     cancel: &CancelToken,
 ) -> CheckResult {
     let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let score_file = scratch_dir.join(format!("lemon_score_{pid}_{timestamp}.txt"));
-    let message_file = scratch_dir.join(format!("lemon_msg_{pid}_{timestamp}.txt"));
+    let score_file = match reserve_scratch_file(&scratch_dir, "lemon_score", "txt") {
+        Ok(p) => p,
+        Err(e) => {
+            return CheckResult {
+                verdict: Verdict::JudgeFailed,
+                score_ratio: 0.0,
+                message: Some(format!("Failed to reserve Lemon score file: {e}")),
+                diff: None,
+            };
+        }
+    };
+    let message_file = match reserve_scratch_file(&scratch_dir, "lemon_msg", "txt") {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = fs::remove_file(&score_file);
+            return CheckResult {
+                verdict: Verdict::JudgeFailed,
+                score_ratio: 0.0,
+                message: Some(format!("Failed to reserve Lemon message file: {e}")),
+                diff: None,
+            };
+        }
+    };
 
-    let full_score_str = format!("{:.0}", full_score);
+    let full_score_str = format_lemon_full_score(full_score);
 
     let argv = vec![
         checker_exe.as_os_str().to_os_string(),
@@ -125,9 +154,14 @@ pub fn run_lemon_checker(
         }
     };
 
-    let score_content = fs::read_to_string(&score_file).unwrap_or_default();
-    let message_content = fs::read_to_string(&message_file)
-        .unwrap_or_else(|_| String::from_utf8_lossy(&run_res.stderr_tail).to_string());
+    let score_content = fs::read(&score_file)
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+    let message_content = fs::read(&message_file)
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| String::from_utf8_lossy(&run_res.stderr_tail).to_string());
 
     let _ = fs::remove_file(&score_file);
     let _ = fs::remove_file(&message_file);
@@ -170,5 +204,11 @@ mod tests {
         let inf_res = parse_lemon_output("inf\n", "inf score", 100.0);
         assert_eq!(inf_res.verdict, Verdict::JudgeFailed);
         assert_eq!(inf_res.score_ratio, 0.0);
+
+        assert_eq!(format_lemon_full_score(100.0), "100");
+        assert_eq!(format_lemon_full_score(12.5), "12.5");
+        let frac_ac = parse_lemon_output(&format_lemon_full_score(12.5), "ok", 12.5);
+        assert_eq!(frac_ac.verdict, Verdict::Accepted);
+        assert_eq!(frac_ac.score_ratio, 1.0);
     }
 }

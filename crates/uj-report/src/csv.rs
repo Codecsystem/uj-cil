@@ -2,26 +2,35 @@
 
 use crate::result::SubmissionJudgeReport;
 
-/// Escapes a CSV cell if it contains delimiters, quotes, or newlines.
+/// Escapes a CSV cell if it contains delimiters, quotes, or newlines, and neutralizes
+/// spreadsheet formula injection (CWE-1236) by prefixing `'` when the cell starts with
+/// `=`, `+`, `-`, `@`, `\t`, or `\r`.
 fn escape_csv(val: &str) -> String {
-    if val.contains(',') || val.contains('"') || val.contains('\n') || val.contains('\r') {
-        format!("\"{}\"", val.replace('"', "\"\""))
+    let safe = if val.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{val}")
     } else {
         val.to_string()
+    };
+    if safe.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", safe.replace('"', "\"\""))
+    } else {
+        safe
     }
 }
 
 /// Generates a CSV report for a single submission.
 ///
-/// Header format: `submission,problem,test,verdict,time_ms,memory_kb,score`
+/// Header format: `submission,problem,test,verdict,time_ms,memory_kb,score` (prefixed with a UTF-8 BOM).
 pub fn generate_csv(report: &SubmissionJudgeReport) -> String {
     generate_multi_csv(std::slice::from_ref(report))
 }
 
 /// Generates a CSV report for multiple submissions (e.g. contest or batch judging).
+///
+/// Prepends a UTF-8 BOM (`\u{FEFF}`) so Excel on Windows opens non-ASCII participant/problem names
+/// without mojibake.
 pub fn generate_multi_csv(reports: &[SubmissionJudgeReport]) -> String {
-    let mut out = String::new();
-    out.push_str("submission,problem,test,verdict,time_ms,memory_kb,score\n");
+    let mut out = String::from("\u{FEFF}submission,problem,test,verdict,time_ms,memory_kb,score\n");
 
     for report in reports {
         let sub = escape_csv(&report.submission);
@@ -94,7 +103,8 @@ mod tests {
         };
 
         let csv = generate_csv(&report);
-        let lines: Vec<&str> = csv.lines().collect();
+        assert!(csv.starts_with('\u{FEFF}'), "CSV must start with UTF-8 BOM");
+        let lines: Vec<&str> = csv.trim_start_matches('\u{FEFF}').lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(
             lines[0],
@@ -102,5 +112,25 @@ mod tests {
         );
         assert_eq!(lines[1], "ac.cpp,aplusb,1,AC,5,512,50.00");
         assert_eq!(lines[2], "ac.cpp,aplusb,2,AC,7,640,50.00");
+    }
+
+    #[test]
+    fn test_csv_formula_injection_guard() {
+        for dangerous in [
+            "=cmd|' /C calc'!A0",
+            "+SUM(A1:A2)",
+            "-2+3",
+            "@IMPORTXML()",
+            "\t=1",
+            "\r=1",
+        ] {
+            let escaped = escape_csv(dangerous);
+            let unquoted = escaped.trim_matches('"');
+            assert!(
+                unquoted.starts_with('\''),
+                "Cell {dangerous:?} must be prefixed with single quote, got {escaped:?}"
+            );
+        }
+        assert_eq!(escape_csv("=1,2\"3"), "\"'=1,2\"\"3\"");
     }
 }

@@ -765,14 +765,39 @@ pub fn run_contest(
 
     // Export HTML and CSV reports
     let html_path = contest_dir.join("contest_report.html");
-    if let Ok(html_content) = uj_report::generate_multi_html(&all_reports, true)
-        && let Err(e) = fs::write(&html_path, html_content)
-    {
-        eprintln!(
-            "Failed to write HTML report to {}: {e}",
-            html_path.display()
-        );
-        return ExitCode::from(crate::error::EXIT_JUDGE_FAILED);
+    let standing_rows: Vec<uj_report::ContestStandingRow> = standings
+        .iter()
+        .map(|st| {
+            let verdict = if st.problem_results.is_empty() {
+                Verdict::Skipped
+            } else {
+                st.problem_results
+                    .values()
+                    .fold(Verdict::Accepted, |acc, (v, _, _)| acc.merge(*v))
+            };
+            uj_report::ContestStandingRow {
+                rank: st.rank,
+                participant: st.name.clone(),
+                total_score: st.total_score,
+                total_time_ms: st.total_time_ms,
+                verdict,
+            }
+        })
+        .collect();
+    match uj_report::generate_contest_html(&all_reports, &standing_rows) {
+        Ok(html_content) => {
+            if let Err(e) = fs::write(&html_path, html_content) {
+                eprintln!(
+                    "Failed to write HTML report to {}: {e}",
+                    html_path.display()
+                );
+                return ExitCode::from(crate::error::EXIT_JUDGE_FAILED);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to generate HTML report: {e}");
+            return ExitCode::from(crate::error::EXIT_JUDGE_FAILED);
+        }
     }
 
     let csv_path = contest_dir.join("contest_report.csv");

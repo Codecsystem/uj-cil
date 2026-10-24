@@ -108,7 +108,7 @@ fn test_html_and_csv_report_generation() {
     let csv_lines: Vec<&str> = csv_content.lines().collect();
     assert!(!csv_lines.is_empty());
     assert_eq!(
-        csv_lines[0],
+        csv_lines[0].trim_start_matches('\u{feff}'),
         "submission,problem,test,verdict,time_ms,memory_kb,score"
     );
     assert!(

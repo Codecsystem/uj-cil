@@ -334,14 +334,14 @@ const REPORT_TEMPLATE: &str = r#"<!DOCTYPE html>
           </tr>
         </thead>
         <tbody>
-          {% for r in reports %}
+          {% for s in standings %}
           <tr>
-            <td class="rank-{{ loop.index }}">{{ loop.index }}</td>
-            <td><strong>{{ r.submission }}</strong></td>
-            <td><strong style="color: var(--color-ac);">{{ r.score | round(1) }}</strong></td>
-            <td>{{ r.max_time_ms }} ms</td>
+            <td class="rank-{{ s.rank }}">{{ s.rank }}</td>
+            <td><strong>{{ s.participant }}</strong></td>
+            <td><strong style="color: var(--color-ac);">{{ s.total_score | round(1) }}</strong></td>
+            <td>{{ s.total_time_ms }} ms</td>
             <td>
-              <span class="badge {{ badge_class(r.verdict) }}">{{ r.verdict }}</span>
+              <span class="badge {{ badge_class(s.verdict) }}">{{ s.verdict }}</span>
             </td>
           </tr>
           {% endfor %}
@@ -351,7 +351,8 @@ const REPORT_TEMPLATE: &str = r#"<!DOCTYPE html>
     {% endif %}
 
     {% for r in reports %}
-    <div class="report-section" id="report-{{ loop.index }}">
+    {% set report_idx = loop.index %}
+    <div class="report-section" id="report-{{ report_idx }}">
       <div class="summary-grid">
         <div class="stat-box">
           <div class="stat-label">Problem / Submission</div>
@@ -415,7 +416,7 @@ const REPORT_TEMPLATE: &str = r#"<!DOCTYPE html>
               <tbody>
                 {% for t in r.tests %}
                   {% if t.subtask == st.id %}
-                    {{ render_test_row(t, loop.index) }}
+                    {{ render_test_row(t, loop.index, report_idx) }}
                   {% endif %}
                 {% endfor %}
               </tbody>
@@ -423,6 +424,38 @@ const REPORT_TEMPLATE: &str = r#"<!DOCTYPE html>
           </div>
         </div>
         {% endfor %}
+        {% set extra_tests = unassigned_tests(r.tests, r.subtasks) %}
+        {% if extra_tests | length > 0 %}
+        <div class="subtask-group">
+          <div class="subtask-header" onclick="toggleSubtask(this)">
+            <div>
+              <span class="chevron">▼</span>
+              <strong>Other Tests</strong>
+              <span style="color: var(--text-muted); margin-left: 0.5rem;">({{ extra_tests | length }} tests)</span>
+            </div>
+          </div>
+          <div class="subtask-content">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width: 50px;">#</th>
+                  <th>Test Case</th>
+                  <th style="width: 100px;">Verdict</th>
+                  <th style="width: 90px;">Time</th>
+                  <th style="width: 100px;">Memory</th>
+                  <th style="width: 80px;">Score</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for item in extra_tests %}
+                  {{ render_test_row(item.test, item.index, report_idx) }}
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        {% endif %}
       {% else %}
         <!-- Flat tests list -->
         <div class="card" style="padding: 0; overflow: hidden;">
@@ -440,7 +473,7 @@ const REPORT_TEMPLATE: &str = r#"<!DOCTYPE html>
             </thead>
             <tbody>
               {% for t in r.tests %}
-                {{ render_test_row(t, loop.index) }}
+                {{ render_test_row(t, loop.index, report_idx) }}
               {% endfor %}
             </tbody>
           </table>
@@ -466,6 +499,79 @@ const REPORT_TEMPLATE: &str = r#"<!DOCTYPE html>
 </html>
 "#;
 
+/// A ranked row in the contest standings leaderboard.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContestStandingRow {
+    pub rank: usize,
+    pub participant: String,
+    pub total_score: f64,
+    pub total_time_ms: u64,
+    pub verdict: uj_core::verdict::Verdict,
+}
+
+/// Computes ranked contest standings by aggregating per-submission reports when explicit standings
+/// are not supplied by the caller.
+pub fn compute_standings_from_reports(
+    reports: &[SubmissionJudgeReport],
+) -> Vec<ContestStandingRow> {
+    use std::collections::BTreeMap;
+    use uj_core::verdict::Verdict;
+
+    let mut by_participant: BTreeMap<String, (f64, u64, Option<Verdict>)> = BTreeMap::new();
+    for r in reports {
+        let suffix = format!(" - {}", r.problem);
+        let participant = r
+            .submission
+            .strip_suffix(&suffix)
+            .unwrap_or(&r.submission)
+            .to_string();
+        let entry = by_participant.entry(participant).or_insert((0.0, 0, None));
+        entry.0 += r.score;
+        entry.1 += r.max_time_ms;
+        entry.2 = Some(match entry.2 {
+            Some(prev) => prev.merge(r.verdict),
+            None => r.verdict,
+        });
+    }
+
+    let mut rows: Vec<ContestStandingRow> = by_participant
+        .into_iter()
+        .map(
+            |(participant, (total_score, total_time_ms, verdict))| ContestStandingRow {
+                rank: 1,
+                participant,
+                total_score,
+                total_time_ms,
+                verdict: verdict.unwrap_or(Verdict::Skipped),
+            },
+        )
+        .collect();
+
+    rows.sort_by(|a, b| {
+        b.total_score
+            .partial_cmp(&a.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.total_time_ms.cmp(&b.total_time_ms))
+            .then_with(|| a.participant.cmp(&b.participant))
+    });
+
+    let mut current_rank = 1;
+    for i in 0..rows.len() {
+        if i > 0 {
+            let prev = &rows[i - 1];
+            let curr = &rows[i];
+            let same_score = (curr.total_score - prev.total_score).abs() < 1e-6;
+            let same_time = curr.total_time_ms == prev.total_time_ms;
+            if !(same_score && same_time) {
+                current_rank = i + 1;
+            }
+        }
+        rows[i].rank = current_rank;
+    }
+
+    rows
+}
+
 #[derive(Serialize)]
 struct ReportContext<'a> {
     title: &'a str,
@@ -473,6 +579,7 @@ struct ReportContext<'a> {
     uj_version: &'a str,
     is_contest: bool,
     reports: &'a [SubmissionJudgeReport],
+    standings: &'a [ContestStandingRow],
 }
 
 fn map_verdict_badge(v: &str) -> &'static str {
@@ -501,6 +608,27 @@ pub fn generate_multi_html(
     reports: &[SubmissionJudgeReport],
     is_contest: bool,
 ) -> Result<String, String> {
+    if is_contest {
+        let standings = compute_standings_from_reports(reports);
+        generate_contest_html(reports, &standings)
+    } else {
+        render_html_impl(reports, false, &[])
+    }
+}
+
+/// Generates a standalone HTML contest report using an explicit ranked standings leaderboard.
+pub fn generate_contest_html(
+    reports: &[SubmissionJudgeReport],
+    standings: &[ContestStandingRow],
+) -> Result<String, String> {
+    render_html_impl(reports, true, standings)
+}
+
+fn render_html_impl(
+    reports: &[SubmissionJudgeReport],
+    is_contest: bool,
+    standings: &[ContestStandingRow],
+) -> Result<String, String> {
     let mut env = Environment::new();
 
     // Helper functions for template
@@ -508,10 +636,47 @@ pub fn generate_multi_html(
         map_verdict_badge(&verdict).to_string()
     });
 
+    env.add_function(
+        "unassigned_tests",
+        |tests: minijinja::Value, subtasks: minijinja::Value| -> Vec<minijinja::Value> {
+            let mut known_ids = std::collections::HashSet::new();
+            if let Ok(iter) = subtasks.try_iter() {
+                for st in iter {
+                    if let Ok(id_val) = st.get_attr("id")
+                        && let Some(id) = id_val.as_i64()
+                    {
+                        known_ids.insert(id);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            if let Ok(iter) = tests.try_iter() {
+                for (i, t) in iter.enumerate() {
+                    let matched = t
+                        .get_attr("subtask")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_none())
+                        .and_then(|v| v.as_i64())
+                        .is_some_and(|st_id| known_ids.contains(&st_id));
+                    if !matched {
+                        out.push(context! {
+                            index => i + 1,
+                            test => t,
+                        });
+                    }
+                }
+            }
+            out
+        },
+    );
+
     // Custom test row macro renderer
     env.add_function(
         "render_test_row",
-        |test: minijinja::Value, idx: usize| -> minijinja::Value {
+        |test: minijinja::Value,
+         idx: usize,
+         report_idx: Option<usize>|
+         -> minijinja::Value {
             let id = test.get_attr("id").unwrap_or_default().to_string();
             let verdict = test.get_attr("verdict").unwrap_or_default().to_string();
             let time_ms = test
@@ -531,11 +696,14 @@ pub fn generate_multi_html(
                 .unwrap_or(0);
             let score = test
                 .get_attr("score")
-                .map(|v| format!("{:.1}", v))
-                .unwrap_or_else(|_| "0.0".to_string());
+                .ok()
+                .and_then(|v| f64::try_from(v).ok())
+                .map(|s| format!("{s:.1}"))
+                .unwrap_or_else(|| "0.0".to_string());
 
             let badge_cls = map_verdict_badge(&verdict);
-            let row_detail_id = format!("test-detail-row-{idx}");
+            let r_idx = report_idx.unwrap_or(1);
+            let row_detail_id = format!("test-detail-row-{r_idx}-{idx}");
             let escaped_id = html_escape(&id);
             let escaped_verdict = html_escape(&verdict);
 
@@ -551,7 +719,10 @@ pub fn generate_multi_html(
                 .ok()
                 .filter(|v| !v.is_undefined() && !v.is_none())
                 .map(|v| v.to_string());
-            let diff_val = test.get_attr("diff").ok().filter(|v| !v.is_undefined());
+            let diff_val = test
+                .get_attr("diff")
+                .ok()
+                .filter(|v| !v.is_undefined() && !v.is_none());
 
             let mut details_html = String::new();
             if let Some(ref chk) = checker_val {
@@ -585,7 +756,10 @@ pub fn generate_multi_html(
                 details_html.push_str("</div>");
             }
 
-            let timing_info = test.get_attr("timing").ok();
+            let timing_info = test
+                .get_attr("timing")
+                .ok()
+                .filter(|v| !v.is_undefined() && !v.is_none());
             let mut timing_html = String::new();
             if let Some(t) = timing_info {
                 let rejudged = t
@@ -648,7 +822,7 @@ pub fn generate_multi_html(
         .get_template(template_name)
         .map_err(|e| format!("Failed to get report template: {e}"))?;
 
-    let title = if reports.len() == 1 {
+    let title = if reports.len() == 1 && !is_contest {
         format!("{}: {}", reports[0].problem, reports[0].submission)
     } else {
         "Contest Report".to_string()
@@ -660,6 +834,7 @@ pub fn generate_multi_html(
         uj_version: env!("CARGO_PKG_VERSION"),
         is_contest,
         reports,
+        standings,
     };
 
     tmpl.render(context! {
@@ -668,6 +843,7 @@ pub fn generate_multi_html(
         uj_version => ctx.uj_version,
         is_contest => ctx.is_contest,
         reports => ctx.reports,
+        standings => ctx.standings,
     })
     .map_err(|e| format!("Failed to render HTML report: {e}"))
 }
@@ -767,5 +943,134 @@ mod tests {
         assert!(html.contains("aplusb: ac.cpp"));
         assert!(html.contains("ok answer matches"));
         assert!(html.contains("badge-ac"));
+        // Tests without a diff must NOT render a bogus "Mismatch at Line , Column" block
+        assert!(!html.contains("Mismatch at Line"));
+        assert!(!html.contains("<div class=\"diff-block\">"));
+    }
+
+    #[test]
+    fn test_html_score_precision_and_unassigned_subtask_tests() {
+        let report = SubmissionJudgeReport {
+            schema_version: 1,
+            problem: "prob".to_string(),
+            submission: "sub.cpp".to_string(),
+            verdict: Verdict::PartiallyCorrect,
+            score: 100.0 / 3.0,
+            max_time_ms: 10,
+            max_memory_kb: 512,
+            subtasks: vec![crate::result::SubtaskResult {
+                id: 1,
+                score: 100.0 / 3.0,
+                max_score: 50.0,
+                verdict: Verdict::PartiallyCorrect,
+                test_ids: vec!["1".to_string()],
+            }],
+            tests: vec![
+                crate::result::SingleTestResult {
+                    id: "1".to_string(),
+                    subtask: Some(1),
+                    verdict: Verdict::PartiallyCorrect,
+                    score: 100.0 / 3.0,
+                    time_ms: 5,
+                    wall_ms: 6,
+                    memory_kb: 512,
+                    exit: Default::default(),
+                    message: None,
+                    checker: None,
+                    diff: None,
+                    timing: Default::default(),
+                    sandbox_tier: None,
+                },
+                crate::result::SingleTestResult {
+                    id: "orphan_case_99".to_string(),
+                    subtask: None,
+                    verdict: Verdict::Accepted,
+                    score: 50.0,
+                    time_ms: 5,
+                    wall_ms: 6,
+                    memory_kb: 512,
+                    exit: Default::default(),
+                    message: None,
+                    checker: None,
+                    diff: None,
+                    timing: Default::default(),
+                    sandbox_tier: None,
+                },
+            ],
+        };
+
+        let html = generate_html(&report).unwrap();
+        assert!(html.contains("33.3"));
+        assert!(!html.contains("33.3333"));
+        assert!(html.contains("orphan_case_99"));
+        assert!(html.contains("Other Tests"));
+    }
+
+    #[test]
+    fn test_contest_html_standings_order_and_unique_row_ids() {
+        let rep_bob = SubmissionJudgeReport {
+            schema_version: 1,
+            problem: "p1".to_string(),
+            submission: "bob - p1".to_string(),
+            verdict: Verdict::WrongAnswer,
+            score: 0.0,
+            max_time_ms: 50,
+            max_memory_kb: 512,
+            subtasks: vec![],
+            tests: vec![crate::result::SingleTestResult {
+                id: "1".to_string(),
+                subtask: None,
+                verdict: Verdict::WrongAnswer,
+                score: 0.0,
+                time_ms: 50,
+                wall_ms: 55,
+                memory_kb: 512,
+                exit: Default::default(),
+                message: None,
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: None,
+            }],
+        };
+        let rep_alice = SubmissionJudgeReport {
+            schema_version: 1,
+            problem: "p1".to_string(),
+            submission: "alice - p1".to_string(),
+            verdict: Verdict::Accepted,
+            score: 100.0,
+            max_time_ms: 10,
+            max_memory_kb: 512,
+            subtasks: vec![],
+            tests: vec![crate::result::SingleTestResult {
+                id: "1".to_string(),
+                subtask: None,
+                verdict: Verdict::Accepted,
+                score: 100.0,
+                time_ms: 10,
+                wall_ms: 12,
+                memory_kb: 512,
+                exit: Default::default(),
+                message: None,
+                checker: None,
+                diff: None,
+                timing: Default::default(),
+                sandbox_tier: None,
+            }],
+        };
+
+        // Pass bob first, alice second; standings must rank alice #1 before bob #2
+        let html = generate_multi_html(&[rep_bob, rep_alice], true).unwrap();
+        let standings_end = html.find("id=\"report-1\"").unwrap();
+        let standings_slice = &html[..standings_end];
+        let alice_pos = standings_slice.find("alice").unwrap();
+        let bob_pos = standings_slice.find("bob").unwrap();
+        assert!(
+            alice_pos < bob_pos,
+            "Alice (100 pts) must appear before Bob (0 pts) in Contest Standings"
+        );
+        // Unique expandable row IDs per report
+        assert!(html.contains("id=\"test-detail-row-1-1\""));
+        assert!(html.contains("id=\"test-detail-row-2-1\""));
     }
 }

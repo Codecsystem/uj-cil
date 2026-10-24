@@ -7,7 +7,10 @@ pub mod result;
 pub mod schema;
 
 pub use csv::{generate_csv, generate_multi_csv};
-pub use html::{generate_html, generate_multi_html};
+pub use html::{
+    ContestStandingRow, compute_standings_from_reports, generate_contest_html, generate_html,
+    generate_multi_html,
+};
 pub use human::{format_human_report, format_test_details};
 pub use result::{
     DiffSummary, ExitInfo, JudgeEvent, PoolEvent, SingleTestResult, SubmissionJudgeReport,

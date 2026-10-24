@@ -207,13 +207,63 @@ impl TuiApp {
     }
 }
 
+static PANIC_HOOK_ONCE: std::sync::Once = std::sync::Once::new();
+static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Installs a panic hook (once per process) that restores the terminal out of raw mode and the
+/// alternate screen before delegating to the previous panic hook, so panic diagnostics are not
+/// swallowed by the alternate screen or printed with stair-stepped newlines in raw mode.
+pub fn ensure_tui_panic_hook() {
+    PANIC_HOOK_ONCE.call_once(|| {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            if TUI_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stderr(), LeaveAlternateScreen, Show);
+            }
+            prev_hook(panic_info);
+        }));
+    });
+}
+
 /// RAII Guard ensuring terminal restoration on exit or panic.
-pub struct TerminalGuard;
+pub struct TerminalGuard {
+    entered_alt_screen: bool,
+}
+
+impl TerminalGuard {
+    /// Verifies that `stderr` is an interactive terminal, installs the TUI panic hook, enables raw
+    /// mode (creating the guard immediately so any subsequent error cleans up raw mode), and enters
+    /// the alternate screen.
+    pub fn enter() -> io::Result<Self> {
+        use std::io::IsTerminal;
+        if !io::stderr().is_terminal() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TUI requires stderr to be an interactive terminal (TTY)",
+            ));
+        }
+        ensure_tui_panic_hook();
+        enable_raw_mode()?;
+        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = Self {
+            entered_alt_screen: false,
+        };
+        execute!(io::stderr(), EnterAlternateScreen, Hide)?;
+        guard.entered_alt_screen = true;
+        Ok(guard)
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let was_active = TUI_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst);
         let _ = disable_raw_mode();
-        let _ = execute!(io::stderr(), LeaveAlternateScreen, Show);
+        if self.entered_alt_screen && was_active {
+            let _ = execute!(io::stderr(), LeaveAlternateScreen, Show);
+        } else {
+            let _ = execute!(io::stderr(), Show);
+        }
     }
 }
 
@@ -229,13 +279,10 @@ pub fn run_tui(
     cancel_token: CancelToken,
     auto_exit_on_done: bool,
 ) -> Result<Option<SubmissionJudgeReport>, Box<dyn std::error::Error>> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen, Hide)?;
-    let _guard = TerminalGuard;
+    // Setup terminal (returns Err immediately if stderr is not a TTY; guard created right after enable_raw_mode)
+    let _guard = TerminalGuard::enter()?;
 
-    let backend = CrosstermBackend::new(stderr);
+    let backend = CrosstermBackend::new(io::stderr());
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = TuiApp::new(
@@ -898,5 +945,12 @@ mod tests {
         };
         app.handle_event(JudgeEvent::SubmissionDone(report));
         assert!(app.is_completed);
+    }
+
+    #[test]
+    fn test_tui_panic_hook_installs_cleanly() {
+        ensure_tui_panic_hook();
+        ensure_tui_panic_hook(); // idempotent via Once
+        assert!(!TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
