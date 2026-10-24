@@ -40,7 +40,10 @@ pub(crate) mod x86_64_nr {
     pub const SYS_CLONE: u32 = 56;
     pub const SYS_PTRACE: u32 = 101;
     pub const SYS_PIVOT_ROOT: u32 = 155;
+    pub const SYS_ADJTIMEX: u32 = 159;
     pub const SYS_CHROOT: u32 = 161;
+    pub const SYS_ACCT: u32 = 163;
+    pub const SYS_SETTIMEOFDAY: u32 = 164;
     pub const SYS_MOUNT: u32 = 165;
     pub const SYS_UMOUNT2: u32 = 166;
     pub const SYS_SWAPON: u32 = 167;
@@ -48,22 +51,47 @@ pub(crate) mod x86_64_nr {
     pub const SYS_REBOOT: u32 = 169;
     pub const SYS_INIT_MODULE: u32 = 175;
     pub const SYS_DELETE_MODULE: u32 = 176;
+    pub const SYS_QUOTACTL: u32 = 179;
+    pub const SYS_CLOCK_SETTIME: u32 = 227;
     pub const SYS_KEXEC_LOAD: u32 = 246;
     pub const SYS_ADD_KEY: u32 = 248;
     pub const SYS_REQUEST_KEY: u32 = 249;
     pub const SYS_KEYCTL: u32 = 250;
     pub const SYS_UNSHARE: u32 = 272;
     pub const SYS_PERF_EVENT_OPEN: u32 = 298;
+    pub const SYS_FANOTIFY_INIT: u32 = 300;
+    pub const SYS_NAME_TO_HANDLE_AT: u32 = 303;
+    pub const SYS_OPEN_BY_HANDLE_AT: u32 = 304;
+    pub const SYS_CLOCK_ADJTIME: u32 = 305;
     pub const SYS_SETNS: u32 = 308;
+    pub const SYS_PROCESS_VM_READV: u32 = 310;
+    pub const SYS_PROCESS_VM_WRITEV: u32 = 311;
+    pub const SYS_KCMP: u32 = 312;
     pub const SYS_FINIT_MODULE: u32 = 313;
     pub const SYS_KEXEC_FILE_LOAD: u32 = 320;
     pub const SYS_BPF: u32 = 321;
+    pub const SYS_USERFAULTFD: u32 = 323;
+    pub const SYS_IO_URING_SETUP: u32 = 425;
+    pub const SYS_IO_URING_ENTER: u32 = 426;
+    pub const SYS_IO_URING_REGISTER: u32 = 427;
+    pub const SYS_OPEN_TREE: u32 = 428;
+    pub const SYS_MOVE_MOUNT: u32 = 429;
+    pub const SYS_FSOPEN: u32 = 430;
+    pub const SYS_FSCONFIG: u32 = 431;
+    pub const SYS_FSMOUNT: u32 = 432;
+    pub const SYS_FSPICK: u32 = 433;
     pub const SYS_CLONE3: u32 = 435;
+    pub const SYS_PIDFD_GETFD: u32 = 438;
+    pub const SYS_MOUNT_SETATTR: u32 = 442;
+    pub const SYS_QUOTACTL_FD: u32 = 443;
 
-    pub const BLACKLIST: [u32; 20] = [
+    pub const BLACKLIST: [u32; 45] = [
         SYS_PTRACE,
         SYS_PIVOT_ROOT,
+        SYS_ADJTIMEX,
         SYS_CHROOT,
+        SYS_ACCT,
+        SYS_SETTIMEOFDAY,
         SYS_MOUNT,
         SYS_UMOUNT2,
         SYS_SWAPON,
@@ -71,16 +99,38 @@ pub(crate) mod x86_64_nr {
         SYS_REBOOT,
         SYS_INIT_MODULE,
         SYS_DELETE_MODULE,
+        SYS_QUOTACTL,
+        SYS_CLOCK_SETTIME,
         SYS_KEXEC_LOAD,
         SYS_ADD_KEY,
         SYS_REQUEST_KEY,
         SYS_KEYCTL,
         SYS_UNSHARE,
         SYS_PERF_EVENT_OPEN,
+        SYS_FANOTIFY_INIT,
+        SYS_NAME_TO_HANDLE_AT,
+        SYS_OPEN_BY_HANDLE_AT,
+        SYS_CLOCK_ADJTIME,
         SYS_SETNS,
+        SYS_PROCESS_VM_READV,
+        SYS_PROCESS_VM_WRITEV,
+        SYS_KCMP,
         SYS_FINIT_MODULE,
         SYS_KEXEC_FILE_LOAD,
         SYS_BPF,
+        SYS_USERFAULTFD,
+        SYS_IO_URING_SETUP,
+        SYS_IO_URING_ENTER,
+        SYS_IO_URING_REGISTER,
+        SYS_OPEN_TREE,
+        SYS_MOVE_MOUNT,
+        SYS_FSOPEN,
+        SYS_FSCONFIG,
+        SYS_FSMOUNT,
+        SYS_FSPICK,
+        SYS_PIDFD_GETFD,
+        SYS_MOUNT_SETATTR,
+        SYS_QUOTACTL_FD,
     ];
 }
 
@@ -91,12 +141,17 @@ pub(crate) mod aarch64_nr {
     pub const SYS_MOUNT: u32 = 40;
     pub const SYS_PIVOT_ROOT: u32 = 41;
     pub const SYS_CHROOT: u32 = 51;
+    pub const SYS_QUOTACTL: u32 = 60;
+    pub const SYS_ACCT: u32 = 89;
     pub const SYS_UNSHARE: u32 = 97;
     pub const SYS_KEXEC_LOAD: u32 = 104;
     pub const SYS_INIT_MODULE: u32 = 105;
     pub const SYS_DELETE_MODULE: u32 = 106;
+    pub const SYS_CLOCK_SETTIME: u32 = 112;
     pub const SYS_PTRACE: u32 = 117;
     pub const SYS_REBOOT: u32 = 142;
+    pub const SYS_SETTIMEOFDAY: u32 = 170;
+    pub const SYS_ADJTIMEX: u32 = 171;
     pub const SYS_ADD_KEY: u32 = 217;
     pub const SYS_REQUEST_KEY: u32 = 218;
     pub const SYS_KEYCTL: u32 = 219;
@@ -104,16 +159,39 @@ pub(crate) mod aarch64_nr {
     pub const SYS_SWAPON: u32 = 224;
     pub const SYS_SWAPOFF: u32 = 225;
     pub const SYS_PERF_EVENT_OPEN: u32 = 241;
+    pub const SYS_FANOTIFY_INIT: u32 = 262;
+    pub const SYS_NAME_TO_HANDLE_AT: u32 = 264;
+    pub const SYS_OPEN_BY_HANDLE_AT: u32 = 265;
+    pub const SYS_CLOCK_ADJTIME: u32 = 266;
     pub const SYS_SETNS: u32 = 268;
+    pub const SYS_PROCESS_VM_READV: u32 = 270;
+    pub const SYS_PROCESS_VM_WRITEV: u32 = 271;
+    pub const SYS_KCMP: u32 = 272;
     pub const SYS_FINIT_MODULE: u32 = 273;
     pub const SYS_BPF: u32 = 280;
+    pub const SYS_USERFAULTFD: u32 = 282;
     pub const SYS_KEXEC_FILE_LOAD: u32 = 294;
+    pub const SYS_IO_URING_SETUP: u32 = 425;
+    pub const SYS_IO_URING_ENTER: u32 = 426;
+    pub const SYS_IO_URING_REGISTER: u32 = 427;
+    pub const SYS_OPEN_TREE: u32 = 428;
+    pub const SYS_MOVE_MOUNT: u32 = 429;
+    pub const SYS_FSOPEN: u32 = 430;
+    pub const SYS_FSCONFIG: u32 = 431;
+    pub const SYS_FSMOUNT: u32 = 432;
+    pub const SYS_FSPICK: u32 = 433;
     pub const SYS_CLONE3: u32 = 435;
+    pub const SYS_PIDFD_GETFD: u32 = 438;
+    pub const SYS_MOUNT_SETATTR: u32 = 442;
+    pub const SYS_QUOTACTL_FD: u32 = 443;
 
-    pub const BLACKLIST: [u32; 20] = [
+    pub const BLACKLIST: [u32; 45] = [
         SYS_PTRACE,
         SYS_PIVOT_ROOT,
+        SYS_ADJTIMEX,
         SYS_CHROOT,
+        SYS_ACCT,
+        SYS_SETTIMEOFDAY,
         SYS_MOUNT,
         SYS_UMOUNT2,
         SYS_SWAPON,
@@ -121,21 +199,46 @@ pub(crate) mod aarch64_nr {
         SYS_REBOOT,
         SYS_INIT_MODULE,
         SYS_DELETE_MODULE,
+        SYS_QUOTACTL,
+        SYS_CLOCK_SETTIME,
         SYS_KEXEC_LOAD,
         SYS_ADD_KEY,
         SYS_REQUEST_KEY,
         SYS_KEYCTL,
         SYS_UNSHARE,
         SYS_PERF_EVENT_OPEN,
+        SYS_FANOTIFY_INIT,
+        SYS_NAME_TO_HANDLE_AT,
+        SYS_OPEN_BY_HANDLE_AT,
+        SYS_CLOCK_ADJTIME,
         SYS_SETNS,
+        SYS_PROCESS_VM_READV,
+        SYS_PROCESS_VM_WRITEV,
+        SYS_KCMP,
         SYS_FINIT_MODULE,
         SYS_KEXEC_FILE_LOAD,
         SYS_BPF,
+        SYS_USERFAULTFD,
+        SYS_IO_URING_SETUP,
+        SYS_IO_URING_ENTER,
+        SYS_IO_URING_REGISTER,
+        SYS_OPEN_TREE,
+        SYS_MOVE_MOUNT,
+        SYS_FSOPEN,
+        SYS_FSCONFIG,
+        SYS_FSMOUNT,
+        SYS_FSPICK,
+        SYS_PIDFD_GETFD,
+        SYS_MOUNT_SETATTR,
+        SYS_QUOTACTL_FD,
     ];
 }
 
-// Namespace flags for clone (user, net, mount, pid, ipc, uts, cgroup)
-const CLONE_NAMESPACE_FLAGS: u32 = 0x7a020000;
+// Namespace flags for clone:
+// CLONE_NEWNS (0x00020000) | CLONE_NEWCGROUP (0x02000000) | CLONE_NEWUTS (0x04000000)
+// | CLONE_NEWIPC (0x08000000) | CLONE_NEWUSER (0x10000000) | CLONE_NEWPID (0x20000000)
+// | CLONE_NEWNET (0x40000000) = 0x7e020000
+pub(crate) const CLONE_NAMESPACE_FLAGS: u32 = 0x7e020000;
 
 #[derive(Clone, Copy)]
 enum JumpTarget {
@@ -256,6 +359,10 @@ pub(crate) fn build_bpf_filter(
                     JumpTarget::Relative(offset) => i + 1 + offset as usize,
                 };
                 assert!(dest_idx > i, "BPF jump must be forward");
+                assert!(
+                    dest_idx - i - 1 <= u8::MAX as usize,
+                    "BPF jump offset exceeds u8::MAX"
+                );
                 (dest_idx - i - 1) as u8
             };
 
@@ -406,21 +513,61 @@ mod tests {
             eval_bpf(&x64_prog, 0x40000001, AUDIT_ARCH_X86_64, 0),
             SECCOMP_RET_ERRNO | (libc::ENOSYS as u32)
         );
-        // unshare -> EPERM
-        assert_eq!(
-            eval_bpf(&x64_prog, x86_64_nr::SYS_UNSHARE, AUDIT_ARCH_X86_64, 0),
-            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
-        );
-        // clone with CLONE_NEWUSER (0x10000000) -> EPERM
-        assert_eq!(
-            eval_bpf(
-                &x64_prog,
-                x86_64_nr::SYS_CLONE,
-                AUDIT_ARCH_X86_64,
-                0x10000000
-            ),
-            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
-        );
+        // All blacklisted syscalls on x86_64 -> EPERM
+        for &nr in &x86_64_nr::BLACKLIST {
+            assert_eq!(
+                eval_bpf(&x64_prog, nr, AUDIT_ARCH_X86_64, 0),
+                SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+                "x86_64 syscall {nr} must be blocked with EPERM"
+            );
+        }
+        // Specific checks for new mount API, io_uring, process_vm_*, pidfd_getfd, userfaultfd
+        for &nr in &[
+            x86_64_nr::SYS_OPEN_TREE,
+            x86_64_nr::SYS_MOVE_MOUNT,
+            x86_64_nr::SYS_FSOPEN,
+            x86_64_nr::SYS_FSCONFIG,
+            x86_64_nr::SYS_FSMOUNT,
+            x86_64_nr::SYS_FSPICK,
+            x86_64_nr::SYS_MOUNT_SETATTR,
+            x86_64_nr::SYS_IO_URING_SETUP,
+            x86_64_nr::SYS_IO_URING_ENTER,
+            x86_64_nr::SYS_IO_URING_REGISTER,
+            x86_64_nr::SYS_PROCESS_VM_READV,
+            x86_64_nr::SYS_PROCESS_VM_WRITEV,
+            x86_64_nr::SYS_USERFAULTFD,
+            x86_64_nr::SYS_PIDFD_GETFD,
+            x86_64_nr::SYS_KCMP,
+            x86_64_nr::SYS_OPEN_BY_HANDLE_AT,
+            x86_64_nr::SYS_NAME_TO_HANDLE_AT,
+            x86_64_nr::SYS_FANOTIFY_INIT,
+            x86_64_nr::SYS_ACCT,
+            x86_64_nr::SYS_QUOTACTL,
+            x86_64_nr::SYS_SETTIMEOFDAY,
+            x86_64_nr::SYS_CLOCK_SETTIME,
+            x86_64_nr::SYS_ADJTIMEX,
+        ] {
+            assert_eq!(
+                eval_bpf(&x64_prog, nr, AUDIT_ARCH_X86_64, 0),
+                SECCOMP_RET_ERRNO | (libc::EPERM as u32)
+            );
+        }
+        // clone with each namespace flag (including CLONE_NEWUTS = 0x04000000) -> EPERM
+        for flag in [
+            0x00020000u32, // CLONE_NEWNS
+            0x02000000,    // CLONE_NEWCGROUP
+            0x04000000,    // CLONE_NEWUTS
+            0x08000000,    // CLONE_NEWIPC
+            0x10000000,    // CLONE_NEWUSER
+            0x20000000,    // CLONE_NEWPID
+            0x40000000,    // CLONE_NEWNET
+        ] {
+            assert_eq!(
+                eval_bpf(&x64_prog, x86_64_nr::SYS_CLONE, AUDIT_ARCH_X86_64, flag),
+                SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+                "x86_64 clone with flag {flag:#x} must be EPERM"
+            );
+        }
         // clone for normal thread -> ALLOW
         assert_eq!(
             eval_bpf(&x64_prog, x86_64_nr::SYS_CLONE, AUDIT_ARCH_X86_64, 0x10f00),
@@ -439,26 +586,26 @@ mod tests {
             eval_bpf(&arm64_prog, 0, AUDIT_ARCH_X86_64, 0),
             SECCOMP_RET_KILL_PROCESS
         );
-        // unshare (97 on aarch64) -> EPERM
-        assert_eq!(
-            eval_bpf(&arm64_prog, aarch64_nr::SYS_UNSHARE, AUDIT_ARCH_AARCH64, 0),
-            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
-        );
+        // All blacklisted syscalls on aarch64 -> EPERM
+        for &nr in &aarch64_nr::BLACKLIST {
+            assert_eq!(
+                eval_bpf(&arm64_prog, nr, AUDIT_ARCH_AARCH64, 0),
+                SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+                "aarch64 syscall {nr} must be blocked with EPERM"
+            );
+        }
         // clone3 (435 on aarch64) -> ENOSYS
         assert_eq!(
             eval_bpf(&arm64_prog, aarch64_nr::SYS_CLONE3, AUDIT_ARCH_AARCH64, 0),
             SECCOMP_RET_ERRNO | (libc::ENOSYS as u32)
         );
-        // clone (220 on aarch64) with CLONE_NEWPID (0x20000000) -> EPERM
-        assert_eq!(
-            eval_bpf(
-                &arm64_prog,
-                aarch64_nr::SYS_CLONE,
-                AUDIT_ARCH_AARCH64,
-                0x20000000
-            ),
-            SECCOMP_RET_ERRNO | (libc::EPERM as u32)
-        );
+        // clone (220 on aarch64) with CLONE_NEWPID (0x20000000) and CLONE_NEWUTS (0x04000000) -> EPERM
+        for flag in [0x20000000u32, 0x04000000u32] {
+            assert_eq!(
+                eval_bpf(&arm64_prog, aarch64_nr::SYS_CLONE, AUDIT_ARCH_AARCH64, flag),
+                SECCOMP_RET_ERRNO | (libc::EPERM as u32)
+            );
+        }
         // normal write (64 on aarch64) -> ALLOW
         assert_eq!(
             eval_bpf(&arm64_prog, 64, AUDIT_ARCH_AARCH64, 0),

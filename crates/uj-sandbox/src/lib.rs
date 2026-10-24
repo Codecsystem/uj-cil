@@ -179,30 +179,14 @@ pub fn create_sandbox(
     }
 }
 
-#[cfg(windows)]
-static AUTHORIZED_RUNS_DIRS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
-
 /// Create an isolated, unique box directory inside `<base_dir>/.uj/tmp/runs/run-<id>/box`.
-/// Authorizes `<base_dir>/.uj/tmp/runs` once per base_dir so child box directories automatically
-/// inherit full access without incurring per-test `icacls` process spawn overhead.
+/// On Windows, per-slot AppContainer ACLs are applied only to the specific `box` leaf directory
+/// by `WindowsSandbox` when a test runs, preventing cross-slot or parent directory access.
 pub fn create_isolated_box_dir(
     base_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf, std::io::Error> {
     let runs_dir = base_dir.join(".uj").join("tmp").join("runs");
     std::fs::create_dir_all(&runs_dir)?;
-
-    #[cfg(windows)]
-    {
-        let needs_auth = {
-            let mut set = AUTHORIZED_RUNS_DIRS.lock();
-            set.insert(runs_dir.clone())
-        };
-        if needs_auth && let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
-            let _ = profile.grant_access_to_path(&runs_dir);
-        }
-    }
 
     use std::time::SystemTime;
     let ts = SystemTime::now()
@@ -211,7 +195,8 @@ pub fn create_isolated_box_dir(
         .unwrap_or(0);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let cnt = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let box_dir = runs_dir.join(format!("run-{ts}-{cnt}")).join("box");
+    let pid = std::process::id();
+    let box_dir = runs_dir.join(format!("run-{pid}-{ts}-{cnt}")).join("box");
     std::fs::create_dir_all(&box_dir)?;
 
     Ok(box_dir)
@@ -317,23 +302,14 @@ impl SlotBoxGuard {
 
 /// Create an isolated, reusable slot box directory inside `<base_dir>/.uj/tmp/runs/slot-<pid>-<slot_id>-<ts>/box`.
 /// This eliminates per-test `fs::create_dir_all` and `fs::remove_dir_all` overhead by pooling the box across test cases.
+/// On Windows, the owning `WindowsSandbox` slot grants its exclusive per-slot AppContainer SID
+/// access only to the leaf `box` directory (never `runs` or `run_dir`).
 pub fn create_slot_box_dir(
     base_dir: &std::path::Path,
     slot_id: usize,
 ) -> Result<SlotBoxGuard, std::io::Error> {
     let runs_dir = base_dir.join(".uj").join("tmp").join("runs");
     std::fs::create_dir_all(&runs_dir)?;
-
-    #[cfg(windows)]
-    {
-        let needs_auth = {
-            let mut set = AUTHORIZED_RUNS_DIRS.lock();
-            set.insert(runs_dir.clone())
-        };
-        if needs_auth && let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
-            let _ = profile.grant_access_to_path(&runs_dir);
-        }
-    }
 
     use std::time::SystemTime;
     let ts = SystemTime::now()
@@ -451,8 +427,9 @@ pub fn prepare_binary_content(
     Ok(authorized_exe)
 }
 
-/// Prepares a shared authorized copy of a binary in `<base_dir>/.uj/tmp/bin/<hash>.exe`
-/// (authorized and prewarmed once, reused across all test cases).
+/// Prepares a shared copy of a binary in `<base_dir>/.uj/tmp/bin/<hash>.exe`
+/// and prewarms the image section (without executing untrusted code) once.
+/// Per-slot read+execute (`RX`) ACLs are granted by each `WindowsSandbox` slot.
 pub fn get_or_prepare_authorized_binary(
     exe_path: &std::path::Path,
     base_dir: &std::path::Path,
@@ -467,15 +444,8 @@ pub fn get_or_prepare_authorized_binary(
     if needs_prep {
         #[cfg(windows)]
         {
-            if let Ok(profile) = windows::security::AppContainerProfile::get_shared() {
-                let _ = profile.grant_access_to_path(&authorized_exe);
-            }
-            if let Ok(box_dir) = create_isolated_box_dir(base_dir) {
-                prewarm_binary(&authorized_exe, &box_dir);
-                if let Some(run_dir) = box_dir.parent() {
-                    let _ = std::fs::remove_dir_all(run_dir);
-                }
-            }
+            let work_dir = authorized_exe.parent().unwrap_or(base_dir);
+            prewarm_binary(&authorized_exe, work_dir);
         }
     }
 
