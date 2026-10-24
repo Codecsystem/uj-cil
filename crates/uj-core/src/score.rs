@@ -58,7 +58,15 @@ mod tests {
 
     #[test]
     fn test_roundtrip_is_lossless_for_weights() {
-        for w in [0u64, 1, 333_333, 33_333_333, 100_000_000, 142_857_143, 8_333_334] {
+        for w in [
+            0u64,
+            1,
+            333_333,
+            33_333_333,
+            100_000_000,
+            142_857_143,
+            8_333_334,
+        ] {
             assert_eq!(score_to_fixed(fixed_to_score(w)), w);
         }
     }

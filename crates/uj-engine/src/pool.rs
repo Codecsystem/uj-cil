@@ -18,9 +18,49 @@ use uj_sandbox::{CancelToken, SlotBoxGuard, create_sandbox};
 
 use crate::budget::{MemoryBudget, task_memory_cost};
 use crate::context::{SubmissionContext, run_one_test};
-use crate::judge::aggregate_submission_report;
+use crate::judge::{aggregate_submission_report, topological_subtask_order};
 use crate::scheduler::SchedulerError;
 use crate::topology::Topology;
+use uj_core::score::score_to_fixed;
+
+#[cfg(test)]
+static TEST_PANIC_ON_TEST_NAME: std::sync::LazyLock<parking_lot::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+/// Decide whether a precise-rejudge rerun should replace `best_so_far`.
+///
+/// Rules:
+/// 1. Never accept a rerun with `Verdict::JudgeFailed` or `Verdict::Skipped`.
+/// 2. Only allow changing the verdict class when `original_verdict == Verdict::TimeLimitExceeded`
+///    (to rescue false TLEs caused by parallel contention). Otherwise the rerun must keep the
+///    same verdict as `best_so_far`.
+/// 3. Accept when the rerun rescues a `TimeLimitExceeded` into a non-TLE verdict, or when it
+///    achieves a strictly lower CPU time within the compatible verdict class.
+pub(crate) fn should_accept_precise_rerun(
+    original_verdict: Verdict,
+    best_so_far: &SingleTestResult,
+    rerun: &SingleTestResult,
+) -> bool {
+    if matches!(rerun.verdict, Verdict::JudgeFailed | Verdict::Skipped) {
+        return false;
+    }
+    let verdict_compatible =
+        rerun.verdict == best_so_far.verdict || original_verdict == Verdict::TimeLimitExceeded;
+    if !verdict_compatible {
+        return false;
+    }
+    if best_so_far.verdict == Verdict::TimeLimitExceeded
+        && rerun.verdict != Verdict::TimeLimitExceeded
+    {
+        return true;
+    }
+    if best_so_far.verdict != Verdict::TimeLimitExceeded
+        && rerun.verdict == Verdict::TimeLimitExceeded
+    {
+        return false;
+    }
+    rerun.time_ms < best_so_far.time_ms
+}
 
 /// Submission submitted to the global judging pool.
 pub struct PoolSubmission {
@@ -351,16 +391,44 @@ impl JudgePool {
                         .get(&sub.problem.problem_id)
                         .map(|b| b.box_dir.as_path());
 
-                    let res = run_one_test(
-                        sb.as_ref(),
-                        &sub,
-                        &test,
-                        cpu_core,
-                        custom_box_ref,
-                        &cancel_clone,
-                    );
+                    let run_outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(test)]
+                            if let Some(ref target) = *TEST_PANIC_ON_TEST_NAME.lock()
+                                && &test.name == target
+                            {
+                                panic!("Injected worker panic on test {}", test.name);
+                            }
+                            run_one_test(
+                                sb.as_ref(),
+                                &sub,
+                                &test,
+                                cpu_core,
+                                custom_box_ref,
+                                &cancel_clone,
+                            )
+                        }));
 
                     drop(lease);
+
+                    let res = match run_outcome {
+                        Ok(r) => r,
+                        Err(panic_payload) => {
+                            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            SingleTestResult::synthetic(
+                                &test,
+                                Verdict::JudgeFailed,
+                                Some(format!("Worker panic during test execution: {panic_msg}")),
+                                Some(sb.tier()),
+                            )
+                        }
+                    };
 
                     if let Some(st_id) = test.subtask_id
                         && (sub.problem.has_depends || sub.fail_fast)
@@ -478,6 +546,7 @@ impl JudgePool {
                 let _ = done_tx.send(sub_id);
 
                 if let Some(p_sub) = prepared_subs.iter().find(|p| p.sub.submission_id == sub_id)
+                    && !cancel.is_cancelled()
                     && (!p_sub.precise
                         || p_sub.sub.problem.config.problem_type == ProblemType::OutputOnly)
                 {
@@ -494,6 +563,10 @@ impl JudgePool {
             }
         }
 
+        // Drop done_tx before joining admission_handle so admission exits immediately on disconnect
+        // even if a worker aborted or was cancelled before all submissions completed.
+        drop(done_tx);
+
         // Wait for admission thread and workers
         let _ = admission_handle.join();
 
@@ -509,6 +582,16 @@ impl JudgePool {
             }
             let mut test_results = results_by_sub.remove(&sub_id).unwrap_or_default();
             let exp_count = *expected_tests_count.get(&sub_id).unwrap_or(&0);
+
+            if cancel.is_cancelled() || test_results.len() < exp_count {
+                final_reports.insert(
+                    sub_id,
+                    Err(SchedulerError::Sandbox(
+                        "Judge execution was interrupted before completion".to_string(),
+                    )),
+                );
+                continue;
+            }
 
             let all_failed_init = !test_results.is_empty()
                 && test_results.iter().all(|r| {
@@ -538,10 +621,7 @@ impl JudgePool {
 
             test_results.sort_by(|a, b| uj_core::tests::natural_cmp(&a.id, &b.id));
 
-            if p_sub.precise
-                && !cancel.is_cancelled()
-                && p_sub.sub.problem.config.problem_type != ProblemType::OutputOnly
-            {
+            if p_sub.precise && p_sub.sub.problem.config.problem_type != ProblemType::OutputOnly {
                 deferred_precise.push((p_sub, test_results));
             } else {
                 let report = aggregate_and_dispatch(
@@ -560,13 +640,12 @@ impl JudgePool {
 
             for (p_sub, mut test_results) in deferred_precise {
                 if cancel.is_cancelled() {
-                    let report = aggregate_and_dispatch(
-                        &p_sub.sub,
-                        test_results,
-                        p_sub.event_tx.as_ref(),
-                        self.opts.pool_events.as_ref(),
+                    final_reports.insert(
+                        p_sub.sub.submission_id,
+                        Err(SchedulerError::Sandbox(
+                            "Judge execution was interrupted before completion".to_string(),
+                        )),
                     );
-                    final_reports.insert(p_sub.sub.submission_id, Ok(report));
                     continue;
                 }
 
@@ -577,6 +656,9 @@ impl JudgePool {
 
                 let mut candidate_indices = Vec::new();
                 for (idx, tr) in test_results.iter().enumerate() {
+                    if matches!(tr.verdict, Verdict::JudgeFailed | Verdict::Skipped) {
+                        continue;
+                    }
                     let is_borderline = tr.time_ms >= lower_bound && tr.time_ms <= upper_bound;
                     let is_borderline_tle =
                         tr.verdict == Verdict::TimeLimitExceeded && tr.time_ms < upper_bound;
@@ -632,12 +714,14 @@ impl JudgePool {
                         let rejudge_slot_box =
                             uj_sandbox::create_slot_box_dir(&p_sub.sub.base_dir_path, 9999).ok();
                         let rejudge_box = rejudge_slot_box.as_ref().map(|sb| sb.box_dir.as_path());
+                        let mut any_tle_flipped_to_ac = false;
 
                         for &idx in &candidate_indices {
                             if cancel.is_cancelled() {
                                 break;
                             }
 
+                            let orig_verdict = test_results[idx].verdict;
                             let target_test_id = test_results[idx].id.clone();
                             let Some(orig_test) =
                                 p_sub.sub.tests.iter().find(|t| t.name == target_test_id)
@@ -647,7 +731,7 @@ impl JudgePool {
 
                             let start_ev = JudgeEvent::TestStart {
                                 id: target_test_id.clone(),
-                                subtask: None,
+                                subtask: orig_test.subtask_id,
                                 slot: Some(0),
                             };
                             let warn_ev = JudgeEvent::Warning {
@@ -693,8 +777,11 @@ impl JudgePool {
                                     rejudge_box,
                                     cancel,
                                 );
-                                samples.push(rerun.time_ms);
-                                if rerun.time_ms < best_result.time_ms {
+                                if !matches!(rerun.verdict, Verdict::JudgeFailed | Verdict::Skipped)
+                                {
+                                    samples.push(rerun.time_ms);
+                                }
+                                if should_accept_precise_rerun(orig_verdict, &best_result, &rerun) {
                                     best_result = rerun;
                                 }
                             }
@@ -711,6 +798,12 @@ impl JudgePool {
 
                             best_result.timing.rejudged = true;
                             best_result.timing.confidence = confidence;
+                            best_result.timing.samples_ms = samples;
+                            if orig_verdict == Verdict::TimeLimitExceeded
+                                && best_result.verdict == Verdict::Accepted
+                            {
+                                any_tle_flipped_to_ac = true;
+                            }
                             test_results[idx] = best_result.clone();
 
                             let done_ev = JudgeEvent::TestDone(best_result);
@@ -729,7 +822,34 @@ impl JudgePool {
                                 });
                             }
                         }
+
+                        // If a TLE flipped to Accepted, re-run any Skipped tests whose subtask
+                        // dependencies (or same-subtask fail-fast conditions) are now satisfied.
+                        if any_tle_flipped_to_ac
+                            && !cancel.is_cancelled()
+                            && test_results.iter().any(|r| r.verdict == Verdict::Skipped)
+                        {
+                            rerun_unblocked_skipped_tests(
+                                p_sub,
+                                &mut test_results,
+                                exclusive_sandbox.as_ref(),
+                                exclusive_cpu,
+                                rejudge_box,
+                                self.opts.pool_events.as_ref(),
+                                cancel,
+                            );
+                        }
                     }
+                }
+
+                if cancel.is_cancelled() {
+                    final_reports.insert(
+                        p_sub.sub.submission_id,
+                        Err(SchedulerError::Sandbox(
+                            "Judge execution was interrupted before completion".to_string(),
+                        )),
+                    );
+                    continue;
                 }
 
                 let report = aggregate_and_dispatch(
@@ -755,6 +875,151 @@ impl JudgePool {
                     })
             })
             .collect()
+    }
+}
+
+fn rerun_unblocked_skipped_tests(
+    p_sub: &PreparedSub,
+    test_results: &mut [SingleTestResult],
+    exclusive_sandbox: &dyn uj_sandbox::Sandbox,
+    exclusive_cpu: Option<usize>,
+    rejudge_box: Option<&std::path::Path>,
+    pool_events: Option<&Sender<PoolEvent>>,
+    cancel: &CancelToken,
+) {
+    let config = &p_sub.sub.problem.config;
+    if config.subtasks.is_empty() {
+        if !p_sub.sub.fail_fast {
+            return;
+        }
+        let mut any_failed = test_results
+            .iter()
+            .any(|r| r.verdict != Verdict::Skipped && !r.verdict.is_accepted());
+        if any_failed {
+            return;
+        }
+        for tr in test_results.iter_mut() {
+            if cancel.is_cancelled() || any_failed {
+                break;
+            }
+            if tr.verdict != Verdict::Skipped {
+                continue;
+            }
+            let Some(orig_test) = p_sub.sub.tests.iter().find(|t| t.name == tr.id) else {
+                continue;
+            };
+            let fresh = run_one_test(
+                exclusive_sandbox,
+                &p_sub.sub,
+                orig_test,
+                exclusive_cpu,
+                rejudge_box,
+                cancel,
+            );
+            if !fresh.verdict.is_accepted() {
+                any_failed = true;
+            }
+            *tr = fresh.clone();
+            if let Some(ref tx) = p_sub.event_tx {
+                let _ = tx.send(JudgeEvent::TestDone(fresh.clone()));
+            }
+            if let Some(ptx) = pool_events {
+                let _ = ptx.send(PoolEvent {
+                    submission: SubmissionRef {
+                        id: p_sub.sub.submission_id,
+                        problem: config.name.clone(),
+                        name: p_sub.sub.submission_name.clone(),
+                    },
+                    inner: JudgeEvent::TestDone(fresh),
+                });
+            }
+        }
+        return;
+    }
+
+    let topo = topological_subtask_order(&config.subtasks);
+    let mut subtask_passed: HashMap<u32, bool> = HashMap::new();
+
+    for &st_idx in &topo {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let st_cfg = &config.subtasks[st_idx];
+        let deps_ok = st_cfg
+            .depends
+            .iter()
+            .all(|dep_id| subtask_passed.get(dep_id).copied().unwrap_or(false));
+        if !deps_ok {
+            subtask_passed.insert(st_cfg.id, false);
+            continue;
+        }
+
+        let mut st_failed = test_results.iter().any(|r| {
+            r.subtask == Some(st_cfg.id)
+                && r.verdict != Verdict::Skipped
+                && !r.verdict.is_accepted()
+        });
+
+        for tr in test_results.iter_mut() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if tr.subtask != Some(st_cfg.id) || tr.verdict != Verdict::Skipped {
+                continue;
+            }
+            if p_sub.sub.fail_fast && st_failed {
+                break;
+            }
+            let Some(orig_test) = p_sub.sub.tests.iter().find(|t| t.name == tr.id) else {
+                continue;
+            };
+            let fresh = run_one_test(
+                exclusive_sandbox,
+                &p_sub.sub,
+                orig_test,
+                exclusive_cpu,
+                rejudge_box,
+                cancel,
+            );
+            if !fresh.verdict.is_accepted() {
+                st_failed = true;
+            }
+            *tr = fresh.clone();
+            if let Some(ref tx) = p_sub.event_tx {
+                let _ = tx.send(JudgeEvent::TestDone(fresh.clone()));
+            }
+            if let Some(ptx) = pool_events {
+                let _ = ptx.send(PoolEvent {
+                    submission: SubmissionRef {
+                        id: p_sub.sub.submission_id,
+                        problem: config.name.clone(),
+                        name: p_sub.sub.submission_name.clone(),
+                    },
+                    inner: JudgeEvent::TestDone(fresh),
+                });
+            }
+        }
+
+        let st_max_fixed = score_to_fixed(st_cfg.score);
+        let all_ac = test_results
+            .iter()
+            .filter(|r| r.subtask == Some(st_cfg.id))
+            .all(|r| r.verdict == Verdict::Accepted);
+        let earned_fixed: u64 = match st_cfg.scoring {
+            uj_core::config::ScoringType::Min => test_results
+                .iter()
+                .filter(|r| r.subtask == Some(st_cfg.id))
+                .map(|r| score_to_fixed(r.score).min(st_max_fixed))
+                .min()
+                .unwrap_or(0),
+            uj_core::config::ScoringType::Sum => test_results
+                .iter()
+                .filter(|r| r.subtask == Some(st_cfg.id))
+                .map(|r| score_to_fixed(r.score))
+                .fold(0u64, u64::saturating_add)
+                .min(st_max_fixed),
+        };
+        subtask_passed.insert(st_cfg.id, all_ac && earned_fixed >= st_max_fixed);
     }
 }
 
@@ -1308,6 +1573,161 @@ int main() {
             t2.verdict,
             Verdict::Skipped,
             "Dependent subtask 2 test should be Skipped when subtask 1 fails"
+        );
+    }
+
+    #[test]
+    fn test_pool_worker_panic_recovery_no_hang() {
+        let (_tmp, aplusb_dir) = temp_aplusb();
+        let p_toml = aplusb_dir.join("problem.toml");
+        let p_content = fs::read_to_string(&p_toml).unwrap();
+        let cfg = ProblemConfig::from_toml_str(&p_content, Some(&p_toml)).unwrap();
+
+        let session = crate::compiler::CompileSession::new();
+        let sol_ac = aplusb_dir.join("solutions").join("ac.cpp");
+        let comp_ac = session.compile(&sol_ac, false).unwrap();
+
+        let p_ctx = Arc::new(ProblemContext::prepare(0, &aplusb_dir, &cfg, &session).unwrap());
+        let tests = uj_core::tests::discover_tests(&aplusb_dir, &cfg).unwrap();
+        let target_test_name = tests[0].name.clone();
+
+        *TEST_PANIC_ON_TEST_NAME.lock() = Some(target_test_name.clone());
+
+        let sub = Arc::new(
+            SubmissionContext::prepare(1, "panic_sub", p_ctx, &comp_ac, tests, false).unwrap(),
+        );
+        let pool = JudgePool::new(PoolOptions {
+            sandbox_mode: "none".to_string(),
+            require_tier: false,
+            slots: 2,
+            window: 1,
+            memory_budget: 1024 * 1024 * 1024,
+            pool_events: None,
+        });
+
+        let cancel = CancelToken::new();
+        let reports = pool.run(
+            vec![PoolSubmission {
+                ctx: sub,
+                events: None,
+                precise: false,
+            }],
+            &cancel,
+        );
+
+        *TEST_PANIC_ON_TEST_NAME.lock() = None;
+
+        let rep = reports[0].as_ref().unwrap();
+        assert_eq!(rep.verdict, Verdict::JudgeFailed);
+        let panicked_test = rep
+            .tests
+            .iter()
+            .find(|t| t.id == target_test_name)
+            .expect("panicked test should have a synthetic result");
+        assert_eq!(panicked_test.verdict, Verdict::JudgeFailed);
+        assert!(
+            panicked_test
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("Worker panic"))
+        );
+    }
+
+    #[test]
+    fn test_precise_rejudge_ignores_judge_failed_and_preserves_verdict_class() {
+        let tc = TestCase {
+            name: "1".to_string(),
+            input_path: PathBuf::from("1.in"),
+            answer_path: Some(PathBuf::from("1.ans")),
+            subtask_id: None,
+            weight: 100_000_000,
+        };
+        let mut orig_ac = SingleTestResult::synthetic(&tc, Verdict::Accepted, None, None);
+        orig_ac.time_ms = 950;
+        orig_ac.score = 100.0;
+
+        // A fast JudgeFailed rerun must NEVER overwrite an Accepted result!
+        let mut jf_rerun = SingleTestResult::synthetic(
+            &tc,
+            Verdict::JudgeFailed,
+            Some("transient error".to_string()),
+            None,
+        );
+        jf_rerun.time_ms = 1;
+        assert!(!should_accept_precise_rerun(
+            Verdict::Accepted,
+            &orig_ac,
+            &jf_rerun
+        ));
+
+        // A fast WrongAnswer rerun must not flip an originally Accepted result to WrongAnswer
+        let mut wa_rerun = SingleTestResult::synthetic(&tc, Verdict::WrongAnswer, None, None);
+        wa_rerun.time_ms = 10;
+        assert!(!should_accept_precise_rerun(
+            Verdict::Accepted,
+            &orig_ac,
+            &wa_rerun
+        ));
+
+        // A faster Accepted rerun IS accepted when original was Accepted
+        let mut faster_ac = orig_ac.clone();
+        faster_ac.time_ms = 800;
+        assert!(should_accept_precise_rerun(
+            Verdict::Accepted,
+            &orig_ac,
+            &faster_ac
+        ));
+
+        // A borderline TLE CAN be rescued by a clean Accepted rerun in the exclusive slot
+        let mut orig_tle = SingleTestResult::synthetic(&tc, Verdict::TimeLimitExceeded, None, None);
+        orig_tle.time_ms = 1050;
+        assert!(should_accept_precise_rerun(
+            Verdict::TimeLimitExceeded,
+            &orig_tle,
+            &faster_ac
+        ));
+    }
+
+    #[test]
+    fn test_pool_cancel_returns_err_not_partial_ok() {
+        let (_tmp, aplusb_dir) = temp_aplusb();
+        let p_toml = aplusb_dir.join("problem.toml");
+        let p_content = fs::read_to_string(&p_toml).unwrap();
+        let cfg = ProblemConfig::from_toml_str(&p_content, Some(&p_toml)).unwrap();
+
+        let session = crate::compiler::CompileSession::new();
+        let sol_ac = aplusb_dir.join("solutions").join("ac.cpp");
+        let comp_ac = session.compile(&sol_ac, false).unwrap();
+
+        let p_ctx = Arc::new(ProblemContext::prepare(0, &aplusb_dir, &cfg, &session).unwrap());
+        let tests = uj_core::tests::discover_tests(&aplusb_dir, &cfg).unwrap();
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let sub = Arc::new(
+            SubmissionContext::prepare(1, "cancel_sub", p_ctx, &comp_ac, tests, false).unwrap(),
+        );
+        let pool = JudgePool::new(PoolOptions {
+            sandbox_mode: "none".to_string(),
+            require_tier: false,
+            slots: 2,
+            window: 1,
+            memory_budget: 1024 * 1024 * 1024,
+            pool_events: None,
+        });
+
+        let reports = pool.run(
+            vec![PoolSubmission {
+                ctx: sub,
+                events: None,
+                precise: false,
+            }],
+            &cancel,
+        );
+        assert!(
+            reports[0].is_err(),
+            "Cancelled run must return Err instead of partial Ok report"
         );
     }
 }

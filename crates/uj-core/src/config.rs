@@ -321,6 +321,11 @@ impl ProblemConfig {
 
     /// Convert limits to core Limits.
     pub fn to_limits(&self) -> Result<Limits, ConfigErrorInfo> {
+        const MAX_CPU_TIME_MS: u64 = 3_600_000; // 1 hour
+        const MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
+        const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+        const MAX_STDERR_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
         let cpu_ms = parse_time_ms(&self.limits.time).map_err(|msg| ConfigErrorInfo {
             kind: "ConfigError".to_string(),
             message: format!("Invalid time limit '{}': {msg}", self.limits.time),
@@ -329,6 +334,19 @@ impl ProblemConfig {
             line: None,
             column: None,
         })?;
+        if cpu_ms == 0 || cpu_ms > MAX_CPU_TIME_MS {
+            return Err(ConfigErrorInfo {
+                kind: "ConfigError".to_string(),
+                message: format!(
+                    "Invalid time limit '{}': must be between 1ms and 3600s (got {cpu_ms}ms)",
+                    self.limits.time
+                ),
+                hint: Some("Specify a positive time limit up to 3600s (e.g. '1s')".to_string()),
+                path: None,
+                line: None,
+                column: None,
+            });
+        }
 
         let mem_bytes = parse_bytes(&self.limits.memory).map_err(|msg| ConfigErrorInfo {
             kind: "ConfigError".to_string(),
@@ -338,42 +356,94 @@ impl ProblemConfig {
             line: None,
             column: None,
         })?;
+        if mem_bytes == 0 || mem_bytes > MAX_MEMORY_BYTES {
+            return Err(ConfigErrorInfo {
+                kind: "ConfigError".to_string(),
+                message: format!(
+                    "Invalid memory limit '{}': must be > 0 and <= 64GiB",
+                    self.limits.memory
+                ),
+                hint: Some("Specify a positive memory limit (e.g. '256MiB')".to_string()),
+                path: None,
+                line: None,
+                column: None,
+            });
+        }
 
         let stack_bytes = match &self.limits.stack {
             Some(s) if s.eq_ignore_ascii_case("same") => None,
             Some(s) if s.eq_ignore_ascii_case("unlimited") => None,
-            Some(s) => Some(parse_bytes(s).map_err(|msg| ConfigErrorInfo {
-                kind: "ConfigError".to_string(),
-                message: format!("Invalid stack limit '{s}': {msg}"),
-                hint: Some("'same', 'unlimited', or '<num>MiB'".to_string()),
-                path: None,
-                line: None,
-                column: None,
-            })?),
+            Some(s) => {
+                let b = parse_bytes(s).map_err(|msg| ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!("Invalid stack limit '{s}': {msg}"),
+                    hint: Some("'same', 'unlimited', or '<num>MiB'".to_string()),
+                    path: None,
+                    line: None,
+                    column: None,
+                })?;
+                if b == 0 || b > MAX_MEMORY_BYTES {
+                    return Err(ConfigErrorInfo {
+                        kind: "ConfigError".to_string(),
+                        message: format!("Invalid stack limit '{s}': must be > 0 and <= 64GiB"),
+                        hint: Some("'same', 'unlimited', or '<num>MiB'".to_string()),
+                        path: None,
+                        line: None,
+                        column: None,
+                    });
+                }
+                Some(b)
+            }
             None => None,
         };
 
         let output_bytes = match &self.limits.output {
-            Some(s) => parse_bytes(s).map_err(|msg| ConfigErrorInfo {
-                kind: "ConfigError".to_string(),
-                message: format!("Invalid output limit '{s}': {msg}"),
-                hint: Some("Format: '<num>MiB' or '<num>KiB'".to_string()),
-                path: None,
-                line: None,
-                column: None,
-            })?,
+            Some(s) => {
+                let b = parse_bytes(s).map_err(|msg| ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!("Invalid output limit '{s}': {msg}"),
+                    hint: Some("Format: '<num>MiB' or '<num>KiB'".to_string()),
+                    path: None,
+                    line: None,
+                    column: None,
+                })?;
+                if b == 0 || b > MAX_OUTPUT_BYTES {
+                    return Err(ConfigErrorInfo {
+                        kind: "ConfigError".to_string(),
+                        message: format!("Invalid output limit '{s}': must be > 0 and <= 4GiB"),
+                        hint: Some("Format: '<num>MiB' or '<num>KiB'".to_string()),
+                        path: None,
+                        line: None,
+                        column: None,
+                    });
+                }
+                b
+            }
             None => Limits::DEFAULT_OUTPUT_BYTES,
         };
 
         let stderr_bytes = match &self.limits.stderr {
-            Some(s) => parse_bytes(s).map_err(|msg| ConfigErrorInfo {
-                kind: "ConfigError".to_string(),
-                message: format!("Invalid stderr limit '{s}': {msg}"),
-                hint: Some("Format: '<num>KiB'".to_string()),
-                path: None,
-                line: None,
-                column: None,
-            })?,
+            Some(s) => {
+                let b = parse_bytes(s).map_err(|msg| ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!("Invalid stderr limit '{s}': {msg}"),
+                    hint: Some("Format: '<num>KiB'".to_string()),
+                    path: None,
+                    line: None,
+                    column: None,
+                })?;
+                if b == 0 || b > MAX_STDERR_BYTES {
+                    return Err(ConfigErrorInfo {
+                        kind: "ConfigError".to_string(),
+                        message: format!("Invalid stderr limit '{s}': must be > 0 and <= 256MiB"),
+                        hint: Some("Format: '<num>KiB'".to_string()),
+                        path: None,
+                        line: None,
+                        column: None,
+                    });
+                }
+                b
+            }
             None => Limits::DEFAULT_STDERR_BYTES,
         };
 
@@ -382,6 +452,16 @@ impl ProblemConfig {
         lim.output_bytes = output_bytes;
         lim.stderr_bytes = stderr_bytes;
         if let Some(p) = self.limits.max_processes {
+            if p == 0 {
+                return Err(ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: "Invalid max_processes '0': must be >= 1".to_string(),
+                    hint: Some("Specify `max_processes = 1` or higher".to_string()),
+                    path: None,
+                    line: None,
+                    column: None,
+                });
+            }
             lim.max_processes = p;
         }
 
@@ -457,8 +537,28 @@ impl ProblemConfig {
             }
         }
 
+        // Validate limits early at config load/validation time
+        self.to_limits().map_err(|mut e| {
+            if e.path.is_none() {
+                e.path = path_str.clone();
+            }
+            e
+        })?;
+
         // Path safety check (prevent escaping problem directory via .. or absolute paths)
         let check_path_safe = |p: &Path, field: &str| -> Result<(), ConfigErrorInfo> {
+            if p.as_os_str().is_empty() {
+                return Err(ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!("Field '{field}' must not be empty"),
+                    hint: Some(
+                        "Specify a valid relative path inside the problem directory".to_string(),
+                    ),
+                    path: path_str.clone(),
+                    line: None,
+                    column: None,
+                });
+            }
             for comp in p.components() {
                 if matches!(
                     comp,
@@ -483,6 +583,51 @@ impl ProblemConfig {
             }
             Ok(())
         };
+
+        // Single-component filename check for io.input_name / io.output_name
+        let check_single_filename = |name: &str, field: &str| -> Result<(), ConfigErrorInfo> {
+            let trimmed = name.trim();
+            if trimmed.is_empty()
+                || trimmed.contains('/')
+                || trimmed.contains('\\')
+                || trimmed == "."
+                || trimmed == ".."
+            {
+                return Err(ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!(
+                        "Field '{field}' contains forbidden path traversal or separator: '{name}'"
+                    ),
+                    hint: Some("Specify a single plain filename such as \"input.txt\"".to_string()),
+                    path: path_str.clone(),
+                    line: None,
+                    column: None,
+                });
+            }
+            let p = Path::new(trimmed);
+            let mut comps = p.components();
+            match (comps.next(), comps.next()) {
+                (Some(std::path::Component::Normal(_)), None) => Ok(()),
+                _ => Err(ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!(
+                        "Field '{field}' must be a single relative filename component: '{name}'"
+                    ),
+                    hint: Some("Specify a single plain filename such as \"input.txt\"".to_string()),
+                    path: path_str.clone(),
+                    line: None,
+                    column: None,
+                }),
+            }
+        };
+
+        if let Some(ref in_name) = self.io.input_name {
+            check_single_filename(in_name, "io.input_name")?;
+        }
+        if let Some(ref out_name) = self.io.output_name {
+            check_single_filename(out_name, "io.output_name")?;
+        }
+        check_path_safe(&self.tests.dir, "tests.dir")?;
         if let Some(ref p) = self.interactor {
             check_path_safe(p, "interactor")?;
         }
@@ -543,6 +688,87 @@ impl ProblemConfig {
                     line: None,
                     column: None,
                 });
+            }
+            if sub.tests.is_empty() {
+                return Err(ConfigErrorInfo {
+                    kind: "ConfigError".to_string(),
+                    message: format!(
+                        "Subtask {} has no test patterns specified ('tests' must not be empty)",
+                        sub.id
+                    ),
+                    hint: Some(
+                        "Specify at least one test pattern, e.g. `tests = [\"1-10\"]`".to_string(),
+                    ),
+                    path: path_str.clone(),
+                    line: None,
+                    column: None,
+                });
+            }
+            for pat in &sub.tests {
+                if let Err(err_msg) = crate::tests::validate_subtask_pattern(pat) {
+                    return Err(ConfigErrorInfo {
+                        kind: "ConfigError".to_string(),
+                        message: format!("Subtask {} has {err_msg}", sub.id),
+                        hint: Some(
+                            "Valid patterns: numeric range '1-10' (start <= end), glob 'sample*', regex 're:^1_', or exact name".to_string(),
+                        ),
+                        path: path_str.clone(),
+                        line: None,
+                        column: None,
+                    });
+                }
+            }
+        }
+
+        // Reject static pattern overlaps across subtasks (identical patterns or overlapping numeric ranges/stems)
+        if self.subtasks.len() > 1 {
+            let parse_num_interval = |pat: &str| -> Option<(u64, u64)> {
+                let p = pat.trim();
+                if let Ok(v) = p.parse::<u64>() {
+                    return Some((v, v));
+                }
+                if let Some((s, e)) = p.split_once('-')
+                    && let (Ok(start), Ok(end)) = (s.trim().parse::<u64>(), e.trim().parse::<u64>())
+                    && start <= end
+                {
+                    return Some((start, end));
+                }
+                None
+            };
+
+            for (i, sub_a) in self.subtasks.iter().enumerate() {
+                for sub_b in &self.subtasks[i + 1..] {
+                    for pat_a in &sub_a.tests {
+                        let trim_a = pat_a.trim();
+                        let range_a = parse_num_interval(trim_a);
+                        for pat_b in &sub_b.tests {
+                            let trim_b = pat_b.trim();
+                            let range_b = parse_num_interval(trim_b);
+                            let overlaps = if trim_a == trim_b {
+                                true
+                            } else if let (Some((sa, ea)), Some((sb, eb))) = (range_a, range_b) {
+                                sa <= eb && sb <= ea
+                            } else {
+                                false
+                            };
+                            if overlaps {
+                                return Err(ConfigErrorInfo {
+                                    kind: "ConfigError".to_string(),
+                                    message: format!(
+                                        "Subtask {} pattern '{}' overlaps with subtask {} pattern '{}'",
+                                        sub_a.id, trim_a, sub_b.id, trim_b
+                                    ),
+                                    hint: Some(
+                                        "Each test case must belong to a single subtask; use `depends = [...]` to model subtask dependencies".to_string(),
+                                    ),
+                                    path: path_str.clone(),
+                                    line: None,
+                                    column: None,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -657,6 +883,17 @@ fn dfs_cycle(
     false
 }
 
+/// Strip an ASCII suffix case-insensitively without allocating or slicing across multi-byte UTF-8 chars.
+fn strip_ascii_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    if s.len() >= suffix.len() && s.is_char_boundary(s.len() - suffix.len()) {
+        let (head, tail) = s.split_at(s.len() - suffix.len());
+        if tail.eq_ignore_ascii_case(suffix) {
+            return Some(head);
+        }
+    }
+    None
+}
+
 /// Parse time string like "1s", "500ms", "1.5s", "1000" into milliseconds.
 pub fn parse_time_ms(s: &str) -> Result<u64, String> {
     let trimmed = s.trim();
@@ -664,17 +901,11 @@ pub fn parse_time_ms(s: &str) -> Result<u64, String> {
         return Err("empty time string".to_string());
     }
 
-    if let Some(rest) = trimmed
-        .strip_suffix("ms")
-        .or_else(|| trimmed.strip_suffix("MS"))
-    {
+    if let Some(rest) = strip_ascii_suffix_ci(trimmed, "ms") {
         rest.trim()
             .parse::<u64>()
             .map_err(|e| format!("invalid integer ms: {e}"))
-    } else if let Some(rest) = trimmed
-        .strip_suffix('s')
-        .or_else(|| trimmed.strip_suffix('S'))
-    {
+    } else if let Some(rest) = strip_ascii_suffix_ci(trimmed, "s") {
         let secs = rest
             .trim()
             .parse::<f64>()
@@ -682,7 +913,11 @@ pub fn parse_time_ms(s: &str) -> Result<u64, String> {
         if !secs.is_finite() || secs < 0.0 {
             return Err("time must be a non-negative finite number".to_string());
         }
-        Ok((secs * 1000.0).round() as u64)
+        let ms = (secs * 1000.0).round();
+        if !ms.is_finite() || ms >= (u64::MAX as f64) {
+            return Err("time limit overflows u64 milliseconds".to_string());
+        }
+        Ok(ms as u64)
     } else {
         trimmed
             .parse::<u64>()
@@ -697,21 +932,24 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
         return Err("empty byte string".to_string());
     }
 
-    let lower = trimmed.to_lowercase();
-    let (num_str, multiplier) = if lower.ends_with("gib") || lower.ends_with("gb") {
-        let base = if lower.ends_with("gib") { 3 } else { 2 };
-        (&trimmed[..trimmed.len() - base], 1024 * 1024 * 1024)
-    } else if lower.ends_with("mib") || lower.ends_with("mb") {
-        let base = if lower.ends_with("mib") { 3 } else { 2 };
-        (&trimmed[..trimmed.len() - base], 1024 * 1024)
-    } else if lower.ends_with("kib") || lower.ends_with("kb") {
-        let base = if lower.ends_with("kib") { 3 } else { 2 };
-        (&trimmed[..trimmed.len() - base], 1024)
-    } else if lower.ends_with('b') {
-        (&trimmed[..trimmed.len() - 1], 1)
-    } else {
-        (trimmed, 1)
-    };
+    let (num_str, multiplier): (&str, u64) =
+        if let Some(rest) = strip_ascii_suffix_ci(trimmed, "gib") {
+            (rest, 1024 * 1024 * 1024)
+        } else if let Some(rest) = strip_ascii_suffix_ci(trimmed, "gb") {
+            (rest, 1024 * 1024 * 1024)
+        } else if let Some(rest) = strip_ascii_suffix_ci(trimmed, "mib") {
+            (rest, 1024 * 1024)
+        } else if let Some(rest) = strip_ascii_suffix_ci(trimmed, "mb") {
+            (rest, 1024 * 1024)
+        } else if let Some(rest) = strip_ascii_suffix_ci(trimmed, "kib") {
+            (rest, 1024)
+        } else if let Some(rest) = strip_ascii_suffix_ci(trimmed, "kb") {
+            (rest, 1024)
+        } else if let Some(rest) = strip_ascii_suffix_ci(trimmed, "b") {
+            (rest, 1)
+        } else {
+            (trimmed, 1)
+        };
 
     let val = num_str
         .trim()
@@ -720,7 +958,11 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
     if !val.is_finite() || val < 0.0 {
         return Err("byte size must be a non-negative finite number".to_string());
     }
-    Ok((val * (multiplier as f64)).round() as u64)
+    let scaled = (val * (multiplier as f64)).round();
+    if !scaled.is_finite() || scaled >= (u64::MAX as f64) {
+        return Err("byte size overflows u64".to_string());
+    }
+    Ok(scaled as u64)
 }
 
 // ----------------------------------------------------------------------------
@@ -855,6 +1097,7 @@ tests = ["1-10"]
 id = 2
 score = 70.0
 scoring = "min"
+tests = ["11-50"]
 depends = [1]
 
 [[solutions]]
@@ -882,11 +1125,13 @@ memory = "256MiB"
 [[subtasks]]
 id = 1
 score = 50.0
+tests = ["1"]
 depends = [2]
 
 [[subtasks]]
 id = 2
 score = 50.0
+tests = ["2"]
 depends = [1]
 "#;
         let res = ProblemConfig::from_toml_str(sample, None);
@@ -922,6 +1167,7 @@ memory = "256MiB"
 [[subtasks]]
 id = 1
 score = -10.0
+tests = ["1"]
 "#;
         let res_neg = ProblemConfig::from_toml_str(sample_neg, None);
         assert!(res_neg.is_err());
@@ -1137,5 +1383,156 @@ allow_verdicts = ["WA", "TLE"]
             serde_json::to_string(&SolutionTag::WrongAnswerOrTimeLimit).unwrap(),
             "\"wrong_answer_or_time_limit\""
         );
+    }
+
+    #[test]
+    fn test_parse_bytes_unicode_no_panic() {
+        // U+212A (Kelvin sign) lowercases to 'k' (1 byte vs 3 bytes in UTF-8).
+        assert!(parse_bytes("1\u{212A}B").is_err());
+        // U+0130 ('İ') lowercases to "i\u{307}" (2 bytes vs 3 bytes in UTF-8).
+        assert!(parse_bytes("1\u{0130}B").is_err());
+        assert!(parse_time_ms("1\u{212A}s").is_err());
+    }
+
+    #[test]
+    fn test_limits_validation_in_from_toml_str() {
+        // Zero time limit must be rejected during config validation
+        let zero_time = r#"
+name = "prob"
+[limits]
+time = "0s"
+memory = "256MiB"
+"#;
+        assert!(ProblemConfig::from_toml_str(zero_time, None).is_err());
+
+        // Huge time limit must be rejected
+        let huge_time = r#"
+name = "prob"
+[limits]
+time = "1e300s"
+memory = "256MiB"
+"#;
+        assert!(ProblemConfig::from_toml_str(huge_time, None).is_err());
+
+        // Zero memory limit must be rejected
+        let zero_mem = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "0MiB"
+"#;
+        assert!(ProblemConfig::from_toml_str(zero_mem, None).is_err());
+
+        // Huge memory limit (> 64GiB) must be rejected
+        let huge_mem = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "128GiB"
+"#;
+        assert!(ProblemConfig::from_toml_str(huge_mem, None).is_err());
+    }
+
+    #[test]
+    fn test_io_filename_and_tests_dir_validation() {
+        let bad_input_name = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[io]
+mode = "file"
+input_name = "../secret.in"
+output_name = "out.txt"
+"#;
+        let err = ProblemConfig::from_toml_str(bad_input_name, None).unwrap_err();
+        assert!(err.message.contains("io.input_name"));
+
+        let bad_output_subdir = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[io]
+mode = "file"
+input_name = "in.txt"
+output_name = "sub/out.txt"
+"#;
+        let err = ProblemConfig::from_toml_str(bad_output_subdir, None).unwrap_err();
+        assert!(err.message.contains("io.output_name"));
+
+        let bad_tests_dir = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[tests]
+dir = "../../etc"
+"#;
+        let err = ProblemConfig::from_toml_str(bad_tests_dir, None).unwrap_err();
+        assert!(err.message.contains("tests.dir"));
+    }
+
+    #[test]
+    fn test_subtask_pattern_and_overlap_validation() {
+        // Empty tests list
+        let empty_tests = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[[subtasks]]
+id = 1
+score = 100.0
+tests = []
+"#;
+        let err = ProblemConfig::from_toml_str(empty_tests, None).unwrap_err();
+        assert!(err.message.contains("no test patterns specified"));
+
+        // Invalid regex pattern
+        let bad_regex = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[[subtasks]]
+id = 1
+score = 100.0
+tests = ["re:[a-z"]
+"#;
+        let err = ProblemConfig::from_toml_str(bad_regex, None).unwrap_err();
+        assert!(err.message.contains("invalid regex"));
+
+        // Reversed range
+        let reversed_range = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[[subtasks]]
+id = 1
+score = 100.0
+tests = ["10-1"]
+"#;
+        let err = ProblemConfig::from_toml_str(reversed_range, None).unwrap_err();
+        assert!(err.message.contains("start (10) > end (1)"));
+
+        // Overlapping numeric ranges across subtasks
+        let overlap_ranges = r#"
+name = "prob"
+[limits]
+time = "1s"
+memory = "256MiB"
+[[subtasks]]
+id = 1
+score = 50.0
+tests = ["1-5"]
+[[subtasks]]
+id = 2
+score = 50.0
+tests = ["5-10"]
+"#;
+        let err = ProblemConfig::from_toml_str(overlap_ranges, None).unwrap_err();
+        assert!(err.message.contains("overlaps with subtask"));
     }
 }
