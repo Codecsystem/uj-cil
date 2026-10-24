@@ -7,3 +7,5 @@ pub mod judge;
 pub mod pool;
 pub mod scheduler;
 pub mod topology;
+
+pub use judge::clear_answer_cache;

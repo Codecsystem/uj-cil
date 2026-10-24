@@ -1,4 +1,5 @@
 use crate::config::{ProblemConfig, ScoringType};
+use crate::score::{SCORE_SCALE, score_to_fixed};
 use globset::Glob;
 use regex::Regex;
 use std::cmp::Ordering;
@@ -77,6 +78,9 @@ pub fn get_input_file_size(path: &Path) -> u64 {
     }
     let sz = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if let Ok(mut guard) = input_size_cache().lock() {
+        if guard.len() >= 4096 {
+            guard.clear();
+        }
         guard.insert(path.to_path_buf(), sz);
     }
     sz
@@ -186,13 +190,17 @@ pub fn discover_tests(
 }
 
 /// Assign subtask IDs and weights to test cases based on problem configuration.
+///
+/// Subtask membership is resolved across all subtasks first, and per-test weights are
+/// computed from the final assigned membership so that overlapping patterns never leave a
+/// subtask's remaining test weights summing to less than its declared score.
 pub fn assign_subtasks_and_weights(cases: &mut [TestCase], config: &ProblemConfig) {
     if config.subtasks.is_empty() {
         // Default: Evenly distribute 100 points among all test cases.
         // Remainder is distributed to the first remainder cases.
         let n = cases.len();
         if n > 0 {
-            let total_fixed = 100 * 1_000_000u64;
+            let total_fixed = 100 * SCORE_SCALE;
             let base = total_fixed / (n as u64);
             let rem = total_fixed % (n as u64);
             for (idx, case) in cases.iter_mut().enumerate() {
@@ -200,24 +208,30 @@ pub fn assign_subtasks_and_weights(cases: &mut [TestCase], config: &ProblemConfi
             }
         }
     } else {
-        // Assign test cases to subtasks based on patterns
+        // Pass 1: Assign test cases to subtasks based on patterns.
         for sub in &config.subtasks {
             let pattern_set = PatternSet::compile(&sub.tests);
-            let sub_total_fixed = (sub.score * 1_000_000.0).round() as u64;
-            let mut matched_indices = Vec::new();
-
-            for (idx, case) in cases.iter().enumerate() {
+            for case in cases.iter_mut() {
                 if pattern_set.is_match(&case.name) {
-                    matched_indices.push(idx);
+                    case.subtask_id = Some(sub.id);
                 }
             }
+        }
 
-            let m = matched_indices.len();
+        // Pass 2: Compute weights after final subtask assignment.
+        for sub in &config.subtasks {
+            let sub_total_fixed = score_to_fixed(sub.score);
+            let assigned_indices: Vec<usize> = cases
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, c)| (c.subtask_id == Some(sub.id)).then_some(idx))
+                .collect();
+
+            let m = assigned_indices.len();
             if m > 0 {
                 let base = sub_total_fixed / (m as u64);
                 let rem = sub_total_fixed % (m as u64);
-                for (rank, &idx) in matched_indices.iter().enumerate() {
-                    cases[idx].subtask_id = Some(sub.id);
+                for (rank, &idx) in assigned_indices.iter().enumerate() {
                     if sub.scoring == ScoringType::Sum {
                         cases[idx].weight = base + if (rank as u64) < rem { 1 } else { 0 };
                     } else {
@@ -228,6 +242,35 @@ pub fn assign_subtasks_and_weights(cases: &mut [TestCase], config: &ProblemConfi
             }
         }
     }
+}
+
+/// Validate a single subtask test pattern specification (`"1-10"`, `"re:..."`, glob, or exact).
+pub fn validate_subtask_pattern(raw: &str) -> Result<(), String> {
+    let pat = raw.trim();
+    if pat.is_empty() {
+        return Err("test pattern must not be empty".to_string());
+    }
+
+    if let Some(regex_str) = pat.strip_prefix("re:") {
+        if regex_str.is_empty() {
+            return Err("regex pattern after 're:' must not be empty".to_string());
+        }
+        Regex::new(regex_str).map_err(|e| format!("invalid regex pattern '{pat}': {e}"))?;
+        return Ok(());
+    }
+
+    if let Some((start_s, end_s)) = pat.split_once('-')
+        && let (Ok(start), Ok(end)) = (start_s.trim().parse::<u64>(), end_s.trim().parse::<u64>())
+    {
+        if start > end {
+            return Err(format!(
+                "invalid numeric range '{pat}': start ({start}) > end ({end})"
+            ));
+        }
+        return Ok(());
+    }
+
+    Ok(())
 }
 
 /// A parsed, reusable pattern for subtask test matching.
@@ -389,5 +432,91 @@ mod unit_tests {
         let bad_glob = vec!["[".to_string()];
         assert!(test_matches_patterns("[", &bad_glob));
         assert!(!test_matches_patterns("x", &bad_glob));
+    }
+
+    #[test]
+    fn test_weight_sum_exact_fixed_for_3_6_7_12_tests() {
+        use crate::score::{score_to_fixed, weighted_fixed};
+        let config = ProblemConfig::from_toml_str(
+            r#"
+name = "p"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#,
+            None,
+        )
+        .unwrap();
+        for count in [3usize, 6, 7, 12] {
+            let mut tests: Vec<TestCase> = (1..=count)
+                .map(|i| TestCase {
+                    name: format!("{i}"),
+                    input_path: PathBuf::from(format!("{i}.in")),
+                    answer_path: Some(PathBuf::from(format!("{i}.ans"))),
+                    subtask_id: None,
+                    weight: 0,
+                })
+                .collect();
+            assign_subtasks_and_weights(&mut tests, &config);
+            let total_fixed: u64 = tests.iter().map(|t| weighted_fixed(t.weight, 1.0)).sum();
+            assert_eq!(
+                total_fixed,
+                score_to_fixed(100.0),
+                "Expected exact 100.0 fixed-point sum for {count} tests, got {total_fixed}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_weights_computed_from_final_subtask_assignment() {
+        use crate::config::SubtaskConfig;
+        use crate::score::{score_to_fixed, weighted_fixed};
+
+        let mut tests: Vec<TestCase> = (1..=3)
+            .map(|i| TestCase {
+                name: format!("{i}"),
+                input_path: PathBuf::from(format!("{i}.in")),
+                answer_path: Some(PathBuf::from(format!("{i}.ans"))),
+                subtask_id: None,
+                weight: 0,
+            })
+            .collect();
+        let mut config = ProblemConfig::from_toml_str(
+            r#"
+name = "p"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#,
+            None,
+        )
+        .unwrap();
+        config.subtasks = vec![
+            SubtaskConfig {
+                id: 1,
+                score: 30.0,
+                scoring: ScoringType::Sum,
+                tests: vec!["*".to_string()],
+                depends: vec![],
+            },
+            SubtaskConfig {
+                id: 2,
+                score: 70.0,
+                scoring: ScoringType::Sum,
+                tests: vec!["3".to_string()],
+                depends: vec![],
+            },
+        ];
+        assign_subtasks_and_weights(&mut tests, &config);
+        // Tests 1 and 2 belong to subtask 1 (score 30.0 -> 15.0 each), test 3 belongs to subtask 2 (score 70.0)
+        assert_eq!(tests[0].subtask_id, Some(1));
+        assert_eq!(tests[1].subtask_id, Some(1));
+        assert_eq!(tests[2].subtask_id, Some(2));
+        let st1_fixed: u64 = tests[0..2]
+            .iter()
+            .map(|t| weighted_fixed(t.weight, 1.0))
+            .sum();
+        assert_eq!(st1_fixed, score_to_fixed(30.0));
+        assert_eq!(weighted_fixed(tests[2].weight, 1.0), score_to_fixed(70.0));
     }
 }

@@ -40,6 +40,9 @@ impl ProblemContext {
         problem_config: &ProblemConfig,
         compile_session: &CompileSession,
     ) -> Result<Self, SchedulerError> {
+        problem_config
+            .validate(None)
+            .map_err(|e| SchedulerError::Config(e.to_string()))?;
         let limits = problem_config
             .to_limits()
             .map_err(|e| SchedulerError::Config(e.to_string()))?;
@@ -293,6 +296,28 @@ impl SubmissionContext {
             }
         }
 
+        if !problem.config.subtasks.is_empty() && !tests.is_empty() {
+            let overlaps = uj_core::tests::detect_subtask_pattern_overlaps(&tests, &problem.config);
+            if !overlaps.is_empty() {
+                let details: Vec<String> = overlaps
+                    .iter()
+                    .map(|(t_name, st_ids)| format!("test '{t_name}' matched subtasks {st_ids:?}"))
+                    .collect();
+                return Err(SchedulerError::Config(format!(
+                    "Overlapping subtask test patterns: {} (each test case must belong to a single subtask; use `depends = [...]` to model subtask dependencies)",
+                    details.join("; ")
+                )));
+            }
+            for st in &problem.config.subtasks {
+                if remaining.get(&st.id).copied().unwrap_or(0) == 0 {
+                    return Err(SchedulerError::Config(format!(
+                        "Subtask {} matched 0 discovered test cases for patterns {:?}",
+                        st.id, st.tests
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             submission_id: id,
             submission_name: name.to_string(),
@@ -395,6 +420,7 @@ pub fn run_one_test(
                 &sub.problem.limits,
                 Some(&sub.problem.resolved_checker),
                 sub.problem.pe_as_wa,
+                cpu_core,
                 cancel,
                 box_dir,
             )
@@ -417,6 +443,7 @@ pub fn run_one_test(
                     sub.prepared_exe.as_deref(),
                     test,
                     &sub.problem.limits,
+                    cpu_core,
                     cancel,
                     box_dir,
                     sub.problem.config.processes.unwrap_or(1),

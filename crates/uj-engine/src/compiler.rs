@@ -103,18 +103,58 @@ struct CompileSessionInner {
     inflight: parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>,
 }
 
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let pid = child.id() as i32;
+        if pid > 0 {
+            // Child was spawned with process_group(0), so its pgid equals its pid.
+            // Signal -pgid with SIGKILL (9) to terminate all descendants.
+            unsafe {
+                let _ = kill(-pid, 9);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let pid_str = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn run_command_with_timeout(
     mut cmd: Command,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), CompileError> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     let mut child = cmd.spawn()?;
     let start = Instant::now();
 
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
 
-    let stdout_thread = std::thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = crossbeam_channel::bounded(1);
+    let (stderr_tx, stderr_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -126,10 +166,10 @@ fn run_command_with_timeout(
                 buf.extend_from_slice(&chunk[..n]);
             }
         }
-        buf
+        let _ = stdout_tx.send(buf);
     });
 
-    let stderr_thread = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -141,7 +181,7 @@ fn run_command_with_timeout(
                 buf.extend_from_slice(&chunk[..n]);
             }
         }
-        buf
+        let _ = stderr_tx.send(buf);
     });
 
     let mut timed_out = false;
@@ -156,8 +196,7 @@ fn run_command_with_timeout(
             None => {
                 if start.elapsed() > timeout {
                     timed_out = true;
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut child);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -165,8 +204,13 @@ fn run_command_with_timeout(
         }
     }
 
-    let stdout_bytes = stdout_thread.join().unwrap_or_default();
-    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+    let drain_wait = if timed_out {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(2)
+    };
+    let stdout_bytes = stdout_rx.recv_timeout(drain_wait).unwrap_or_default();
+    let stderr_bytes = stderr_rx.recv_timeout(drain_wait).unwrap_or_default();
 
     if timed_out {
         return Err(CompileError::Failed(format!(
@@ -201,7 +245,12 @@ fn scan_directory_recursive(
                 }
             } else if path.is_dir() {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                if !name.starts_with('.')
+                    && !matches!(
+                        name,
+                        "target" | "node_modules" | "tests" | "test" | "sub" | "submissions"
+                    )
+                {
                     scan_directory_recursive(&path, extensions, max_depth - 1, out);
                 }
             }
@@ -585,10 +634,10 @@ impl CompileSession {
             );
             // 2. Recursive scan of include dirs & source dir for headers
             if let Some(p) = source_path.parent() {
-                scan_directory_recursive(p, header_exts, 5, &mut dep_files);
+                scan_directory_recursive(p, header_exts, 2, &mut dep_files);
             }
             for inc in include_dirs {
-                scan_directory_recursive(inc, header_exts, 5, &mut dep_files);
+                scan_directory_recursive(inc, header_exts, 2, &mut dep_files);
             }
         } else if is_rust {
             if let Some(p) = source_path.parent() {
@@ -735,13 +784,25 @@ impl CompileSession {
 
         fs::create_dir_all(&cache_dir)?;
 
-        // 5. Construct compiler command arguments
+        static COMPILE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = COMPILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp_bin = cache_dir.join(format!("prog.tmp.{pid}.{nonce}{exe_ext}"));
+        let tmp_java_dir = cache_dir.join(format!("javac_tmp_{pid}_{nonce}"));
+        if is_java {
+            fs::create_dir_all(&tmp_java_dir)?;
+        }
+
+        // 5. Construct compiler command arguments (writing to temporary path first)
         let mut final_args = Vec::new();
         for arg in &compile_template[1..] {
             match arg.as_str() {
-                "{exe}" => final_args.push(cached_bin.to_string_lossy().to_string()),
+                "{exe}" => final_args.push(tmp_bin.to_string_lossy().to_string()),
                 "{src}" => final_args.push(source_path.to_string_lossy().to_string()),
-                "{dir}" => final_args.push(cache_dir.to_string_lossy().to_string()),
+                "{dir}" => {
+                    let out_dir = if is_java { &tmp_java_dir } else { &cache_dir };
+                    final_args.push(out_dir.to_string_lossy().to_string());
+                }
                 "{extra_srcs}" => {
                     for extra in extra_sources {
                         final_args.push(extra.to_string_lossy().to_string());
@@ -772,11 +833,24 @@ impl CompileSession {
             }
         }
 
+        let cleanup_tmp = || {
+            let _ = fs::remove_file(&tmp_bin);
+            if is_java {
+                let _ = fs::remove_dir_all(&tmp_java_dir);
+            }
+        };
+
         // 6. Spawn compiler process with timeout and concurrent reader protection
         let mut cmd = Command::new(&compiler_bin);
         cmd.args(&final_args);
         let (status, stdout_bytes, stderr_bytes) =
-            run_command_with_timeout(cmd, Duration::from_secs(30))?;
+            match run_command_with_timeout(cmd, Duration::from_secs(30)) {
+                Ok(res) => res,
+                Err(e) => {
+                    cleanup_tmp();
+                    return Err(e);
+                }
+            };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let combined_output = format!(
@@ -786,18 +860,59 @@ impl CompileSession {
         );
 
         if !status.success() {
+            cleanup_tmp();
             let truncated = truncate_10k(&combined_output);
             return Err(CompileError::Failed(truncated));
         }
 
-        if !target_artifact.exists()
-            || fs::metadata(target_artifact)
-                .map(|m| m.len() == 0)
-                .unwrap_or(true)
-        {
-            return Err(CompileError::Failed(
-                "Compiler succeeded but produced no valid binary file".to_string(),
-            ));
+        // 7. Verify temporary artifact and atomically promote into cache_dir
+        if is_java {
+            let tmp_main_class = tmp_java_dir.join(format!("{java_class_name}.class"));
+            if !tmp_main_class.exists()
+                || fs::metadata(&tmp_main_class)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(true)
+            {
+                cleanup_tmp();
+                return Err(CompileError::Failed(
+                    "Compiler succeeded but produced no valid class file".to_string(),
+                ));
+            }
+            if let Ok(entries) = fs::read_dir(&tmp_java_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p != tmp_main_class
+                        && let Some(fname) = p.file_name()
+                    {
+                        let dst = cache_dir.join(fname);
+                        let _ = fs::rename(&p, &dst).or_else(|_| fs::copy(&p, &dst).map(|_| ()));
+                    }
+                }
+            }
+            if let Err(e) = fs::rename(&tmp_main_class, &java_class_file)
+                && !java_class_file.exists()
+            {
+                cleanup_tmp();
+                return Err(CompileError::Io(e));
+            }
+            let _ = fs::remove_dir_all(&tmp_java_dir);
+        } else {
+            if !tmp_bin.exists() || fs::metadata(&tmp_bin).map(|m| m.len() == 0).unwrap_or(true) {
+                cleanup_tmp();
+                return Err(CompileError::Failed(
+                    "Compiler succeeded but produced no valid binary file".to_string(),
+                ));
+            }
+            if let Err(e) = fs::rename(&tmp_bin, &cached_bin) {
+                let _ = fs::remove_file(&tmp_bin);
+                if !cached_bin.exists()
+                    || fs::metadata(&cached_bin)
+                        .map(|m| m.len() == 0)
+                        .unwrap_or(true)
+                {
+                    return Err(CompileError::Io(e));
+                }
+            }
         }
 
         let interpreter_cmd = if is_java {
@@ -1030,5 +1145,47 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_scan_directory_recursive_skips_tests_and_submissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("include")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::create_dir_all(root.join("submissions")).unwrap();
+        fs::write(root.join("include").join("grader.h"), b"// header").unwrap();
+        fs::write(root.join("tests").join("secret.h"), b"// test header").unwrap();
+        fs::write(root.join("submissions").join("sub.h"), b"// sub header").unwrap();
+
+        let mut out = std::collections::BTreeSet::new();
+        scan_directory_recursive(root, &["h"], 3, &mut out);
+        assert!(out.contains(&root.join("include").join("grader.h")));
+        assert!(!out.contains(&root.join("tests").join("secret.h")));
+        assert!(!out.contains(&root.join("submissions").join("sub.h")));
+    }
+
+    #[test]
+    fn test_run_command_with_timeout_does_not_hang() {
+        #[cfg(windows)]
+        let cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "ping -n 10 127.0.0.1 >NUL"]);
+            c
+        };
+        #[cfg(unix)]
+        let cmd = {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 10 & sleep 10"]);
+            c
+        };
+
+        let start = Instant::now();
+        let res = run_command_with_timeout(cmd, Duration::from_millis(300));
+        assert!(res.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "Timeout handler should return promptly without waiting for 10s sleep"
+        );
     }
 }

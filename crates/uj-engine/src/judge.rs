@@ -1,10 +1,13 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use uj_checker::builtin::BuiltinCheckerType;
 use uj_core::config::{ProblemConfig, ScoringType};
-use uj_core::run::{ExitStatus, KillReason, Limits, RunSpec, Stdio, Tier};
+use uj_core::run::{ExitStatus, KillReason, Limits, RunResult, RunSpec, Stdio, Tier};
+use uj_core::score::{fixed_to_score, score_to_fixed, weighted_fixed};
 use uj_core::tests::TestCase;
 use uj_core::verdict::Verdict;
 use uj_report::result::{
@@ -38,6 +41,250 @@ impl Default for JudgeOptions {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Shared helpers for box lifecycle, argv building, and verdict classification
+// ----------------------------------------------------------------------------
+
+/// Resolve the problem base directory from a test case's input path.
+pub(crate) fn resolve_base_dir(test: &TestCase) -> &Path {
+    test.input_path
+        .parent()
+        .and_then(|p| {
+            if p.file_name().is_some_and(|n| n == "tests") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// RAII lease over a sandbox box directory.
+/// Automatically cleans up the box directory (or its contents if reused) on drop.
+pub(crate) struct BoxLease {
+    box_dir: PathBuf,
+    run_dir: Option<PathBuf>,
+    is_reused: bool,
+}
+
+impl BoxLease {
+    pub fn acquire(
+        sandbox: &dyn Sandbox,
+        base_dir: &Path,
+        custom_box: Option<&Path>,
+    ) -> Result<Self, String> {
+        if let Some(cb) = custom_box {
+            let _ = uj_sandbox::clean_box_dir_contents(cb);
+            Ok(Self {
+                box_dir: cb.to_path_buf(),
+                run_dir: None,
+                is_reused: true,
+            })
+        } else {
+            let bd = sandbox
+                .create_box_dir(base_dir)
+                .map_err(|e| format!("Failed to create sandbox box directory: {e}"))?;
+            let rd = bd.parent().map(|p| p.to_path_buf());
+            Ok(Self {
+                box_dir: bd,
+                run_dir: rd,
+                is_reused: false,
+            })
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.box_dir
+    }
+
+    #[cfg(windows)]
+    pub fn reset(&self) {
+        let _ = uj_sandbox::clean_box_dir_contents(&self.box_dir);
+    }
+}
+
+impl Drop for BoxLease {
+    fn drop(&mut self) {
+        if self.is_reused {
+            let _ = uj_sandbox::clean_box_dir_contents(&self.box_dir);
+        } else if let Some(ref rd) = self.run_dir {
+            let _ = fs::remove_dir_all(rd);
+        } else {
+            let _ = fs::remove_dir_all(&self.box_dir);
+        }
+    }
+}
+
+/// Build the execution `argv` for a contestant binary or interpreted script inside `box_dir`.
+pub(crate) fn build_argv(
+    exe_path: &Path,
+    interpreter_cmd: Option<&[String]>,
+    prepared_exe: Option<&Path>,
+    base_dir: &Path,
+    box_dir: &Path,
+) -> Vec<std::ffi::OsString> {
+    if let Some(cmd) = interpreter_cmd {
+        let mut modified_cmd = Vec::with_capacity(cmd.len());
+        for (i, part) in cmd.iter().enumerate() {
+            if i == 0 {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            } else if Path::new(part).exists() {
+                let script_name = Path::new(part)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
+                let box_script = box_dir.join(script_name);
+                let _ = fs::copy(part, &box_script);
+                modified_cmd.push(box_script.into_os_string());
+            } else {
+                modified_cmd.push(std::ffi::OsString::from(part));
+            }
+        }
+        modified_cmd
+    } else if let Some(p) = prepared_exe {
+        vec![p.to_path_buf().into_os_string()]
+    } else {
+        let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(exe_path, base_dir)
+            .unwrap_or_else(|_| exe_path.to_path_buf());
+        vec![authorized_exe.into_os_string()]
+    }
+}
+
+/// Construct a synthetic failure `SingleTestResult` with the given wall time.
+pub(crate) fn fail_test(
+    test: &TestCase,
+    verdict: Verdict,
+    wall_ms: u64,
+    message: impl Into<String>,
+    tier: Option<Tier>,
+) -> SingleTestResult {
+    let mut res = SingleTestResult::synthetic(test, verdict, Some(message.into()), tier);
+    res.wall_ms = wall_ms;
+    res
+}
+
+pub(crate) fn exit_info_from_status(status: ExitStatus) -> ExitInfo {
+    match status {
+        ExitStatus::Exited(c) => ExitInfo {
+            code: Some(c),
+            signal: None,
+            nt_status: None,
+        },
+        ExitStatus::Signaled(s) => ExitInfo {
+            code: None,
+            signal: Some(s),
+            nt_status: None,
+        },
+        ExitStatus::NtStatus(nt) => ExitInfo {
+            code: None,
+            signal: None,
+            nt_status: Some(nt),
+        },
+    }
+}
+
+pub(crate) fn to_report_diff(d: uj_checker::DiffSummary) -> DiffSummary {
+    let truncated = d.expected.ends_with("...") || d.actual.ends_with("...");
+    DiffSummary {
+        line: d.line,
+        column: d.column,
+        token_index: d.token_index,
+        expected: d.expected,
+        found: d.actual,
+        truncated,
+    }
+}
+
+/// Create a dedicated trusted temporary directory outside any AppContainer-granted `.uj/tmp/runs/` tree.
+pub(crate) fn create_trusted_tempdir(prefix: &str) -> Result<tempfile::TempDir, String> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .map_err(|e| format!("Failed to create trusted temporary directory: {e}"))
+}
+
+/// Classify resource and security limit violations on a sandbox `RunResult`, excluding ordinary
+/// non-zero exit codes / signals (except stack overflow on Windows which reports `0xC00000FD`).
+pub fn classify_run_resource(
+    res: &RunResult,
+    limits: &Limits,
+) -> Option<(Verdict, Option<String>)> {
+    let time_ms = (res.cpu_time_us / 1000).max(1);
+    match res.killed_by {
+        Some(KillReason::UserCancel) => {
+            Some((Verdict::JudgeFailed, Some("Cancelled by user".to_string())))
+        }
+        Some(KillReason::MemoryLimit) => {
+            if res.status == ExitStatus::NtStatus(0xC00000FD) {
+                let name = uj_sandbox::ntstatus::format_ntstatus(0xC00000FD);
+                Some((
+                    Verdict::RuntimeError,
+                    Some(format!("Process crashed: {name} (0xC00000FD)")),
+                ))
+            } else {
+                Some((Verdict::MemoryLimitExceeded, None))
+            }
+        }
+        Some(KillReason::OutputLimit) => Some((Verdict::OutputLimitExceeded, None)),
+        Some(KillReason::CpuLimit) => Some((Verdict::TimeLimitExceeded, None)),
+        Some(KillReason::WallLimit) => Some((
+            Verdict::TimeLimitExceeded,
+            if time_ms < (limits.cpu_time_ms / 4).max(100) {
+                Some("Process idleness detected (waiting on input or sleeping)".to_string())
+            } else {
+                None
+            },
+        )),
+        Some(KillReason::Seccomp) => Some((
+            Verdict::RestrictedFunction,
+            Some("Restricted syscall blocked by security policy".to_string()),
+        )),
+        Some(KillReason::ProcessLimit) => Some((
+            Verdict::RuntimeError,
+            Some("Process limit exceeded".to_string()),
+        )),
+        None => {
+            if res.status == ExitStatus::NtStatus(0xC00000FD) {
+                let name = uj_sandbox::ntstatus::format_ntstatus(0xC00000FD);
+                Some((
+                    Verdict::RuntimeError,
+                    Some(format!("Process crashed: {name} (0xC00000FD)")),
+                ))
+            } else if res.oom_killed || res.memory_peak_bytes > limits.memory_bytes {
+                Some((Verdict::MemoryLimitExceeded, None))
+            } else if time_ms > limits.cpu_time_ms {
+                Some((Verdict::TimeLimitExceeded, None))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Unified classification of a sandbox `RunResult` against `Limits` (Section 5.4 Verdict Order).
+/// Returns `Some((verdict, message))` if the process violated a resource/security limit or exited
+/// abnormally, or `None` if it exited cleanly (`ExitStatus::Exited(0)`) within all limits.
+pub fn classify_run(res: &RunResult, limits: &Limits) -> Option<(Verdict, Option<String>)> {
+    if let Some(resource_violation) = classify_run_resource(res, limits) {
+        return Some(resource_violation);
+    }
+    if !res.status.is_success() {
+        let msg = match res.status {
+            ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
+            ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
+            ExitStatus::NtStatus(nt) => {
+                let name = uj_sandbox::ntstatus::format_ntstatus(nt);
+                format!("Process crashed: {name} (0x{nt:08X})")
+            }
+        };
+        return Some((Verdict::RuntimeError, Some(msg)));
+    }
+    None
+}
+
+// ----------------------------------------------------------------------------
+// Standard single-test evaluation
+// ----------------------------------------------------------------------------
+
 /// Execute a single test case within the sandbox and evaluate verdict.
 #[allow(clippy::too_many_arguments)]
 pub fn judge_single_test(
@@ -54,45 +301,14 @@ pub fn judge_single_test(
     cancel: &CancelToken,
     custom_box: Option<&Path>,
 ) -> SingleTestResult {
-    let base_dir = test
-        .input_path
-        .parent()
-        .and_then(|p| {
-            if p.file_name().is_some_and(|n| n == "tests") {
-                p.parent()
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or_else(|| Path::new("."));
-
-    let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
-        let _ = uj_sandbox::clean_box_dir_contents(cb);
-        (cb.to_path_buf(), None, true)
-    } else {
-        let bd = match sandbox.create_box_dir(base_dir) {
-            Ok(d) => d,
-            Err(e) => {
-                return SingleTestResult {
-                    id: test.name.clone(),
-                    subtask: test.subtask_id,
-                    verdict: Verdict::JudgeFailed,
-                    score: 0.0,
-                    time_ms: 0,
-                    wall_ms: 0,
-                    memory_kb: 0,
-                    exit: ExitInfo::default(),
-                    message: Some(format!("Failed to create sandbox box directory: {e}")),
-                    checker: None,
-                    diff: None,
-                    timing: Default::default(),
-                    sandbox_tier: Some(sandbox.tier()),
-                };
-            }
-        };
-        let rd = bd.parent().map(|p| p.to_path_buf());
-        (bd, rd, false)
+    let base_dir = resolve_base_dir(test);
+    let box_lease = match BoxLease::acquire(sandbox, base_dir, custom_box) {
+        Ok(lease) => lease,
+        Err(msg) => {
+            return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(sandbox.tier()));
+        }
     };
+    let box_dir = box_lease.path();
 
     let is_file_io = io.is_some_and(|i| {
         i.mode == uj_core::config::IoMode::File || i.input_name.is_some() || i.output_name.is_some()
@@ -108,35 +324,12 @@ pub fn judge_single_test(
         let _ = fs::copy(&test.input_path, box_dir.join(in_name));
     }
 
-    let argv = if let Some(cmd) = interpreter_cmd {
-        let mut modified_cmd = Vec::new();
-        for (i, part) in cmd.iter().enumerate() {
-            if i == 0 {
-                modified_cmd.push(std::ffi::OsString::from(part));
-            } else if Path::new(part).exists() {
-                let script_name = Path::new(part)
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
-                let box_script = box_dir.join(script_name);
-                let _ = std::fs::copy(part, &box_script);
-                modified_cmd.push(box_script.into_os_string());
-            } else {
-                modified_cmd.push(std::ffi::OsString::from(part));
-            }
-        }
-        modified_cmd
-    } else if let Some(p) = prepared_exe {
-        vec![p.to_path_buf().into_os_string()]
-    } else {
-        let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(exe_path, base_dir)
-            .unwrap_or_else(|_| exe_path.to_path_buf());
-        vec![authorized_exe.into_os_string()]
-    };
+    let argv = build_argv(exe_path, interpreter_cmd, prepared_exe, base_dir, box_dir);
 
     let spec = RunSpec {
         argv,
         env: vec![],
-        work_dir: box_dir.clone(),
+        work_dir: box_dir.to_path_buf(),
         ro_binds: vec![],
         stdin: Stdio::File(test.input_path.clone()),
         stdout: Stdio::Pipe,
@@ -154,48 +347,37 @@ pub fn judge_single_test(
     #[allow(unused_mut)]
     let mut duration_ms = start_instant.elapsed().as_millis() as u64;
 
-    // Windows Defender mitigation retry:
-    // Tracks retry attempts per binary to handle concurrent -j execution under Defender jitter,
-    // while identifying genuinely slow binaries to avoid repeated 10s stalls.
+    // Windows Defender cold-start mitigation retry (AGENTS.md 3.4):
+    // Only trigger on the first execution of a prepared binary when killed by WallLimit
+    // with negligible CPU usage (< 10% TL). Clean and re-stage box_dir before retrying.
     #[cfg(windows)]
-    #[allow(clippy::type_complexity)]
-    static RETRY_TRACKER: std::sync::LazyLock<
-        parking_lot::Mutex<(
-            std::collections::HashSet<PathBuf>,
-            std::collections::HashMap<PathBuf, u32>,
-        )>,
-    > = std::sync::LazyLock::new(|| {
-        parking_lot::Mutex::new((
-            std::collections::HashSet::new(),
-            std::collections::HashMap::new(),
-        ))
-    });
+    static DEFENDER_WARMED_BINARIES: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashSet<PathBuf>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
     #[cfg(windows)]
     if let Ok(ref res) = run_res {
+        let binary_key = prepared_exe.unwrap_or(exe_path).to_path_buf();
+        let is_first_execution = DEFENDER_WARMED_BINARIES.lock().insert(binary_key);
         let cpu_ms = res.cpu_time_us / 1000;
-        if res.killed_by == Some(KillReason::WallLimit)
-            && cpu_ms < limits.cpu_time_ms
+        let low_cpu_threshold = (limits.cpu_time_ms / 10).max(50);
+        if is_first_execution
+            && res.killed_by == Some(KillReason::WallLimit)
+            && cpu_ms < low_cpu_threshold
             && !cancel.is_cancelled()
         {
-            let should_retry = {
-                let mut state = RETRY_TRACKER.lock();
-                let count = state.1.entry(exe_path.to_path_buf()).or_insert(0);
-                if *count < 5 {
-                    *count += 1;
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_retry {
-                let mut retry_spec = spec.clone();
-                retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(15000);
-                let retry_start = Instant::now();
-                if let Ok(retry_res) = sandbox.run(&retry_spec, cancel) {
-                    run_res = Ok(retry_res);
-                    duration_ms = retry_start.elapsed().as_millis() as u64;
-                }
+            box_lease.reset();
+            if is_file_io {
+                let _ = fs::copy(&test.input_path, box_dir.join(in_name));
+            }
+            let retry_argv = build_argv(exe_path, interpreter_cmd, prepared_exe, base_dir, box_dir);
+            let mut retry_spec = spec.clone();
+            retry_spec.argv = retry_argv;
+            retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(15000);
+            let retry_start = Instant::now();
+            if let Ok(retry_res) = sandbox.run(&retry_spec, cancel) {
+                run_res = Ok(retry_res);
+                duration_ms = retry_start.elapsed().as_millis() as u64;
             }
         }
     }
@@ -203,281 +385,165 @@ pub fn judge_single_test(
     let res = match run_res {
         Ok(r) => r,
         Err(e) => {
-            if is_reused_box {
-                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-            } else if let Some(ref rd) = run_dir {
-                let _ = fs::remove_dir_all(rd);
-            }
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: duration_ms,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some(format!("Sandbox error: {e}")),
-                checker: None,
-                diff: None,
-                timing: TimingInfo {
-                    rejudged: false,
-                    confidence: "low".to_string(),
-                    samples_ms: vec![],
-                },
-                sandbox_tier: Some(sandbox.tier()),
-            };
+            return fail_test(
+                test,
+                Verdict::JudgeFailed,
+                duration_ms,
+                format!("Sandbox error: {e}"),
+                Some(sandbox.tier()),
+            );
         }
     };
 
     let time_ms = (res.cpu_time_us / 1000).max(1);
     let wall_ms = (res.wall_time_us / 1000).max(1);
     let memory_kb = res.memory_peak_bytes / 1024;
-
-    let exit_info = match res.status {
-        ExitStatus::Exited(c) => ExitInfo {
-            code: Some(c),
-            signal: None,
-            nt_status: None,
-        },
-        ExitStatus::Signaled(s) => ExitInfo {
-            code: None,
-            signal: Some(s),
-            nt_status: None,
-        },
-        ExitStatus::NtStatus(nt) => ExitInfo {
-            code: None,
-            signal: None,
-            nt_status: Some(nt),
-        },
-    };
+    let exit_info = exit_info_from_status(res.status);
 
     // ------------------------------------------------------------------------
     // Section 5.4 Verdict Order Evaluation
-    // MLE takes precedence over RuntimeError (e.g. bad_alloc / fastfail crash)
     // ------------------------------------------------------------------------
-    let (mut verdict, score_ratio, test_message, checker_msg, diff_summary) = match res.killed_by {
-        Some(KillReason::UserCancel) => (
-            Verdict::JudgeFailed,
-            0.0,
-            Some("Cancelled by user".to_string()),
-            None,
-            None,
-        ),
-        Some(KillReason::MemoryLimit) => {
-            if res.status == ExitStatus::NtStatus(0xC00000FD) {
-                let name = uj_sandbox::ntstatus::format_ntstatus(0xC00000FD);
-                (
-                    Verdict::RuntimeError,
+    let (mut verdict, score_ratio, test_message, checker_msg, diff_summary) = if let Some((
+        v,
+        msg,
+    )) =
+        classify_run(&res, limits)
+    {
+        (v, 0.0, msg, None, None)
+    } else {
+        // Program exited cleanly (Exit code 0) within limits, run checker
+        // 1. Resolve contestant output bytes (enforcing file_io vs stdout and bounds)
+        let output_bytes_res = if is_file_io {
+            let out_path = box_dir.join(out_name);
+            if !out_path.exists() {
+                Err((
+                    Verdict::WrongAnswer,
                     0.0,
-                    Some(format!("Process crashed: {name} (0xC00000FD)")),
+                    Some(format!("Output file '{out_name}' was not created")),
                     None,
                     None,
-                )
+                ))
             } else {
-                (Verdict::MemoryLimitExceeded, 0.0, None, None, None)
+                match uj_core::read_artifact_bounded(&out_path, spec.limits.output_bytes) {
+                    Ok(art) => Ok(art.bytes),
+                    Err(uj_core::ReadArtifactError::TooLarge { size, limit }) => Err((
+                        Verdict::OutputLimitExceeded,
+                        0.0,
+                        Some(format!(
+                            "Output file '{out_name}' size ({size} bytes) exceeds limit ({limit} bytes)"
+                        )),
+                        None,
+                        None,
+                    )),
+                    Err(e) => Err((
+                        Verdict::JudgeFailed,
+                        0.0,
+                        Some(format!("Failed to read output file '{out_name}': {e}")),
+                        None,
+                        None,
+                    )),
+                }
             }
-        }
-        Some(KillReason::OutputLimit) => (Verdict::OutputLimitExceeded, 0.0, None, None, None),
-        Some(KillReason::CpuLimit) => (Verdict::TimeLimitExceeded, 0.0, None, None, None),
-        Some(KillReason::WallLimit) => (
-            Verdict::TimeLimitExceeded,
-            0.0,
-            if time_ms < (limits.cpu_time_ms / 4).max(100) {
-                Some("Process idleness detected (waiting on input or sleeping)".to_string())
-            } else {
-                None
-            },
-            None,
-            None,
-        ),
-        Some(KillReason::Seccomp) => (
-            Verdict::RestrictedFunction,
-            0.0,
-            Some("Restricted syscall blocked by security policy".to_string()),
-            None,
-            None,
-        ),
-        Some(KillReason::ProcessLimit) => (
-            Verdict::RuntimeError,
-            0.0,
-            Some("Process limit exceeded".to_string()),
-            None,
-            None,
-        ),
-        None => {
-            // Check limits even if process exited cleanly
-            if res.status == ExitStatus::NtStatus(0xC00000FD) {
-                let name = uj_sandbox::ntstatus::format_ntstatus(0xC00000FD);
-                (
-                    Verdict::RuntimeError,
+        } else if let Some(ref out) = res.stdout {
+            if out.truncated || res.killed_by == Some(KillReason::OutputLimit) {
+                Err((
+                    Verdict::OutputLimitExceeded,
                     0.0,
-                    Some(format!("Process crashed: {name} (0xC00000FD)")),
+                    Some("Standard output exceeded limit".to_string()),
                     None,
                     None,
-                )
-            } else if res.oom_killed || res.memory_peak_bytes > limits.memory_bytes {
-                (Verdict::MemoryLimitExceeded, 0.0, None, None, None)
-            } else if time_ms > limits.cpu_time_ms {
-                (Verdict::TimeLimitExceeded, 0.0, None, None, None)
-            } else if !res.status.is_success() {
-                let msg = match res.status {
-                    ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
-                    ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
-                    ExitStatus::NtStatus(nt) => {
-                        let name = uj_sandbox::ntstatus::format_ntstatus(nt);
-                        format!("Process crashed: {name} (0x{nt:08X})")
-                    }
-                };
-                (Verdict::RuntimeError, 0.0, Some(msg), None, None)
+                ))
             } else {
-                // Program exited cleanly (Exit code 0), run checker
-                // 1. Resolve contestant output bytes (enforcing file_io vs stdout and bounds)
-                let output_bytes_res = if is_file_io {
-                    let out_path = box_dir.join(out_name);
-                    if !out_path.exists() {
-                        Err((
-                            Verdict::WrongAnswer,
-                            0.0,
-                            Some(format!("Output file '{out_name}' was not created")),
-                            None,
-                            None,
-                        ))
-                    } else {
-                        match uj_core::read_artifact_bounded(&out_path, spec.limits.output_bytes) {
-                            Ok(art) => Ok(art.bytes),
-                            Err(uj_core::ReadArtifactError::TooLarge { size, limit }) => Err((
-                                Verdict::OutputLimitExceeded,
-                                0.0,
-                                Some(format!(
-                                    "Output file '{out_name}' size ({size} bytes) exceeds limit ({limit} bytes)"
-                                )),
-                                None,
-                                None,
-                            )),
-                            Err(e) => Err((
-                                Verdict::JudgeFailed,
-                                0.0,
-                                Some(format!("Failed to read output file '{out_name}': {e}")),
-                                None,
-                                None,
-                            )),
-                        }
-                    }
-                } else if let Some(ref out) = res.stdout {
-                    if out.truncated || res.killed_by == Some(KillReason::OutputLimit) {
-                        Err((
-                            Verdict::OutputLimitExceeded,
-                            0.0,
-                            Some("Standard output exceeded limit".to_string()),
-                            None,
-                            None,
-                        ))
-                    } else {
-                        Ok(out.bytes.clone())
-                    }
-                } else {
-                    Ok(Vec::new())
-                };
+                Ok(out.bytes.clone())
+            }
+        } else {
+            Ok(Vec::new())
+        };
 
-                match output_bytes_res {
-                    Err(verdict_tuple) => verdict_tuple,
-                    Ok(stdout_bytes) => {
-                        // 2. Validate and read answer file with bounded reader
-                        match &test.answer_path {
-                            None => (
-                                Verdict::JudgeFailed,
-                                0.0,
-                                Some("No answer file specified for test case".to_string()),
-                                None,
-                                None,
-                            ),
-                            Some(ans_path) => {
-                                let ans_limit = std::cmp::max(
-                                    spec.limits.output_bytes.saturating_mul(2),
-                                    Limits::DEFAULT_OUTPUT_BYTES,
-                                );
-                                match read_answer_cached(ans_path, ans_limit) {
-                                    Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg), None, None),
-                                    Ok(ans_artifact) => {
-                                        let ans_slice = &ans_artifact[..];
+        match output_bytes_res {
+            Err(verdict_tuple) => verdict_tuple,
+            Ok(stdout_bytes) => match &test.answer_path {
+                None => (
+                    Verdict::JudgeFailed,
+                    0.0,
+                    Some("No answer file specified for test case".to_string()),
+                    None,
+                    None,
+                ),
+                Some(ans_path) => {
+                    let ans_limit = std::cmp::max(
+                        spec.limits.output_bytes.saturating_mul(2),
+                        Limits::DEFAULT_OUTPUT_BYTES,
+                    );
+                    match read_answer_cached(ans_path, ans_limit) {
+                        Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg), None, None),
+                        Ok(ans_artifact) => {
+                            let ans_slice = &ans_artifact[..];
 
-                                        match checker {
-                                            ResolvedChecker::Builtin(b) => {
-                                                let check_res = b.check(&stdout_bytes, ans_slice);
-                                                let diff = check_res.diff.map(|d| DiffSummary {
-                                                    line: d.line,
-                                                    column: d.column,
-                                                    token_index: d.token_index,
-                                                    expected: d.expected,
-                                                    found: d.actual,
-                                                    truncated: false,
-                                                });
-                                                (
-                                                    check_res.verdict,
-                                                    check_res.score_ratio,
-                                                    None,
-                                                    check_res.message,
-                                                    diff,
-                                                )
-                                            }
-                                            ResolvedChecker::Testlib(chk_exe) => {
-                                                let out_file = box_dir.join("uj_out.txt");
-                                                let _ = fs::write(&out_file, &stdout_bytes);
+                            match checker {
+                                ResolvedChecker::Builtin(b) => {
+                                    let check_res = b.check(&stdout_bytes, ans_slice);
+                                    let diff = check_res.diff.map(to_report_diff);
+                                    (
+                                        check_res.verdict,
+                                        check_res.score_ratio,
+                                        None,
+                                        check_res.message,
+                                        diff,
+                                    )
+                                }
+                                ResolvedChecker::Testlib(chk_exe) => {
+                                    let out_file = box_dir.join("uj_out.txt");
+                                    let _ = fs::write(&out_file, &stdout_bytes);
 
-                                                let check_res =
-                                                    uj_checker::testlib::run_testlib_checker(
-                                                        sandbox,
-                                                        chk_exe,
-                                                        &test.input_path,
-                                                        &out_file,
-                                                        ans_path,
-                                                        pe_as_wa,
-                                                        cancel,
-                                                    );
-                                                let _ = fs::remove_file(&out_file);
-                                                (
-                                                    check_res.verdict,
-                                                    check_res.score_ratio,
-                                                    None,
-                                                    check_res.message,
-                                                    None,
-                                                )
-                                            }
-                                            ResolvedChecker::Lemon {
-                                                path: chk_exe,
-                                                full_score,
-                                            } => {
-                                                let out_file = box_dir.join("uj_out.txt");
-                                                let _ = fs::write(&out_file, &stdout_bytes);
+                                    let check_res = uj_checker::testlib::run_testlib_checker(
+                                        sandbox,
+                                        chk_exe,
+                                        &test.input_path,
+                                        &out_file,
+                                        ans_path,
+                                        pe_as_wa,
+                                        cancel,
+                                    );
+                                    let _ = fs::remove_file(&out_file);
+                                    (
+                                        check_res.verdict,
+                                        check_res.score_ratio,
+                                        None,
+                                        check_res.message,
+                                        None,
+                                    )
+                                }
+                                ResolvedChecker::Lemon {
+                                    path: chk_exe,
+                                    full_score,
+                                } => {
+                                    let out_file = box_dir.join("uj_out.txt");
+                                    let _ = fs::write(&out_file, &stdout_bytes);
 
-                                                let check_res =
-                                                    uj_checker::lemon::run_lemon_checker(
-                                                        sandbox,
-                                                        chk_exe,
-                                                        &test.input_path,
-                                                        &out_file,
-                                                        ans_path,
-                                                        *full_score,
-                                                        cancel,
-                                                    );
-                                                let _ = fs::remove_file(&out_file);
-                                                (
-                                                    check_res.verdict,
-                                                    check_res.score_ratio,
-                                                    None,
-                                                    check_res.message,
-                                                    None,
-                                                )
-                                            }
-                                        }
-                                    }
+                                    let check_res = uj_checker::lemon::run_lemon_checker(
+                                        sandbox,
+                                        chk_exe,
+                                        &test.input_path,
+                                        &out_file,
+                                        ans_path,
+                                        *full_score,
+                                        cancel,
+                                    );
+                                    let _ = fs::remove_file(&out_file);
+                                    (
+                                        check_res.verdict,
+                                        check_res.score_ratio,
+                                        None,
+                                        check_res.message,
+                                        None,
+                                    )
                                 }
                             }
                         }
                     }
                 }
-            }
+            },
         }
     };
 
@@ -485,14 +551,7 @@ pub fn judge_single_test(
         verdict = Verdict::WrongAnswer;
     }
 
-    let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
-
-    // Clean up isolated run directory and all files inside it
-    if is_reused_box {
-        let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-    } else if let Some(ref rd) = run_dir {
-        let _ = fs::remove_dir_all(rd);
-    }
+    let allocated_score = fixed_to_score(weighted_fixed(test.weight, score_ratio));
 
     SingleTestResult {
         id: test.name.clone(),
@@ -519,26 +578,95 @@ pub fn judge_single_test(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Bounded answer file cache
+// ----------------------------------------------------------------------------
+
+const MAX_ANSWER_CACHE_ENTRIES: usize = 256;
+const MAX_ANSWER_CACHE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+struct AnswerCacheState {
+    entries: HashMap<PathBuf, (SystemTime, u64, Arc<uj_checker::FileBytes>)>,
+    order: VecDeque<PathBuf>,
+    total_bytes: u64,
+}
+
+impl AnswerCacheState {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            total_bytes: 0,
+        }
+    }
+
+    fn get(
+        &mut self,
+        path: &Path,
+        mtime: SystemTime,
+        len: u64,
+    ) -> Option<Arc<uj_checker::FileBytes>> {
+        if let Some((c_mtime, c_len, c_bytes)) = self.entries.get(path) {
+            if *c_mtime == mtime && *c_len == len {
+                return Some(c_bytes.clone());
+            }
+            // Stale entry: remove it immediately
+            let old_len = *c_len;
+            self.entries.remove(path);
+            self.order.retain(|p| p != path);
+            self.total_bytes = self.total_bytes.saturating_sub(old_len);
+        }
+        None
+    }
+
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        len: u64,
+        bytes: Arc<uj_checker::FileBytes>,
+    ) {
+        if len > MAX_ANSWER_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, old_len, _)) = self.entries.remove(&path) {
+            self.order.retain(|p| p != &path);
+            self.total_bytes = self.total_bytes.saturating_sub(old_len);
+        }
+        while (self.entries.len() >= MAX_ANSWER_CACHE_ENTRIES
+            || self.total_bytes.saturating_add(len) > MAX_ANSWER_CACHE_BYTES)
+            && let Some(oldest) = self.order.pop_front()
+        {
+            if let Some((_, evicted_len, _)) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted_len);
+            }
+        }
+        self.total_bytes = self.total_bytes.saturating_add(len);
+        self.order.push_back(path.clone());
+        self.entries.insert(path, (mtime, len, bytes));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.total_bytes = 0;
+    }
+}
+
+static ANSWER_FILE_CACHE: std::sync::LazyLock<parking_lot::Mutex<AnswerCacheState>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(AnswerCacheState::new()));
+
+/// Clear all cached answer files from the global in-memory/mmap cache.
+pub fn clear_answer_cache() {
+    ANSWER_FILE_CACHE.lock().clear();
+}
+
 /// Read and cache an answer file using zero-copy mmap (or buffered fallback) without holding the
 /// global cache lock across disk I/O.
 pub fn read_answer_cached(
     ans_path: &Path,
     ans_limit: u64,
-) -> Result<std::sync::Arc<uj_checker::FileBytes>, String> {
-    #[allow(clippy::type_complexity)]
-    static ANSWER_FILE_CACHE: std::sync::LazyLock<
-        parking_lot::Mutex<
-            std::collections::HashMap<
-                PathBuf,
-                (
-                    std::time::SystemTime,
-                    u64,
-                    std::sync::Arc<uj_checker::FileBytes>,
-                ),
-            >,
-        >,
-    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
+) -> Result<Arc<uj_checker::FileBytes>, String> {
     let meta = match fs::metadata(ans_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -560,24 +688,25 @@ pub fn read_answer_cached(
             "Answer file exceeded limit: {len} bytes > {ans_limit} bytes"
         ));
     }
-    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     {
-        let cache = ANSWER_FILE_CACHE.lock();
-        if let Some((c_mtime, c_len, c_bytes)) = cache.get(ans_path)
-            && *c_mtime == mtime
-            && *c_len == len
-        {
-            return Ok(c_bytes.clone());
+        let mut cache = ANSWER_FILE_CACHE.lock();
+        if let Some(cached) = cache.get(ans_path, mtime, len) {
+            return Ok(cached);
         }
     }
     let fb = uj_checker::read_file_bytes(ans_path)
         .map_err(|e| format!("Failed to read answer file: {e}"))?;
-    let arc = std::sync::Arc::new(fb);
+    let arc = Arc::new(fb);
     ANSWER_FILE_CACHE
         .lock()
-        .insert(ans_path.to_path_buf(), (mtime, len, arc.clone()));
+        .insert(ans_path.to_path_buf(), mtime, len, arc.clone());
     Ok(arc)
 }
+
+// ----------------------------------------------------------------------------
+// Subtask topological ordering and report aggregation
+// ----------------------------------------------------------------------------
 
 /// Compute deterministic topological order of subtask configurations.
 pub(crate) fn topological_subtask_order(subtasks: &[uj_core::config::SubtaskConfig]) -> Vec<usize> {
@@ -586,7 +715,7 @@ pub(crate) fn topological_subtask_order(subtasks: &[uj_core::config::SubtaskConf
         return (0..n).collect();
     }
 
-    let id_to_idx: std::collections::HashMap<u32, usize> = subtasks
+    let id_to_idx: HashMap<u32, usize> = subtasks
         .iter()
         .enumerate()
         .map(|(idx, s)| (s.id, idx))
@@ -637,7 +766,8 @@ pub(crate) fn topological_subtask_order(subtasks: &[uj_core::config::SubtaskConf
     order
 }
 
-/// Aggregate single test results into subtasks and overall submission report.
+/// Aggregate single test results into subtasks and overall submission report using
+/// 1e6 fixed-point integer units (`uj_core::score::SCORE_SCALE`) end-to-end.
 pub fn aggregate_submission_report(
     problem_name: &str,
     submission_name: &str,
@@ -670,8 +800,8 @@ pub fn aggregate_submission_report(
         }
     }
 
-    let mut subtask_results_map: std::collections::HashMap<u32, SubtaskResult> =
-        std::collections::HashMap::new();
+    let mut subtask_results_map: HashMap<u32, SubtaskResult> = HashMap::new();
+    let mut subtask_fixed_map: HashMap<u32, (u64, u64)> = HashMap::new();
 
     // Evaluate subtasks in deterministic topological order
     let topo_indices = topological_subtask_order(&config.subtasks);
@@ -680,13 +810,20 @@ pub fn aggregate_submission_report(
         let st_cfg = &config.subtasks[idx];
         let tests = subtask_map.remove(&st_cfg.id).unwrap_or_default();
         let test_ids: Vec<String> = tests.iter().map(|t| t.id.clone()).collect();
-        let st_max_fixed = (st_cfg.score * 10000.0).round() as i64;
+        let st_max_fixed = score_to_fixed(st_cfg.score);
 
-        // Check dependencies - all dependencies are already evaluated and in subtask_results_map
+        // Check dependencies using exact fixed-point integer comparison
         let mut dep_failed = false;
         for &dep_id in &st_cfg.depends {
             if let Some(dep_res) = subtask_results_map.get(&dep_id) {
-                if dep_res.score < dep_res.max_score || dep_res.verdict != Verdict::Accepted {
+                let (dep_earned, dep_max) =
+                    subtask_fixed_map.get(&dep_id).copied().unwrap_or_else(|| {
+                        (
+                            score_to_fixed(dep_res.score),
+                            score_to_fixed(dep_res.max_score),
+                        )
+                    });
+                if dep_earned < dep_max || dep_res.verdict != Verdict::Accepted {
                     dep_failed = true;
                     break;
                 }
@@ -697,51 +834,69 @@ pub fn aggregate_submission_report(
         }
 
         let (st_verdict, st_score_fixed) = if dep_failed {
-            (Verdict::Skipped, 0i64)
+            (Verdict::Skipped, 0u64)
         } else if tests.is_empty() {
-            (Verdict::JudgeFailed, 0i64)
+            (Verdict::JudgeFailed, 0u64)
         } else {
-            let mut worst = Verdict::Accepted;
+            let mut has_skipped = false;
+            let mut has_non_skipped = false;
+            let mut worst_non_skipped = Verdict::Accepted;
             for t in &tests {
-                worst = worst.merge(t.verdict);
+                if t.verdict == Verdict::Skipped {
+                    has_skipped = true;
+                } else {
+                    has_non_skipped = true;
+                    worst_non_skipped = worst_non_skipped.merge(t.verdict);
+                }
             }
 
-            let score_fixed = match st_cfg.scoring {
+            let score_fixed: u64 = match st_cfg.scoring {
                 ScoringType::Min => {
-                    let min_ratio = tests
-                        .iter()
-                        .map(|t| {
-                            if st_cfg.score > 0.0 {
-                                (t.score / st_cfg.score).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            }
-                        })
-                        .fold(1.0f64, f64::min);
-                    ((st_max_fixed as f64) * min_ratio).round() as i64
+                    if has_skipped {
+                        0
+                    } else {
+                        tests
+                            .iter()
+                            .map(|t| {
+                                if st_max_fixed > 0 {
+                                    score_to_fixed(t.score).min(st_max_fixed)
+                                } else {
+                                    0
+                                }
+                            })
+                            .min()
+                            .unwrap_or(0)
+                    }
                 }
                 ScoringType::Sum => tests
                     .iter()
-                    .map(|t| (t.score * 10000.0).round() as i64)
-                    .sum(),
+                    .map(|t| score_to_fixed(t.score))
+                    .fold(0u64, u64::saturating_add)
+                    .min(st_max_fixed),
             };
 
             // Verdict resolution:
-            // Severe errors (SE, CE, RF, MLE, OLE, TLE, RE) must NEVER be masked by PartiallyCorrect!
-            let final_verdict = if score_fixed >= st_max_fixed
-                || worst.priority() > Verdict::WrongAnswer.priority()
+            // 1. A subtask with Skipped tests must never be reported as Accepted with 0 points.
+            // 2. Severe errors (SE, CE, RF, MLE, OLE, TLE, RE) must NEVER be masked by PartiallyCorrect!
+            let final_verdict = if !has_non_skipped {
+                Verdict::Skipped
+            } else if worst_non_skipped.priority() > Verdict::WrongAnswer.priority()
+                || (!has_skipped && score_fixed >= st_max_fixed)
             {
-                worst
+                worst_non_skipped
             } else if score_fixed > 0 {
                 Verdict::PartiallyCorrect
+            } else if has_skipped && worst_non_skipped == Verdict::Accepted {
+                Verdict::Skipped
             } else {
-                worst
+                worst_non_skipped
             };
 
             (final_verdict, score_fixed)
         };
 
-        let st_score = st_score_fixed as f64 / 10000.0;
+        let st_score = fixed_to_score(st_score_fixed);
+        subtask_fixed_map.insert(st_cfg.id, (st_score_fixed, st_max_fixed));
 
         subtask_results_map.insert(
             st_cfg.id,
@@ -756,45 +911,67 @@ pub fn aggregate_submission_report(
     }
 
     let mut subtask_results = Vec::new();
-    let mut total_score_fixed: i64 = 0;
-    let mut worst_verdict = Verdict::Accepted;
+    let mut total_score_fixed: u64 = 0;
+    let mut has_skipped = false;
+    let mut has_non_skipped = false;
+    let mut worst_non_skipped = Verdict::Accepted;
 
     // Assemble subtasks in config declaration order
     for st_cfg in &config.subtasks {
         if let Some(res) = subtask_results_map.remove(&st_cfg.id) {
-            worst_verdict = worst_verdict.merge(res.verdict);
-            total_score_fixed += (res.score * 10000.0).round() as i64;
+            if res.verdict == Verdict::Skipped {
+                has_skipped = true;
+            } else {
+                has_non_skipped = true;
+                worst_non_skipped = worst_non_skipped.merge(res.verdict);
+            }
+            let (st_fixed, _) = subtask_fixed_map
+                .get(&st_cfg.id)
+                .copied()
+                .unwrap_or_else(|| (score_to_fixed(res.score), score_to_fixed(res.max_score)));
+            total_score_fixed = total_score_fixed.saturating_add(st_fixed);
             subtask_results.push(res);
         }
     }
 
     // Handle any unassigned tests
-    if !unassigned_tests.is_empty() {
-        for t in &unassigned_tests {
-            worst_verdict = worst_verdict.merge(t.verdict);
-            total_score_fixed += (t.score * 10000.0).round() as i64;
+    for t in &unassigned_tests {
+        if t.verdict == Verdict::Skipped {
+            has_skipped = true;
+        } else {
+            has_non_skipped = true;
+            worst_non_skipped = worst_non_skipped.merge(t.verdict);
         }
+        total_score_fixed = total_score_fixed.saturating_add(score_to_fixed(t.score));
     }
 
-    let total_score = total_score_fixed as f64 / 10000.0;
-
-    let max_possible_score: f64 = if !config.subtasks.is_empty() {
-        config.subtasks.iter().map(|s| s.score).sum()
+    let max_possible_fixed: u64 = if !config.subtasks.is_empty() {
+        config
+            .subtasks
+            .iter()
+            .map(|s| score_to_fixed(s.score))
+            .fold(0u64, u64::saturating_add)
     } else {
-        100.0
+        score_to_fixed(100.0)
     };
+
+    let total_score = fixed_to_score(total_score_fixed);
 
     let final_submission_verdict = if test_results.is_empty() {
         Verdict::JudgeFailed
-    } else if (total_score - max_possible_score).abs() < 1e-6 && max_possible_score > 0.0 {
-        worst_verdict
-    } else if worst_verdict.priority() > Verdict::WrongAnswer.priority() {
+    } else if !has_non_skipped {
+        Verdict::Skipped
+    } else if worst_non_skipped.priority() > Verdict::WrongAnswer.priority()
+        || (!has_skipped && total_score_fixed >= max_possible_fixed && max_possible_fixed > 0)
+    {
         // Severe errors (JudgeFailed, TLE, MLE, OLE, RE, etc.) must NEVER be masked by PC!
-        worst_verdict
-    } else if total_score > 0.0 && worst_verdict.priority() <= Verdict::WrongAnswer.priority() {
+        worst_non_skipped
+    } else if total_score_fixed > 0 {
         Verdict::PartiallyCorrect
+    } else if has_skipped && worst_non_skipped == Verdict::Accepted {
+        Verdict::Skipped
     } else {
-        worst_verdict
+        worst_non_skipped
     };
 
     let max_time_ms = test_results.iter().map(|t| t.time_ms).max().unwrap_or(0);
@@ -813,6 +990,10 @@ pub fn aggregate_submission_report(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Interactive problem evaluation
+// ----------------------------------------------------------------------------
+
 /// Execute an interactive test case with solution and interactor wired together.
 #[allow(clippy::too_many_arguments)]
 pub fn judge_interactive_test(
@@ -825,103 +1006,45 @@ pub fn judge_interactive_test(
     limits: &Limits,
     checker: Option<&ResolvedChecker>,
     pe_as_wa: bool,
+    cpu_affinity: Option<usize>,
     cancel: &CancelToken,
     custom_box: Option<&Path>,
 ) -> SingleTestResult {
-    let base_dir = test
-        .input_path
-        .parent()
-        .and_then(|p| {
-            if p.file_name().is_some_and(|n| n == "tests") {
-                p.parent()
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or_else(|| Path::new("."));
-
-    let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
-        let _ = uj_sandbox::clean_box_dir_contents(cb);
-        (cb.to_path_buf(), None, true)
-    } else {
-        let bd = match sandbox.create_box_dir(base_dir) {
-            Ok(d) => d,
-            Err(e) => {
-                return SingleTestResult {
-                    id: test.name.clone(),
-                    subtask: test.subtask_id,
-                    verdict: Verdict::JudgeFailed,
-                    score: 0.0,
-                    time_ms: 0,
-                    wall_ms: 0,
-                    memory_kb: 0,
-                    exit: ExitInfo::default(),
-                    message: Some(format!("Failed to create sandbox box directory: {e}")),
-                    checker: None,
-                    diff: None,
-                    timing: Default::default(),
-                    sandbox_tier: Some(sandbox.tier()),
-                };
-            }
-        };
-        let rd = bd.parent().map(|p| p.to_path_buf());
-        (bd, rd, false)
-    };
-
-    let argv_sol = if let Some(cmd) = interpreter_cmd {
-        let mut modified_cmd = Vec::new();
-        for (i, part) in cmd.iter().enumerate() {
-            if i == 0 {
-                modified_cmd.push(std::ffi::OsString::from(part));
-            } else if Path::new(part).exists() {
-                let script_name = Path::new(part)
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
-                let box_script = box_dir.join(script_name);
-                let _ = std::fs::copy(part, &box_script);
-                modified_cmd.push(box_script.into_os_string());
-            } else {
-                modified_cmd.push(std::ffi::OsString::from(part));
-            }
+    let base_dir = resolve_base_dir(test);
+    let box_lease = match BoxLease::acquire(sandbox, base_dir, custom_box) {
+        Ok(lease) => lease,
+        Err(msg) => {
+            return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(sandbox.tier()));
         }
-        modified_cmd
-    } else if let Some(p) = prepared_exe {
-        vec![p.to_path_buf().into_os_string()]
-    } else {
-        let authorized_exe = uj_sandbox::get_or_prepare_authorized_binary(exe_path, base_dir)
-            .unwrap_or_else(|_| exe_path.to_path_buf());
-        vec![authorized_exe.into_os_string()]
     };
+    let box_dir = box_lease.path();
 
-    let pid = std::process::id();
-    let time_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let argv_sol = build_argv(exe_path, interpreter_cmd, prepared_exe, base_dir, box_dir);
 
-    // CRITICAL (P0-01): Create a dedicated trusted directory OUTSIDE the contestant's box_dir.
-    // The contestant's AppContainer on Windows and userns on Linux only have write access to box_dir.
-    // Placing judge results outside box_dir prevents contestant code from spoofing or modifying XML results.
-    let trusted_dir = box_dir
-        .parent()
-        .unwrap_or(&box_dir)
-        .join(format!("trusted_int_{pid}_{time_now}"));
-    let _ = fs::create_dir_all(&trusted_dir);
-
-    let tout_file = trusted_dir.join(format!("interact_tout_{pid}_{time_now}.txt"));
-    let result_file = trusted_dir.join(format!("interact_res_{pid}_{time_now}.xml"));
+    // CRITICAL (P0-03): Create a dedicated trusted directory in the OS temp tree OUTSIDE
+    // the slot directory (`box_dir.parent()`), because Windows AppContainer grants
+    // `FILE_ALL_ACCESS` with inheritance to the entire `.uj/tmp/runs/slot-N/` directory!
+    let trusted_tempdir = match create_trusted_tempdir("uj_trusted_int_") {
+        Ok(td) => td,
+        Err(msg) => {
+            return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(sandbox.tier()));
+        }
+    };
+    let trusted_dir = trusted_tempdir.path();
+    let tout_file = trusted_dir.join("interact_tout.txt");
+    let result_file = trusted_dir.join("interact_res.xml");
 
     let spec_sol = RunSpec {
         argv: argv_sol,
         env: vec![],
-        work_dir: box_dir.clone(),
+        work_dir: box_dir.to_path_buf(),
         ro_binds: vec![],
         stdin: Stdio::Pipe,
         stdout: Stdio::Pipe,
         stderr: Stdio::Pipe,
         extra_fds: vec![],
         limits: limits.clone(),
-        cpu_affinity: None,
+        cpu_affinity: cpu_affinity.map(|c| vec![c]),
         seccomp_profile: Default::default(),
         trusted: false,
     };
@@ -939,13 +1062,16 @@ pub fn judge_interactive_test(
     argv_int.push(result_file.as_os_str().to_os_string());
     argv_int.push(std::ffi::OsString::from("-appes"));
 
-    let mut int_limits = Limits::new(limits.cpu_time_ms * 2 + 5000, 1024 * 1024 * 1024);
-    int_limits.wall_time_ms = limits.wall_time_ms + 2000;
+    let mut int_limits = Limits::new(
+        limits.cpu_time_ms.saturating_mul(2).saturating_add(5000),
+        1024 * 1024 * 1024,
+    );
+    int_limits.wall_time_ms = limits.wall_time_ms.saturating_add(2000);
 
     let spec_int = RunSpec {
         argv: argv_int,
         env: vec![],
-        work_dir: box_dir.clone(),
+        work_dir: box_dir.to_path_buf(),
         ro_binds: vec![],
         stdin: Stdio::Pipe,
         stdout: Stdio::Pipe,
@@ -978,50 +1104,22 @@ pub fn judge_interactive_test(
     let results = match group_res {
         Ok(r) if r.len() >= 2 => r,
         Ok(_) => {
-            let _ = fs::remove_dir_all(&trusted_dir);
-            if is_reused_box {
-                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-            } else if let Some(ref rd) = run_dir {
-                let _ = fs::remove_dir_all(rd);
-            }
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: duration_ms,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some("Incomplete process group results".to_string()),
-                checker: None,
-                diff: None,
-                timing: TimingInfo::default(),
-                sandbox_tier: Some(sandbox.tier()),
-            };
+            return fail_test(
+                test,
+                Verdict::JudgeFailed,
+                duration_ms,
+                "Incomplete process group results",
+                Some(sandbox.tier()),
+            );
         }
         Err(e) => {
-            let _ = fs::remove_dir_all(&trusted_dir);
-            if is_reused_box {
-                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-            } else if let Some(ref rd) = run_dir {
-                let _ = fs::remove_dir_all(rd);
-            }
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: duration_ms,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some(format!("Sandbox run_group error: {e}")),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(sandbox.tier()),
-            };
+            return fail_test(
+                test,
+                Verdict::JudgeFailed,
+                duration_ms,
+                format!("Sandbox run_group error: {e}"),
+                Some(sandbox.tier()),
+            );
         }
     };
 
@@ -1053,8 +1151,6 @@ pub fn judge_interactive_test(
         uj_checker::testlib::parse_testlib_exit_code(code, &int_stderr, pe_as_wa)
     });
 
-    let _ = fs::remove_file(&result_file);
-
     let interactor_finished_first = match (int_res.exit_order, sol_res.exit_order) {
         (Some(i_ord), Some(s_ord)) => i_ord < s_ord,
         (Some(_), None) => true,
@@ -1064,7 +1160,7 @@ pub fn judge_interactive_test(
     // ------------------------------------------------------------------------
     // Section 7.4 Interactive Verdict Rules
     // ------------------------------------------------------------------------
-    let (verdict, score_ratio, checker_msg) = if cancel.is_cancelled() {
+    let (mut verdict, score_ratio, checker_msg) = if cancel.is_cancelled() {
         (
             Verdict::JudgeFailed,
             0.0,
@@ -1094,34 +1190,10 @@ pub fn judge_interactive_test(
                 .or_else(|| Some("Interactor failed or crashed".to_string())),
         )
     } else if !interactor_finished_first {
-        // Rule 2: Solution exceeded limits or crashed BEFORE interactor ended
-        if sol_res.killed_by == Some(KillReason::CpuLimit) || time_ms > limits.cpu_time_ms {
-            (Verdict::TimeLimitExceeded, 0.0, None)
-        } else if sol_res.killed_by == Some(KillReason::MemoryLimit)
-            || sol_res.oom_killed
-            || sol_res.memory_peak_bytes > limits.memory_bytes
-        {
-            (Verdict::MemoryLimitExceeded, 0.0, None)
-        } else if sol_res.killed_by == Some(KillReason::OutputLimit) {
-            (Verdict::OutputLimitExceeded, 0.0, None)
-        } else if sol_res.killed_by == Some(KillReason::Seccomp) {
-            (
-                Verdict::RestrictedFunction,
-                0.0,
-                Some("Restricted syscall blocked by security policy".to_string()),
-            )
-        } else if !sol_res.status.is_success() {
-            let msg = match sol_res.status {
-                ExitStatus::Exited(c) => format!("Process exited with return code {c}"),
-                ExitStatus::Signaled(s) => format!("Terminated by signal {s}"),
-                ExitStatus::NtStatus(nt) => {
-                    let name = uj_sandbox::ntstatus::format_ntstatus(nt);
-                    format!("Process crashed: {name} (0x{nt:08X})")
-                }
-            };
-            (Verdict::RuntimeError, 0.0, Some(msg))
+        // Rule 2: Solution finished (or crashed/violated limits) BEFORE interactor ended
+        if let Some((v, msg)) = classify_run(sol_res, limits) {
+            (v, 0.0, msg)
         } else {
-            // Solution exited cleanly first, use interactor's verdict
             (
                 interactor_res.verdict,
                 interactor_res.score_ratio,
@@ -1131,15 +1203,24 @@ pub fn judge_interactive_test(
     } else {
         // Rule 3 & 5: Interactor finished first
         if interactor_res.verdict != Verdict::Accepted {
-            // Interactor decided WA/PE/PC, solution exited afterward due to EOF/broken pipe -> not RE
-            (
-                interactor_res.verdict,
-                interactor_res.score_ratio,
-                interactor_res.message,
-            )
+            // Interactor rejected the solution (WA/PE/PC).
+            // Still enforce hard resource/security violations (TLE, MLE, OLE, RF),
+            // while suppressing ordinary RE/SIGPIPE caused by interactor closing pipes early.
+            if let Some((v, msg)) = classify_run_resource(sol_res, limits) {
+                (v, 0.0, msg)
+            } else {
+                (
+                    interactor_res.verdict,
+                    interactor_res.score_ratio,
+                    interactor_res.message,
+                )
+            }
         } else {
-            // Interactor said Accepted!
-            if let Some(chk) = checker
+            // Interactor reported Accepted, but we MUST still verify that the solution did not
+            // exceed CPU/memory/output/seccomp limits or crash after the interactor exited!
+            if let Some((v, msg)) = classify_run(sol_res, limits) {
+                (v, 0.0, msg)
+            } else if let Some(chk) = checker
                 && tout_file.is_file()
             {
                 // Run post-checker on tout_file if configured (VULN-08: fail-closed if answer is missing)
@@ -1229,32 +1310,12 @@ pub fn judge_interactive_test(
         }
     };
 
-    let _ = fs::remove_dir_all(&trusted_dir);
-    if is_reused_box {
-        let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-    } else if let Some(ref rd) = run_dir {
-        let _ = fs::remove_dir_all(rd);
+    if pe_as_wa && verdict == Verdict::PresentationError {
+        verdict = Verdict::WrongAnswer;
     }
 
-    let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
-
-    let exit_info = match sol_res.status {
-        ExitStatus::Exited(c) => ExitInfo {
-            code: Some(c),
-            signal: None,
-            nt_status: None,
-        },
-        ExitStatus::Signaled(s) => ExitInfo {
-            code: None,
-            signal: Some(s),
-            nt_status: None,
-        },
-        ExitStatus::NtStatus(nt) => ExitInfo {
-            code: None,
-            signal: None,
-            nt_status: Some(nt),
-        },
-    };
+    let allocated_score = fixed_to_score(weighted_fixed(test.weight, score_ratio));
+    let exit_info = exit_info_from_status(sol_res.status);
 
     let (test_message, checker_message) = match verdict {
         Verdict::RuntimeError | Verdict::JudgeFailed => (checker_msg, None),
@@ -1286,6 +1347,10 @@ pub fn judge_interactive_test(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Output-only problem evaluation
+// ----------------------------------------------------------------------------
+
 /// Evaluate a submitted output file for an output-only problem.
 pub fn judge_output_only_test(
     sandbox: &dyn Sandbox,
@@ -1307,71 +1372,41 @@ pub fn judge_output_only_test(
     };
 
     let Some(existing_out) = out_path else {
-        return SingleTestResult {
-            id: test.name.clone(),
-            subtask: test.subtask_id,
-            verdict: Verdict::WrongAnswer,
-            score: 0.0,
-            time_ms: 0,
-            wall_ms: 0,
-            memory_kb: 0,
-            exit: ExitInfo::default(),
-            message: Some("Output file not found in submission".to_string()),
-            checker: None,
-            diff: None,
-            timing: TimingInfo {
-                rejudged: false,
-                confidence: "high".to_string(),
-                samples_ms: vec![0],
-            },
-            sandbox_tier: Some(Tier::None),
+        let mut res = fail_test(
+            test,
+            Verdict::WrongAnswer,
+            0,
+            "Output file not found in submission",
+            Some(Tier::None),
+        );
+        res.timing = TimingInfo {
+            rejudged: false,
+            confidence: "high".to_string(),
+            samples_ms: vec![0],
         };
+        return res;
     };
 
     // P0-03: Validate answer file existence
     let ans_path = match &test.answer_path {
         Some(p) if p.is_file() => p,
         Some(p) => {
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: 0,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some(format!("Answer file not found: {}", p.display())),
-                checker: None,
-                diff: None,
-                timing: TimingInfo {
-                    rejudged: false,
-                    confidence: "high".to_string(),
-                    samples_ms: vec![0],
-                },
-                sandbox_tier: Some(Tier::None),
-            };
+            return fail_test(
+                test,
+                Verdict::JudgeFailed,
+                0,
+                format!("Answer file not found: {}", p.display()),
+                Some(Tier::None),
+            );
         }
         None => {
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
-                wall_ms: 0,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some("No answer file specified for test case".to_string()),
-                checker: None,
-                diff: None,
-                timing: TimingInfo {
-                    rejudged: false,
-                    confidence: "high".to_string(),
-                    samples_ms: vec![0],
-                },
-                sandbox_tier: Some(Tier::None),
-            };
+            return fail_test(
+                test,
+                Verdict::JudgeFailed,
+                0,
+                "No answer file specified for test case",
+                Some(Tier::None),
+            );
         }
     };
 
@@ -1380,87 +1415,38 @@ pub fn judge_output_only_test(
         match uj_core::read_artifact_bounded(&existing_out, Limits::DEFAULT_OUTPUT_BYTES) {
             Ok(art) => art,
             Err(uj_core::ReadArtifactError::TooLarge { size, limit, .. }) => {
-                return SingleTestResult {
-                    id: test.name.clone(),
-                    subtask: test.subtask_id,
-                    verdict: Verdict::OutputLimitExceeded,
-                    score: 0.0,
-                    time_ms: 0,
-                    wall_ms: 0,
-                    memory_kb: 0,
-                    exit: ExitInfo::default(),
-                    message: Some(format!(
-                        "Submission output file exceeded limit ({size} > {limit} bytes)"
-                    )),
-                    checker: None,
-                    diff: None,
-                    timing: TimingInfo {
-                        rejudged: false,
-                        confidence: "high".to_string(),
-                        samples_ms: vec![0],
-                    },
-                    sandbox_tier: Some(Tier::None),
-                };
+                return fail_test(
+                    test,
+                    Verdict::OutputLimitExceeded,
+                    0,
+                    format!("Submission output file exceeded limit ({size} > {limit} bytes)"),
+                    Some(Tier::None),
+                );
             }
             Err(e) => {
-                return SingleTestResult {
-                    id: test.name.clone(),
-                    subtask: test.subtask_id,
-                    verdict: Verdict::JudgeFailed,
-                    score: 0.0,
-                    time_ms: 0,
-                    wall_ms: 0,
-                    memory_kb: 0,
-                    exit: ExitInfo::default(),
-                    message: Some(format!("Failed to read submission output file: {e}")),
-                    checker: None,
-                    diff: None,
-                    timing: TimingInfo {
-                        rejudged: false,
-                        confidence: "high".to_string(),
-                        samples_ms: vec![0],
-                    },
-                    sandbox_tier: Some(Tier::None),
-                };
+                return fail_test(
+                    test,
+                    Verdict::JudgeFailed,
+                    0,
+                    format!("Failed to read submission output file: {e}"),
+                    Some(Tier::None),
+                );
             }
         };
 
     let (mut verdict, score_ratio, checker_msg, diff) = match checker {
         ResolvedChecker::Builtin(b) => {
-            let ans_artifact = match read_answer_cached(ans_path, Limits::DEFAULT_OUTPUT_BYTES * 2)
-            {
+            let ans_artifact = match read_answer_cached(
+                ans_path,
+                Limits::DEFAULT_OUTPUT_BYTES.saturating_mul(2),
+            ) {
                 Ok(art) => art,
                 Err(msg) => {
-                    return SingleTestResult {
-                        id: test.name.clone(),
-                        subtask: test.subtask_id,
-                        verdict: Verdict::JudgeFailed,
-                        score: 0.0,
-                        time_ms: 0,
-                        wall_ms: 0,
-                        memory_kb: 0,
-                        exit: ExitInfo::default(),
-                        message: Some(msg),
-                        checker: None,
-                        diff: None,
-                        timing: TimingInfo {
-                            rejudged: false,
-                            confidence: "high".to_string(),
-                            samples_ms: vec![0],
-                        },
-                        sandbox_tier: Some(Tier::None),
-                    };
+                    return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(Tier::None));
                 }
             };
             let check_res = b.check(&out_artifact.bytes, &ans_artifact[..]);
-            let diff = check_res.diff.map(|d| DiffSummary {
-                line: d.line,
-                column: d.column,
-                token_index: d.token_index,
-                expected: d.expected,
-                found: d.actual,
-                truncated: false,
-            });
+            let diff = check_res.diff.map(to_report_diff);
             (
                 check_res.verdict,
                 check_res.score_ratio,
@@ -1511,7 +1497,7 @@ pub fn judge_output_only_test(
         verdict = Verdict::WrongAnswer;
     }
 
-    let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
+    let allocated_score = fixed_to_score(weighted_fixed(test.weight, score_ratio));
 
     SingleTestResult {
         id: test.name.clone(),
@@ -1534,6 +1520,10 @@ pub fn judge_output_only_test(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Communication problem evaluation
+// ----------------------------------------------------------------------------
+
 /// Evaluate a communication problem with manager and participant instances.
 #[allow(clippy::too_many_arguments)]
 pub fn judge_communication_test(
@@ -1544,102 +1534,59 @@ pub fn judge_communication_test(
     prepared_exe: Option<&Path>,
     test: &TestCase,
     limits: &Limits,
+    cpu_affinity: Option<usize>,
     cancel: &CancelToken,
     custom_box: Option<&Path>,
     num_processes: usize,
     topology: Option<&str>,
 ) -> SingleTestResult {
-    let base_dir = test
-        .input_path
-        .parent()
-        .and_then(|p| {
-            if p.file_name().is_some_and(|n| n == "tests") {
-                p.parent()
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or_else(|| Path::new("."));
-
-    let (box_dir, run_dir, is_reused_box) = if let Some(cb) = custom_box {
-        let _ = uj_sandbox::clean_box_dir_contents(cb);
-        (cb.to_path_buf(), None, true)
-    } else {
-        let bd = match sandbox.create_box_dir(base_dir) {
-            Ok(d) => d,
-            Err(e) => {
-                return SingleTestResult {
-                    id: test.name.clone(),
-                    subtask: test.subtask_id,
-                    verdict: Verdict::JudgeFailed,
-                    score: 0.0,
-                    time_ms: 0,
-                    wall_ms: 0,
-                    memory_kb: 0,
-                    exit: ExitInfo::default(),
-                    message: Some(format!("Failed to create sandbox box directory: {e}")),
-                    checker: None,
-                    diff: None,
-                    timing: Default::default(),
-                    sandbox_tier: Some(sandbox.tier()),
-                };
-            }
-        };
-        let rd = bd.parent().map(|p| p.to_path_buf());
-        (bd, rd, false)
-    };
-
-    let trusted_dir = tempfile::tempdir().ok();
-    let score_file = trusted_dir.as_ref().map(|d| d.path().join("score.txt"));
-
-    let argv_sol = if let Some(cmd) = interpreter_cmd {
-        let mut modified_cmd = Vec::new();
-        for (i, part) in cmd.iter().enumerate() {
-            if i == 0 {
-                modified_cmd.push(std::ffi::OsString::from(part));
-            } else if Path::new(part).exists() {
-                let script_name = Path::new(part)
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
-                let box_script = box_dir.join(script_name);
-                let _ = std::fs::copy(part, &box_script);
-                modified_cmd.push(box_script.into_os_string());
-            } else {
-                modified_cmd.push(std::ffi::OsString::from(part));
-            }
+    let base_dir = resolve_base_dir(test);
+    let box_lease = match BoxLease::acquire(sandbox, base_dir, custom_box) {
+        Ok(lease) => lease,
+        Err(msg) => {
+            return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(sandbox.tier()));
         }
-        modified_cmd
-    } else if let Some(p) = prepared_exe {
-        vec![p.to_path_buf().into_os_string()]
-    } else {
-        let authorized_exe =
-            uj_sandbox::get_or_prepare_authorized_binary(participant_exe, base_dir)
-                .unwrap_or_else(|_| participant_exe.to_path_buf());
-        vec![authorized_exe.into_os_string()]
     };
+    let box_dir = box_lease.path();
 
-    let mut mgr_limits = Limits::new(limits.cpu_time_ms * 2 + 5000, 1024 * 1024 * 1024);
-    mgr_limits.wall_time_ms = limits.wall_time_ms + 2000;
+    let trusted_tempdir = match create_trusted_tempdir("uj_trusted_comm_") {
+        Ok(td) => td,
+        Err(msg) => {
+            return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(sandbox.tier()));
+        }
+    };
+    let score_file = trusted_tempdir.path().join("score.txt");
 
-    let mut mgr_argv = vec![
+    let argv_sol = build_argv(
+        participant_exe,
+        interpreter_cmd,
+        prepared_exe,
+        base_dir,
+        box_dir,
+    );
+
+    let mut mgr_limits = Limits::new(
+        limits.cpu_time_ms.saturating_mul(2).saturating_add(5000),
+        1024 * 1024 * 1024,
+    );
+    mgr_limits.wall_time_ms = limits.wall_time_ms.saturating_add(2000);
+
+    let mgr_argv = vec![
         manager_exe.as_os_str().to_os_string(),
         test.input_path.as_os_str().to_os_string(),
+        score_file.as_os_str().to_os_string(),
     ];
-    let mut mgr_env = Vec::new();
-    if let Some(ref sf) = score_file {
-        mgr_argv.push(sf.as_os_str().to_os_string());
-        mgr_env.push((
-            std::ffi::OsString::from("UJ_SCORE_FILE"),
-            sf.as_os_str().to_os_string(),
-        ));
-    }
+    let mgr_env = vec![(
+        std::ffi::OsString::from("UJ_SCORE_FILE"),
+        score_file.as_os_str().to_os_string(),
+    )];
 
     let spec_mgr = RunSpec {
         argv: mgr_argv,
         env: mgr_env,
-        work_dir: box_dir.clone(),
+        work_dir: box_dir.to_path_buf(),
         ro_binds: vec![],
-        stdin: Stdio::Inherit,
+        stdin: Stdio::Null,
         stdout: Stdio::Pipe,
         stderr: Stdio::Pipe,
         extra_fds: vec![],
@@ -1652,14 +1599,14 @@ pub fn judge_communication_test(
     let spec_sol = RunSpec {
         argv: argv_sol,
         env: vec![],
-        work_dir: box_dir.clone(),
+        work_dir: box_dir.to_path_buf(),
         ro_binds: vec![],
         stdin: Stdio::Pipe,
         stdout: Stdio::Pipe,
         stderr: Stdio::Pipe,
         extra_fds: vec![],
         limits: limits.clone(),
-        cpu_affinity: None,
+        cpu_affinity: cpu_affinity.map(|c| vec![c]),
         seccomp_profile: Default::default(),
         trusted: false,
     };
@@ -1710,29 +1657,16 @@ pub fn judge_communication_test(
             star_manager_proc: None,
         }
     } else {
-        if is_reused_box {
-            let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-        } else if let Some(ref rd) = run_dir {
-            let _ = fs::remove_dir_all(rd);
-        }
-        return SingleTestResult {
-            id: test.name.clone(),
-            subtask: test.subtask_id,
-            verdict: Verdict::JudgeFailed,
-            score: 0.0,
-            time_ms: 0,
-            wall_ms: 0,
-            memory_kb: 0,
-            exit: ExitInfo::default(),
-            message: Some(format!(
+        return fail_test(
+            test,
+            Verdict::JudgeFailed,
+            0,
+            format!(
                 "Unsupported communication topology '{:?}' for {} participants",
                 topology, num_participants
-            )),
-            checker: None,
-            diff: None,
-            timing: Default::default(),
-            sandbox_tier: None,
-        };
+            ),
+            None,
+        );
     };
 
     let start_instant = Instant::now();
@@ -1742,26 +1676,13 @@ pub fn judge_communication_test(
     let results = match group_res {
         Ok(r) if r.len() > num_participants => r,
         Ok(_) | Err(_) => {
-            if is_reused_box {
-                let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-            } else if let Some(ref rd) = run_dir {
-                let _ = fs::remove_dir_all(rd);
-            }
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::JudgeFailed,
-                score: 0.0,
-                time_ms: 0,
+            return fail_test(
+                test,
+                Verdict::JudgeFailed,
                 wall_ms,
-                memory_kb: 0,
-                exit: ExitInfo::default(),
-                message: Some("Communication run_group failed".to_string()),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(sandbox.tier()),
-            };
+                "Communication run_group failed",
+                Some(sandbox.tier()),
+            );
         }
     };
 
@@ -1778,202 +1699,125 @@ pub fn judge_communication_test(
     let memory_kb = max_peak_bytes / 1024;
     let participant_tier = sol_results[0].sandbox_tier;
 
-    let cleanup = || {
-        if is_reused_box {
-            let _ = uj_sandbox::clean_box_dir_contents(&box_dir);
-        } else if let Some(ref rd) = run_dir {
-            let _ = fs::remove_dir_all(rd);
-        }
+    let make_res = |verdict: Verdict,
+                    score: f64,
+                    message: Option<String>,
+                    checker: Option<String>,
+                    exit: ExitInfo| SingleTestResult {
+        id: test.name.clone(),
+        subtask: test.subtask_id,
+        verdict,
+        score,
+        time_ms,
+        wall_ms,
+        memory_kb,
+        exit,
+        message,
+        checker,
+        diff: None,
+        timing: Default::default(),
+        sandbox_tier: Some(participant_tier),
     };
 
     if cancel.is_cancelled() {
-        cleanup();
-        return SingleTestResult {
-            id: test.name.clone(),
-            subtask: test.subtask_id,
-            verdict: Verdict::JudgeFailed,
-            score: 0.0,
-            time_ms,
-            wall_ms,
-            memory_kb,
-            exit: ExitInfo::default(),
-            message: Some("Cancelled by user".to_string()),
-            checker: None,
-            diff: None,
-            timing: Default::default(),
-            sandbox_tier: Some(participant_tier),
-        };
+        return make_res(
+            Verdict::JudgeFailed,
+            0.0,
+            Some("Cancelled by user".to_string()),
+            None,
+            ExitInfo::default(),
+        );
     }
 
-    // Check if any participant violated limits or crashed
+    // Check if any participant violated resource/security limits or crashed
     for (i, p_res) in sol_results.iter().enumerate() {
-        if p_res.killed_by == Some(KillReason::CpuLimit)
-            || p_res.killed_by == Some(KillReason::WallLimit)
-        {
-            cleanup();
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::TimeLimitExceeded,
-                score: 0.0,
-                time_ms,
-                wall_ms,
-                memory_kb,
-                exit: ExitInfo::default(),
-                message: Some(format!("Participant {} exceeded time limit", i + 1)),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(participant_tier),
-            };
-        }
-        if p_res.killed_by == Some(KillReason::MemoryLimit) || p_res.oom_killed {
-            cleanup();
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::MemoryLimitExceeded,
-                score: 0.0,
-                time_ms,
-                wall_ms,
-                memory_kb,
-                exit: ExitInfo::default(),
-                message: Some(format!("Participant {} exceeded memory limit", i + 1)),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(participant_tier),
-            };
-        }
-        if p_res.killed_by == Some(KillReason::OutputLimit) {
-            cleanup();
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::OutputLimitExceeded,
-                score: 0.0,
-                time_ms,
-                wall_ms,
-                memory_kb,
-                exit: ExitInfo::default(),
-                message: Some(format!("Participant {} exceeded output limit", i + 1)),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(participant_tier),
-            };
-        }
-        if !p_res.status.is_success() {
+        if let Some((v, reason)) = classify_run(p_res, limits) {
             let stderr_msg = String::from_utf8_lossy(&p_res.stderr_tail)
                 .trim()
                 .to_string();
-            cleanup();
-            return SingleTestResult {
-                id: test.name.clone(),
-                subtask: test.subtask_id,
-                verdict: Verdict::RuntimeError,
-                score: 0.0,
-                time_ms,
-                wall_ms,
-                memory_kb,
-                exit: ExitInfo::default(),
-                message: Some(if stderr_msg.is_empty() {
-                    format!(
-                        "Participant {} failed with status {:?}",
-                        i + 1,
-                        p_res.status
-                    )
-                } else {
-                    stderr_msg
-                }),
-                checker: None,
-                diff: None,
-                timing: Default::default(),
-                sandbox_tier: Some(participant_tier),
+            let detail = match v {
+                Verdict::RuntimeError if !stderr_msg.is_empty() => stderr_msg,
+                _ => reason.unwrap_or_else(|| format!("Participant {} failed with {v:?}", i + 1)),
             };
+            return make_res(
+                v,
+                0.0,
+                Some(format!("Participant {}: {detail}", i + 1)),
+                None,
+                exit_info_from_status(p_res.status),
+            );
         }
     }
 
-    // Parse score from score_file
-    let mut score_float: Option<f64> = None;
-    if let Some(ref sf) = score_file
-        && let Ok(content) = fs::read_to_string(sf)
-        && let Some(first_line) = content.lines().next()
-        && let Ok(val) = first_line.trim().parse::<f64>()
-        && val.is_finite()
-    {
-        score_float = Some(val);
-    }
-
-    // Fallback: check manager stderr
     let mgr_stderr = String::from_utf8_lossy(&mgr_res.stderr_tail)
         .trim()
         .to_string();
-    if score_float.is_none() {
-        for line in mgr_stderr.lines() {
-            let trimmed = line.trim();
-            if let Ok(val) = trimmed.parse::<f64>()
-                && val.is_finite()
-            {
-                score_float = Some(val);
-                break;
-            }
-        }
-    }
-
-    // Fallback: check manager stdout
     let mgr_stdout = mgr_res
         .stdout
         .as_ref()
         .map(|o| String::from_utf8_lossy(&o.bytes).trim().to_string())
         .unwrap_or_default();
-    if score_float.is_none()
-        && let Some(line) = mgr_stdout.lines().next()
-        && let Ok(val) = line.trim().parse::<f64>()
-        && val.is_finite()
-    {
-        score_float = Some(val);
-    }
 
-    // If manager crashed or timed out and produced no score: JudgeFailed
-    if !mgr_res.status.is_success() && score_float.is_none() {
-        cleanup();
-        return SingleTestResult {
-            id: test.name.clone(),
-            subtask: test.subtask_id,
-            verdict: Verdict::JudgeFailed,
-            score: 0.0,
-            time_ms,
-            wall_ms,
-            memory_kb,
-            exit: ExitInfo::default(),
-            message: Some(if mgr_stderr.is_empty() {
+    // Fail-closed if manager crashed, timed out, or exited non-zero
+    if mgr_res.killed_by.is_some() || !mgr_res.status.is_success() {
+        return make_res(
+            Verdict::JudgeFailed,
+            0.0,
+            Some(if mgr_stderr.is_empty() {
                 format!("Manager failed with status {:?}", mgr_res.status)
             } else {
                 mgr_stderr
             }),
-            checker: None,
-            diff: None,
-            timing: Default::default(),
-            sandbox_tier: Some(participant_tier),
-        };
+            None,
+            ExitInfo::default(),
+        );
     }
 
-    let parsed_score = score_float.unwrap_or_else(|| {
-        if mgr_res.status.is_success() {
-            1.0
-        } else {
-            0.0
+    // Parse manager score from score_file (primary) or first non-empty stdout line (fallback).
+    // Never scrape arbitrary stderr lines and never silently default a missing score to Accepted!
+    let raw_score_str = fs::read_to_string(&score_file)
+        .ok()
+        .and_then(|content| {
+            content
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            mgr_stdout
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_string)
+        });
+
+    let Some(score_token) = raw_score_str else {
+        return make_res(
+            Verdict::JudgeFailed,
+            0.0,
+            Some("Manager exited without writing a score to UJ_SCORE_FILE or stdout".to_string()),
+            None,
+            ExitInfo::default(),
+        );
+    };
+
+    let parsed_score = match score_token.parse::<f64>() {
+        Ok(val) if val.is_finite() && (0.0..=1.0).contains(&val) => val,
+        _ => {
+            return make_res(
+                Verdict::JudgeFailed,
+                0.0,
+                Some(format!(
+                    "Manager reported invalid score ratio '{score_token}' (expected a finite number in 0.0..=1.0)"
+                )),
+                None,
+                ExitInfo::default(),
+            );
         }
-    });
+    };
 
-    let score_ratio = if parsed_score > 1.0 {
-        parsed_score / 100.0
-    } else {
-        parsed_score
-    }
-    .clamp(0.0, 1.0);
-
+    let score_ratio = parsed_score;
     let verdict = if score_ratio >= 1.0 {
         Verdict::Accepted
     } else if score_ratio > 0.0 {
@@ -1982,26 +1826,258 @@ pub fn judge_communication_test(
         Verdict::WrongAnswer
     };
 
-    let allocated_score = (test.weight as f64 / 1_000_000.0) * score_ratio;
-    cleanup();
+    let allocated_score = fixed_to_score(weighted_fixed(test.weight, score_ratio));
+    let checker_note = if !mgr_stderr.is_empty() {
+        Some(mgr_stderr)
+    } else if !mgr_stdout.is_empty() {
+        Some(mgr_stdout)
+    } else {
+        None
+    };
 
-    SingleTestResult {
-        id: test.name.clone(),
-        subtask: test.subtask_id,
+    make_res(
         verdict,
-        score: allocated_score,
-        time_ms,
-        wall_ms,
-        memory_kb,
-        exit: ExitInfo::default(),
-        message: None,
-        checker: Some(if mgr_stderr.is_empty() {
-            mgr_stdout
-        } else {
-            mgr_stderr
-        }),
-        diff: None,
-        timing: Default::default(),
-        sandbox_tier: Some(participant_tier),
+        allocated_score,
+        None,
+        checker_note,
+        exit_info_from_status(sol_results[0].status),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uj_core::config::SubtaskConfig;
+    use uj_core::score::SCORE_SCALE;
+    use uj_core::tests::assign_subtasks_and_weights;
+
+    fn make_test_cases(count: usize, config: &ProblemConfig) -> Vec<TestCase> {
+        let mut cases: Vec<TestCase> = (1..=count)
+            .map(|i| TestCase {
+                name: format!("{i}"),
+                input_path: PathBuf::from(format!("{i}.in")),
+                answer_path: Some(PathBuf::from(format!("{i}.ans"))),
+                subtask_id: None,
+                weight: 0,
+            })
+            .collect();
+        assign_subtasks_and_weights(&mut cases, config);
+        cases
+    }
+
+    fn ac_result(tc: &TestCase) -> SingleTestResult {
+        SingleTestResult {
+            id: tc.name.clone(),
+            subtask: tc.subtask_id,
+            verdict: Verdict::Accepted,
+            score: fixed_to_score(weighted_fixed(tc.weight, 1.0)),
+            time_ms: 5,
+            wall_ms: 5,
+            memory_kb: 1024,
+            exit: ExitInfo {
+                code: Some(0),
+                signal: None,
+                nt_status: None,
+            },
+            message: None,
+            checker: None,
+            diff: None,
+            timing: TimingInfo::default(),
+            sandbox_tier: Some(Tier::Full),
+        }
+    }
+
+    #[test]
+    fn test_fixed_point_scoring_all_ac_for_3_6_7_12_tests() {
+        let cfg = ProblemConfig::from_toml_str(
+            r#"
+name = "p"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#,
+            None,
+        )
+        .unwrap();
+
+        for count in [3usize, 6, 7, 12] {
+            let cases = make_test_cases(count, &cfg);
+            let results: Vec<SingleTestResult> = cases.iter().map(ac_result).collect();
+            let report = aggregate_submission_report("p", "sol.cpp", &cfg, results);
+            assert_eq!(
+                report.verdict,
+                Verdict::Accepted,
+                "Expected Accepted for {count} tests all-AC, got {:?}",
+                report.verdict
+            );
+            assert_eq!(
+                score_to_fixed(report.score),
+                100 * SCORE_SCALE,
+                "Expected 100.0 points for {count} tests all-AC, got {}",
+                report.score
+            );
+        }
+    }
+
+    #[test]
+    fn test_sum_subtask_score_10_with_3_tests_and_dependent_not_skipped() {
+        let mut cfg = ProblemConfig::from_toml_str(
+            r#"
+name = "p"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#,
+            None,
+        )
+        .unwrap();
+        cfg.subtasks = vec![
+            SubtaskConfig {
+                id: 1,
+                score: 10.0,
+                scoring: ScoringType::Sum,
+                tests: vec!["1-3".to_string()],
+                depends: vec![],
+            },
+            SubtaskConfig {
+                id: 2,
+                score: 90.0,
+                scoring: ScoringType::Min,
+                tests: vec!["4".to_string()],
+                depends: vec![1],
+            },
+        ];
+
+        let cases = make_test_cases(4, &cfg);
+        let results: Vec<SingleTestResult> = cases.iter().map(ac_result).collect();
+        let report = aggregate_submission_report("p", "sol.cpp", &cfg, results);
+
+        assert_eq!(report.subtasks.len(), 2);
+        assert_eq!(report.subtasks[0].verdict, Verdict::Accepted);
+        assert_eq!(
+            score_to_fixed(report.subtasks[0].score),
+            score_to_fixed(10.0)
+        );
+        assert_eq!(
+            report.subtasks[1].verdict,
+            Verdict::Accepted,
+            "Dependent subtask 2 should not be skipped when subtask 1 is all-AC"
+        );
+        assert_eq!(
+            score_to_fixed(report.subtasks[1].score),
+            score_to_fixed(90.0)
+        );
+        assert_eq!(report.verdict, Verdict::Accepted);
+        assert_eq!(score_to_fixed(report.score), score_to_fixed(100.0));
+    }
+
+    #[test]
+    fn test_min_subtask_fractional_score_33_333333_all_ac() {
+        let mut cfg = ProblemConfig::from_toml_str(
+            r#"
+name = "p"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#,
+            None,
+        )
+        .unwrap();
+        cfg.subtasks = vec![
+            SubtaskConfig {
+                id: 1,
+                score: 33.333333,
+                scoring: ScoringType::Min,
+                tests: vec!["1-2".to_string()],
+                depends: vec![],
+            },
+            SubtaskConfig {
+                id: 2,
+                score: 66.666667,
+                scoring: ScoringType::Min,
+                tests: vec!["3".to_string()],
+                depends: vec![1],
+            },
+        ];
+
+        let cases = make_test_cases(3, &cfg);
+        let results: Vec<SingleTestResult> = cases.iter().map(ac_result).collect();
+        let report = aggregate_submission_report("p", "sol.cpp", &cfg, results);
+
+        assert_eq!(report.subtasks[0].verdict, Verdict::Accepted);
+        assert_eq!(
+            score_to_fixed(report.subtasks[0].score),
+            score_to_fixed(33.333333)
+        );
+        assert_eq!(report.subtasks[1].verdict, Verdict::Accepted);
+        assert_eq!(report.verdict, Verdict::Accepted);
+        assert_eq!(score_to_fixed(report.score), score_to_fixed(100.0));
+    }
+
+    #[test]
+    fn test_skipped_subtask_never_reported_as_accepted() {
+        let mut cfg = ProblemConfig::from_toml_str(
+            r#"
+name = "p"
+[limits]
+time = "1s"
+memory = "256MiB"
+"#,
+            None,
+        )
+        .unwrap();
+        cfg.subtasks = vec![SubtaskConfig {
+            id: 1,
+            score: 100.0,
+            scoring: ScoringType::Min,
+            tests: vec!["1-2".to_string()],
+            depends: vec![],
+        }];
+
+        let cases = make_test_cases(2, &cfg);
+        // Simulate fail-fast or dependency skip where test 1 is AC and test 2 is Skipped
+        let results = vec![
+            ac_result(&cases[0]),
+            SingleTestResult::synthetic(&cases[1], Verdict::Skipped, None, None),
+        ];
+        let report = aggregate_submission_report("p", "sol.cpp", &cfg, results);
+        assert_eq!(report.subtasks[0].verdict, Verdict::Skipped);
+        assert_eq!(report.subtasks[0].score, 0.0);
+        assert_eq!(report.verdict, Verdict::Skipped);
+        assert_eq!(report.score, 0.0);
+    }
+
+    #[test]
+    fn test_trusted_tempdir_is_outside_box_parent() {
+        let fake_slot = tempfile::tempdir().unwrap();
+        let fake_box = fake_slot.path().join("box");
+        fs::create_dir_all(&fake_box).unwrap();
+        let box_parent = fake_box.parent().unwrap();
+
+        let trusted = create_trusted_tempdir("uj_trusted_int_").unwrap();
+        assert!(
+            !trusted.path().starts_with(box_parent),
+            "trusted_dir ({}) must not be inside box_dir.parent() ({})",
+            trusted.path().display(),
+            box_parent.display()
+        );
+    }
+
+    #[test]
+    fn test_answer_cache_reload_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let ans_path = dir.path().join("1.ans");
+        fs::write(&ans_path, b"42\n").unwrap();
+
+        let first = read_answer_cached(&ans_path, 1024).unwrap();
+        assert_eq!(&first[..], b"42\n");
+
+        // Overwrite with different length and ensure cache reloads
+        fs::write(&ans_path, b"1000\n").unwrap();
+        let second = read_answer_cached(&ans_path, 1024).unwrap();
+        assert_eq!(&second[..], b"1000\n");
+
+        clear_answer_cache();
+        assert_eq!(ANSWER_FILE_CACHE.lock().entries.len(), 0);
     }
 }
