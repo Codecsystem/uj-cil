@@ -306,11 +306,14 @@ pub fn exec_ans(
         }
     };
 
-    // Cold-start Defender / scheduling stall retry:
+    // Cold-start Defender / scheduling stall retry (AGENTS.md §3.4: < 10% of CPU TL):
+    let cpu_ms = res.cpu_time_us / 1000;
+    let cold_start_threshold_ms = (limits.cpu_time_ms / 10).max(50);
     if res.killed_by == Some(KillReason::WallLimit)
         && !cancel.is_cancelled()
-        && (res.cpu_time_us / 1000) < limits.cpu_time_ms
+        && cpu_ms < cold_start_threshold_ms
     {
+        let _ = uj_sandbox::clean_box_dir_contents(work_dir);
         let mut retry_spec = spec.clone();
         retry_spec.limits.wall_time_ms = retry_spec.limits.wall_time_ms.max(15000);
         if let Ok(retry_res) = sb.run(&retry_spec, cancel) {
@@ -358,6 +361,7 @@ pub enum CaseStagesOutcome {
     },
     ConfigOrCompileError {
         stage: uj_tui::pipeline::Stage,
+        message: String,
         exit_code: ExitCode,
     },
     Interrupted,
@@ -415,9 +419,10 @@ pub fn run_case_stages(
 ) -> CaseStagesOutcome {
     use crate::cli::OutputFormat;
     use crate::error::{
-        EXIT_COMPILE_ERROR, EXIT_JUDGE_FAILED, EXIT_USAGE_OR_CONFIG, handle_config_error,
+        EXIT_COMPILE_ERROR, EXIT_JUDGE_FAILED, EXIT_USAGE_OR_CONFIG, handle_config_error_fmt,
     };
     use indicatif::{ProgressBar, ProgressStyle};
+    use std::io::IsTerminal;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uj_core::config::SolutionTag;
@@ -429,9 +434,11 @@ pub fn run_case_stages(
     let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Cannot read problem.toml: {e}");
+            let msg = format!("Cannot read problem.toml: {e}");
+            eprintln!("{msg}");
             return CaseStagesOutcome::ConfigOrCompileError {
                 stage: Stage::Gen,
+                message: msg,
                 exit_code: ExitCode::from(EXIT_USAGE_OR_CONFIG),
             };
         }
@@ -439,9 +446,11 @@ pub fn run_case_stages(
     let cfg = match ProblemConfig::from_toml_str(&content, Some(&config_path)) {
         Ok(c) => c,
         Err(e) => {
-            let code = handle_config_error(e, format == OutputFormat::Json);
+            let msg = e.to_string();
+            let code = handle_config_error_fmt(e, format);
             return CaseStagesOutcome::ConfigOrCompileError {
                 stage: Stage::Gen,
+                message: msg,
                 exit_code: code,
             };
         }
@@ -457,6 +466,7 @@ pub fn run_case_stages(
         Err(code) => {
             return CaseStagesOutcome::ConfigOrCompileError {
                 stage: Stage::Gen,
+                message: "Failed to plan or compile generator(s)".to_string(),
                 exit_code: code,
             };
         }
@@ -468,9 +478,11 @@ pub fn run_case_stages(
         match session.compile(&val_path, false) {
             Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("Failed to compile validator: {e}");
+                let msg = format!("Failed to compile validator: {e}");
+                eprintln!("{msg}");
                 return CaseStagesOutcome::ConfigOrCompileError {
                     stage: Stage::Validate,
+                    message: msg,
                     exit_code: ExitCode::from(EXIT_COMPILE_ERROR),
                 };
             }
@@ -490,15 +502,17 @@ pub fn run_case_stages(
                 .find(|s| s.tag == SolutionTag::Accepted)
         })
         .ok_or_else(|| {
-            eprintln!("No main or accepted solution configured to generate answers");
-            ExitCode::from(EXIT_USAGE_OR_CONFIG)
+            let msg = "No main or accepted solution configured to generate answers".to_string();
+            eprintln!("{msg}");
+            (ExitCode::from(EXIT_USAGE_OR_CONFIG), msg)
         });
 
     let main_sol = match main_sol {
         Ok(s) => s,
-        Err(code) => {
+        Err((code, msg)) => {
             return CaseStagesOutcome::ConfigOrCompileError {
                 stage: Stage::Ans,
+                message: msg,
                 exit_code: code,
             };
         }
@@ -508,9 +522,11 @@ pub fn run_case_stages(
     let compiled_sol = match session.compile_problem_solution(problem_dir, &cfg, &sol_path, false) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to compile main solution: {e}");
+            let msg = format!("Failed to compile main solution: {e}");
+            eprintln!("{msg}");
             return CaseStagesOutcome::ConfigOrCompileError {
                 stage: Stage::Ans,
+                message: msg,
                 exit_code: ExitCode::from(EXIT_COMPILE_ERROR),
             };
         }
@@ -519,9 +535,11 @@ pub fn run_case_stages(
     let main_hash = match hash_file_streaming(&compiled_sol.binary_path) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("Failed to read binary for hash: {e}");
+            let msg = format!("Failed to read binary for hash: {e}");
+            eprintln!("{msg}");
             return CaseStagesOutcome::ConfigOrCompileError {
                 stage: Stage::Ans,
+                message: msg,
                 exit_code: ExitCode::from(EXIT_JUDGE_FAILED),
             };
         }
@@ -619,14 +637,28 @@ pub fn run_case_stages(
     }
     drop(job_tx);
 
-    let (event_tx, tui_handle) = if cli.tui {
+    let use_tui = cli.tui && format == OutputFormat::Human && std::io::stderr().is_terminal();
+
+    let (event_tx, tui_handle) = if use_tui {
         let (etx, erx) = crossbeam_channel::unbounded::<CaseStageEvent>();
         let p_name = cfg.name.clone();
         let c_names: Vec<String> = cases.iter().map(|c| c.name.clone()).collect();
         let h_gen = has_gen.clone();
         let cancel_tui = cancel.clone();
         let handle = std::thread::spawn(move || {
-            let _ = run_pipeline_tui(&p_name, &c_names, &h_gen, num_workers, erx, cancel_tui);
+            if let Err(e) = run_pipeline_tui(
+                &p_name,
+                &c_names,
+                &h_gen,
+                num_workers,
+                erx.clone(),
+                cancel_tui,
+            ) {
+                eprintln!(
+                    "Warning: Pipeline TUI initialization failed ({e}); falling back to non-TUI execution."
+                );
+                while erx.recv().is_ok() {}
+            }
         });
         (Some(etx), Some(handle))
     } else {
@@ -641,6 +673,8 @@ pub fn run_case_stages(
     let gen_work_dir = tests_dir.clone();
     let run_limits = limits.clone();
     let force = false;
+    let sandbox_mode_str = cli.sandbox_mode_str().to_string();
+    let require_tier = cli.require_tier;
 
     let mut handles = Vec::new();
     for worker_idx in 0..num_workers {
@@ -655,9 +689,10 @@ pub fn run_case_stages(
         let limits = run_limits.clone();
         let main_h = main_hash.clone();
         let etx = event_tx.clone();
+        let sb_mode = sandbox_mode_str.clone();
 
         let handle = std::thread::spawn(move || {
-            let sandbox = match create_sandbox("auto", false) {
+            let sandbox = match create_sandbox(&sb_mode, require_tier) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = res_tx.send(CaseResult::RuntimeError {
@@ -901,7 +936,7 @@ pub fn run_case_stages(
     let mut first_failure: Option<CaseFailure> = None;
     let mut runtime_error: Option<(Stage, String)> = None;
 
-    let pb = if format == OutputFormat::Human && !cli.quiet && !cli.tui && !cases.is_empty() {
+    let pb = if format == OutputFormat::Human && !cli.quiet && !use_tui && !cases.is_empty() {
         let p = ProgressBar::new(cases.len() as u64);
         p.set_style(
             ProgressStyle::default_bar()
@@ -1010,7 +1045,7 @@ pub fn run_case_stages(
         }
     }
 
-    if format == OutputFormat::Human && !cli.quiet && !cli.tui {
+    if format == OutputFormat::Human && !cli.quiet && !use_tui {
         println!(
             "All {success_count} test case(s) successfully generated, validated, and answered"
         );

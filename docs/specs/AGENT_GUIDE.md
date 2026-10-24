@@ -50,16 +50,17 @@ MCP 暴露的工具与参数签名严格映射源码 `crates/uj-cli/src/mcp_serv
 
 | 工具名称 (Tool Name) | 参数 (Arguments) | 说明 |
 |---|---|---|
-| `judge` | `{ "submission": "solutions/std.cpp", "problem": ".", "sources": ["..."] }` | 评测单份或多份选手源码，返回评测结构体 |
-| `build` | `{ "problem": ".", "targets": [] }` | 编译题目下的所有组件（Checker、Validator、标程等） |
-| `pipeline` | `{ "problem": "." }` | 一键执行自动化出题流水线（build ➡️ gen ➡️ validate ➡️ ans ➡️ verify ➡️ tl） |
-| `stress` | `{ "problem": ".", "generator": "gen.cpp", "solution": "solutions/wa.cpp", "brute": "solutions/brute.cpp", "count": 100 }` | 自动化差分对拍找反例 |
-| `verify` | `{ "problem": "." }` | 批量验证 `problem.toml` 中声明的所有期望解法 |
-| `doctor` | `{ "problem": boolean }` | 诊断宿主沙盒与当前题目数据健康度 |
+| `judge` | `{ "submission": "solutions/std.cpp", "problem": ".", "sources": ["..."], "sandbox": "auto", "require_tier": false }` | 评测单份或多份选手源码，返回评测结构体 |
+| `build` | `{ "problem": ".", "targets": [], "no_cache": false }` | 编译题目下的所有组件（Checker、Validator、Interactor、Manager、标程等） |
+| `pipeline` | `{ "problem": ".", "sandbox": "auto", "require_tier": false }` | 一键执行自动化出题流水线（build ➡️ gen ➡️ validate ➡️ ans ➡️ verify ➡️ tl） |
+| `stress` | `{ "problem": ".", "generator": "gen.cpp", "solution": "solutions/wa.cpp", "brute": "solutions/brute.cpp", "count": 100, "time_budget": "60s" }` | 自动化差分对拍找反例 |
+| `verify` | `{ "problem": ".", "sandbox": "auto", "require_tier": false }` | 批量验证 `problem.toml` 中声明的所有期望解法 |
+| `doctor` | `{ "problem": true \| "path/to/problem" }` | 诊断宿主沙盒与指定题目目录（布尔值或路径字符串）的数据健康度 |
 | `show` | `{ "problem": ".", "run_id": "", "test": "1" }` | 深度检查某次运行或某个具体测试点的输入输出差异 |
-| `contest` | `{ "dir": "contest_root" }` | 批量评测整场多题多选手的比赛包 |
+| `contest` | `{ "dir": "contest_root", "problems": [], "contestants": [] }` | 批量评测整场多题多选手的比赛包 |
+| `init_problem` | `{ "dir": "my_problem", "type": "traditional", "name": "my_prob", "title": "My Problem", "force": false }` | 初始化新题目目录骨架（安全拒绝覆盖已有题目，除非 `force: true`） |
 
-> ⚠️ **注意**：`uj init` 目前是 CLI 独有命令（`uj init <dir> --type traditional`），尚未纳入 MCP 工具集。创建题目目录骨架建议直接使用 CLI。
+> 💡 **提示**：无论是通过 MCP 工具 `init_problem` 还是 CLI 命令 `uj init <dir> --type <type> [--name <id>] [--title <title>] [--force]`，当目录已存在 `problem.toml` 时默认都会拒绝覆盖以保护已有文件。
 
 ---
 
@@ -82,13 +83,15 @@ uj stress -p . --gen gen.cpp --sol solutions/wa.cpp --brute solutions/brute.cpp 
 ```
 
 #### 全局通用 CLI 参数表 (Global Flags)
-- `-p, --problem <DIR>`：指定包含 `problem.toml` 的题目根目录（默认 `.`）。
+- `-p, --problem <DIR>`：指定包含 `problem.toml` 的题目根目录（默认 `.`；支持 `judge`, `build`, `gen`, `validate`, `ans`, `verify`, `tl`, `stress`, `pack`, `pipeline`, `last`, `show`, `clean`, `report`, `doctor`）。
 - `--format <human|json|ndjson>`：输出格式。交互终端默认 `human`，非 TTY 环境默认 `json`。
+- `--color <auto|always|never>`：控制终端 ANSI 颜色输出（默认 `auto`）。
 - `-j, --jobs <N>`：并行评测/编译槽位数（默认自动检测物理核心数）。
-- `--sandbox <auto|full|degraded|none>`：沙盒隔离等级（默认 `auto`）。
-- `--require-tier`：要求必须达到 Full 隔离层级，否则直接中止。
+- `--sandbox <auto|full|none>`：请求沙盒隔离模式（默认 `auto`；注意 `Degraded` 是运行时自动回退后上报在 `sandbox_tier` 中的真实层级，而非命令行请求模式）。
+- `--require-tier`：要求必须达到 Full 隔离层级，否则直接报错中止（Fail-Closed）。
 - `--no-cache`：禁用编译二进制与输出答案的 Blake3 缓存，强制重跑。
 - `--fail-fast`：某个测试点未通过时立即终止当前子任务剩余测试点。
+- `--precise` / `--no-precise`：开启或显式关闭边界测试点多次采样复测机制（默认开启 `--precise`）。
 
 ---
 
@@ -171,7 +174,8 @@ tag = "wrong_answer"
 | **根目录** | `interactor` | `path` | `None` | 交互题交互器路径（如 `"interactor.cpp"`） |
 | **根目录** | `manager` | `path` | `None` | 通信题评测管理器（如 `"manager.cpp"`） |
 | **根目录** | `processes` | `usize` | `1` | 通信题参赛选手进程数量 |
-| **根目录** | `communication_topology` | `string` | `None` | 当 `processes > 1` 时必填支持的拓扑结构（如 `"ring"` 或 `"pipeline"`） |
+| **根目录** | `communication_topology` | `string` | `None` | 当 `type="communication"` 时必填支持的拓扑结构：`"star"`, `"pipeline"`, 或 `"ring"` |
+| `[grader]` | `files` / `headers` | `[path]` | `[]` | 当 `type="grader"` 时配置交互库源码（如 `files = ["grader.cpp"]`）与头文件（如 `headers = ["grader.h"]`） |
 | `[limits]` | `time` | `string` | **必填** | **带单位字符串**。如 `"1s"`, `"1.0s"`, `"500ms"`（底层由 `parse_time_ms` 解析） |
 | `[limits]` | `memory` | `string` | **必填** | **带单位字符串**。如 `"256MB"`, `"512MiB"`, `"1GiB"`（底层由 `parse_bytes` 解析） |
 | `[limits]` | `stack` | `string` | `"same"` | 栈空间限制。合法值：`"same"`, `"unlimited"`, 或带单位如 `"256MiB"` |
@@ -180,8 +184,8 @@ tag = "wrong_answer"
 | `[io]` | `input` / `output` | `string` | `None` | 文件 IO 模式下的文件名（如 `"sum.in"`, `"sum.out"`） |
 | `[checker]` | `type` | `enum` | `"builtin"` | `"builtin"`, `"testlib"`, `"lemon"` |
 | `[checker]` | `name` | `string` | `None` | 当 `type="builtin"` 时有效。合法值：`"exact"`, `"wcmp"`, `"fcmp"`, `"lcmp"`, `"ncmp"`, `"hcmp"`, `"rcmp4"`, `"rcmp6"`, `"rcmp9"`, `"yesno"` |
-| `[checker]` | `path` | `path` | `None` | 当 `type="testlib"` 时指定自定义校验器源码（如 `"checker.cpp"`） |
-| `[checker]` | `pe_as_wa` | `bool` | `true` | 是否将格式错误视为 WA |
+| `[checker]` | `path` | `path` | `None` | 当 `type="testlib"` 或 `"lemon"` 时指定自定义校验器源码（如 `"checker.cpp"`） |
+| `[checker]` | `pe_as_wa` | `bool` | `false` | 是否将格式错误（PE）视为 WA（默认 `false`） |
 | `[tests]` | `dir` | `path` | `"tests"` | 测试数据存放目录（**默认是 `tests`，不是 `data`**） |
 | `[tests]` | `pattern` | `string` | `"auto"` | 输入文件识别模式（默认识别 `*.in`） |
 | `[[tests.gen]]` | `generator` | `string` | **必填** | 生成器源码或程序路径（如 `"gen.cpp"`） |
@@ -196,15 +200,17 @@ tag = "wrong_answer"
 | `[[solutions]]` | `path` | `path` | **必填** | 解法源码路径（**字段名是 `path`，不是 `source`**） |
 | `[[solutions]]` | `tag` | `enum` | **必填** | 预期行为标签（**字段名是 `tag`，不是 `expect`**）。合法值见下文 |
 | `[[solutions]]` | `expect_subtasks` | `map` | `None` | 子任务级别的精确预期，如 `{ 1 = "AC", 2 = "TLE" }` |
+| `[[solutions]]` | `allow_verdicts` | `[Verdict]` | `None` | 额外允许在单个测试点上出现的结论列表（如 `["WA", "TLE"]`） |
 
 #### SolutionTag 合法枚举值
-- `"main"`：官方主标程（要求必须所有测试点 Accepted，`uj ans` 优先选用此解法生成 `.ans`）。
-- `"accepted"`：其他备选标程/常数不同的正解（要求全部 Accepted）。
-- `"wrong_answer"`：预期 WA 解（必须至少出现一次 WA，且**不得**发生 TLE/MLE/RE 等崩溃）。
-- `"time_limit"`：预期超时暴力解（必须至少出现一次 TLE，且**不得**发生 WA/MLE/RE 等）。
-- `"memory_limit"`：预期爆内存解（必须至少出现一次 MLE，且不得发生 WA/TLE/RE）。
-- `"runtime_error"`：预期崩溃解（必须至少出现一次 RE，且不得发生 WA/TLE/MLE）。
-- `"rejected"`：预期被拒（最终结论只要不是 AC 即可）。
+- `"main"`（别名 `"std"`）：官方主标程（要求必须所有测试点 Accepted，`uj ans` 优先选用此解法生成 `.ans`）。
+- `"accepted"`（别名 `"ac"`）：其他备选标程/常数不同的正解（要求全部 Accepted）。
+- `"wrong_answer"`（别名 `"wa"`）：预期 WA 解（必须至少出现一次 WA，且**不得**发生 TLE/MLE/RE 等崩溃）。
+- `"time_limit"`（别名 `"tle"`）：预期超时暴力解（必须至少出现一次 TLE，且**不得**发生 WA/MLE/RE 等）。
+- `"wrong_answer_or_time_limit"`（别名 `"wa_or_tle"`）：允许同时出现 WA 与 TLE 的次优/错误启发式解法（必须至少有一个 WA，且不得出现 MLE/RE）。
+- `"memory_limit"`（别名 `"mle"`）：预期爆内存解（必须至少出现一次 MLE，且不得发生 WA/TLE/RE）。
+- `"runtime_error"`（别名 `"re"`）：预期崩溃解（必须至少出现一次 RE，且不得发生 WA/TLE/MLE）。
+- `"rejected"`：预期被拒（最终结论只要不是 AC 且无 JF/SE 即可）。
 - `"partial"`：部分分算法（得分必须严格满足 `0 < score < 100`）。
 
 ---
@@ -301,7 +307,7 @@ flowchart TD
     B --> C["执行评测: uj judge solutions/my_sol.cpp -p . --format json"]
     C --> D{"解析 JSON 结果"}
     D -- "AC (verdict='AC', score=100)" --> E["🎉 任务完成！汇报成功"]
-    D -- "CE (verdict='CE')" --> F["提取 compile_error 字段, 修复语法/头文件错误"] --> B
+    D -- "CE (ok=false, error.kind='CompileError' 或 verdict='CE')" --> F["提取 error.message 或 tests[0].message, 修复语法/头文件错误"] --> B
     D -- "WA (verdict='WA')" --> G["提取 tests[i].diff 与 checker 字段, 定位逻辑 Bug"] --> B
     D -- "TLE (verdict='TLE')" --> H["检查 max_time_ms 与算法复杂度, 优化常数/渐进复杂度"] --> B
     D -- "RE (verdict='RE')" --> I["检查 exit.signal (11=段错误, 6=断言, 8=除零), 修复数组/指针"] --> B
@@ -324,21 +330,38 @@ def judge_submission(solution_path: str, problem_dir: str = ".") -> Dict[str, An
     except json.JSONDecodeError as e:
         return {"status": "SE", "error": f"JSON parse error: {e}, stderr: {proc.stderr}"}
 
+    # 1. 结构化错误信封（例如编译失败 EXIT_COMPILE_ERROR=5 或配置/沙盒错误）
+    if report.get("ok") is False and "error" in report:
+        err = report["error"]
+        if err.get("kind") == "CompileError":
+            return {
+                "status": "CE",
+                "compile_error": err.get("message", "")
+            }
+        return {
+            "status": "SE",
+            "error": err.get("message", "Unknown error")
+        }
+
     verdict = report.get("verdict")
     score = report.get("score", 0.0)
 
-    # 1. 编译错误 (CE) 的真实字段是 compile_error
+    # 2. 若读取的是保存的 SubmissionJudgeReport (如 .uj/runs/last.json) 中的 CE 报告
     if verdict == "CE":
+        tests = report.get("tests", [])
+        ce_msg = tests[0].get("message", "") if tests else ""
         return {
             "status": "CE",
-            "compile_error": report.get("compile_error", "")
+            "compile_error": ce_msg
         }
 
-    # 2. 系统异常 (SE)
-    if verdict == "SE":
+    # 3. 系统异常 (SE / JF)：详细原因保存在对应测试点的 message 字段中
+    if verdict in ("SE", "JF"):
+        tests = report.get("tests", [])
+        se_msgs = [t.get("message") for t in tests if t.get("message")]
         return {
-            "status": "SE",
-            "error": report.get("judge_failed_error", "Unknown system failure")
+            "status": verdict,
+            "error": "; ".join(se_msgs) if se_msgs else "Judge failed"
         }
 
     # 3. 正常评测结果分析
@@ -439,6 +462,7 @@ uj stress \
 当对拍检测到分歧时，进程退出码为 `1`，返回如下格式的纯净 JSON：
 ```json
 {
+  "schema_version": 1,
   "ok": false,
   "seed": 142,
   "diff": "wrong answer 1st numbers differ - expected: '15', found: '14'",
@@ -452,12 +476,16 @@ uj stress \
 
 Agent 只需直接读取 `stress/fail-142.in` 文件，即可立即进入断点单步调试或编写边界单元测试！
 
-若 1000 次对拍全部一致，返回：
+若 1000 次对拍全部一致，返回（若因达到 `--time-budget` 提前结束而未跑满 `--count`，则 `"truncated": true`）：
 ```json
 {
+  "schema_version": 1,
   "ok": true,
   "iterations": 1000,
-  "duration_ms": 1425
+  "tested": 1000,
+  "truncated": false,
+  "duration_ms": 1425,
+  "message": "All stress tests passed"
 }
 ```
 

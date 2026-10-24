@@ -26,10 +26,11 @@
 
 ## 2. 结构化错误响应格式
 
-当命令执行出错且使用 JSON 模式时，stdout/stderr 输出如下标准错误对象：
+当命令执行出错且使用 `--format json` 或 `--format ndjson` 模式时，`stdout` 输出如下标准错误对象（`schema_version: 1`）：
 
 ```json
 {
+  "schema_version": 1,
   "ok": false,
   "error": {
     "kind": "ConfigError",
@@ -125,7 +126,7 @@
 > **核心原则**：若存在 SystemError 或 JudgeFailed，最终评测 Verdict 必须呈现失败状态，即使部分子任务已获得分数。
 
 ### 5.2 子任务依赖门控 (Subtask Dependency Gating)
-- 子任务可声明 `dependencies = [subtask_id_1, ...]`。
+- 子任务可声明 `depends = [subtask_id_1, ...]`。
 - 依赖判定按子任务拓扑排序严格执行（声明顺序无差别不变性）。
 - **门控规则**：若被依赖的子任务结论非 `Accepted`（或未达标），依赖该子任务的所有测试点将被标记为 `Skipped`，得分强制计 `0.0`。
 
@@ -140,11 +141,15 @@
 
 ## 6. MCP Server 规范与并发取消模型 (MCP Protocol)
 
-`uj mcp` 实现 Model Context Protocol 2024-11-05 规范，采用 Stdio 传输：
+`uj mcp` 实现 Model Context Protocol（支持 `2024-11-05`、`2025-03-26`、`2025-06-18` 协议版本协商），采用 Stdio 传输：
 1. **纯净标准输出**：标准输入输出只流转合法 JSON-RPC 2.0 数据，禁止向 stdout 输出任何日志或 ANSI 控制码。
-2. **并发取消机制**：
-   - 客户端发送 `$/cancelRequest` 或 `notifications/cancelled` 时，服务端通过共享 `CancelToken` 触发正在执行的评测或出题进程组安全回收与中断。
-   - 被取消任务立即终止沙盒与子进程树，并返回包含 `{"isError": true, "content": [{"text": "Cancelled"}]}` 的受控响应。
-3. **Fail-Closed 故障防护**：
-   - 对任何非法的 JSON-RPC 协议版本（如 `jsonrpc: "1.0"`），立即返回标准错误码 `-32600 (Invalid Request)`。
-   - 目标题目不存在或配置破损时，直接返回 `isError: true`，绝不静默报告假成功。
+2. **协议级 JSON-RPC 2.0 校验与错误码**：
+   - `-32700 (Parse error)`：非合法 JSON 载荷。
+   - `-32600 (Invalid Request)`：非 JSON 对象、空批处理数组 `[]`、`jsonrpc != "2.0"`、缺失或非字符串 `method`、非法 `id` 类型（非 string/number/null）或非法 `params` 类型。
+   - `-32601 (Method not found)`：未知 RPC 方法。
+   - `-32602 (Invalid params)`：调用未知工具名称、缺失必填工具参数（如 `judge` 缺少 `submission`/`sources`、`stress` 缺少 `generator`/`solution`/`brute`、`contest`/`init_problem` 缺少 `dir`）或参数类型/枚举值非法（包括非法的 `run_id` 路径穿越）。
+   - **Notification 语义**：省略 `"id"` 字段的请求严格视为 JSON-RPC Notification，服务端绝不向其发送响应；显式携带 `"id": null` 的请求按标准返回 `"id": null` 响应。
+   - **运行时业务错误**：当工具参数合法但在编译、发现用例或评测执行中发生业务错误时，返回 `result: { "isError": true, "content": [...] }`。
+3. **非阻塞并发与 `requestId` 精准取消**：
+   - 当耗时 `tools/call` 在后台工作线程执行时，`ping`、`tools/list`、`initialize` 等轻量请求立即在线响应，后续 `tools/call` 自动进入有序队列。
+   - 客户端发送 `$/cancelRequest` 或 `notifications/cancelled` 时，服务端按 `params.requestId` 精准匹配当前执行中或队列中的任务并通过 `CancelToken` 触发沙盒与子进程树安全回收。

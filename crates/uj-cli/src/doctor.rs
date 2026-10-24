@@ -19,13 +19,41 @@ pub enum CheckStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoctorReport {
+    pub schema_version: u32,
     pub ok: bool,
     pub platform: String,
     pub checks: Vec<DoctorCheckItem>,
 }
 
-pub fn run_doctor(problem_mode: bool, _fix_apparmor: bool) -> DoctorReport {
+/// Returns actionable instructions and profile content for installing an AppArmor profile
+/// allowing `uj` to create unprivileged user namespaces on Ubuntu 23.10+.
+pub fn apparmor_profile_instructions() -> String {
+    let exe_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/usr/local/bin/uj".to_string());
+    format!(
+        "Note: Installing an AppArmor profile requires root privileges; uj does not modify /etc/apparmor.d automatically.\n\
+Run the following command as root to install the profile for '{exe_path}':\n\n\
+sudo tee /etc/apparmor.d/uj >/dev/null <<'EOF'\n\
+abi <abi/4.0>,\n\
+include <tunables/global>\n\
+\n\
+profile uj {exe_path} flags=(unconfined) {{\n\
+  userns,\n\
+}}\n\
+EOF\n\
+sudo apparmor_parser -r /etc/apparmor.d/uj\n\n\
+Alternatively, disable the restriction system-wide:\n\
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+    )
+}
+
+pub fn run_doctor(problem_dir: Option<&Path>, fix_apparmor: bool) -> DoctorReport {
     let mut checks = Vec::new();
+
+    if fix_apparmor {
+        eprintln!("{}", apparmor_profile_instructions());
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -34,16 +62,17 @@ pub fn run_doctor(problem_mode: bool, _fix_apparmor: bool) -> DoctorReport {
 
     #[cfg(target_os = "linux")]
     {
-        run_linux_checks(&mut checks, _fix_apparmor);
+        run_linux_checks(&mut checks, fix_apparmor);
     }
 
-    if problem_mode {
-        run_problem_checks(&mut checks, Path::new("."));
+    if let Some(dir) = problem_dir {
+        run_problem_checks(&mut checks, dir);
     }
 
     let ok = checks.iter().all(|c| c.status != CheckStatus::Fail);
 
     DoctorReport {
+        schema_version: 1,
         ok,
         platform: std::env::consts::OS.to_string(),
         checks,
@@ -206,15 +235,16 @@ fn run_linux_checks(checks: &mut Vec<DoctorCheckItem>, fix_apparmor: bool) {
     if apparmor_restrict.exists() {
         let val = std::fs::read_to_string(apparmor_restrict).unwrap_or_default();
         if val.trim() == "1" {
-            if fix_apparmor {
-                // Print profile
-                eprintln!("Installing AppArmor profile for uj...");
-            }
+            let rec = if fix_apparmor {
+                apparmor_profile_instructions()
+            } else {
+                "Run 'sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' or view AppArmor profile installation instructions via 'uj doctor --fix-apparmor'".to_string()
+            };
             checks.push(DoctorCheckItem {
                 name: "Ubuntu AppArmor Userns Restriction".to_string(),
                 status: CheckStatus::Warn,
                 message: "kernel.apparmor_restrict_unprivileged_userns=1 is active".to_string(),
-                recommendation: Some("Run 'sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' or install uj AppArmor profile via 'uj doctor --fix-apparmor'".to_string()),
+                recommendation: Some(rec),
             });
         }
     }
