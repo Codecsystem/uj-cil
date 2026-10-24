@@ -594,7 +594,7 @@ pub fn execute_in_sandbox_with_stdio(
                     if (st.f_flag & libc::ST_NODIRATIME) != 0 {
                         preserve |= libc::MS_NODIRATIME;
                     }
-                    if (st.f_flag & libc::ST_RELATIME) != 0 {
+                    if (st.f_flag & 4096/* ST_RELATIME */) != 0 {
                         preserve |= libc::MS_RELATIME;
                     }
                     if (st.f_flag & libc::ST_SYNCHRONOUS) != 0 {
