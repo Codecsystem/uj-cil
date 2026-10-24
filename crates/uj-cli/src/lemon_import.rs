@@ -152,10 +152,12 @@ pub fn generate_problem_toml(task: &LemonTask, tests_dir: Option<&str>) -> Strin
         toml.push_str("mode = \"file\"\n");
     }
     if !stdin_check && let Some(ref inf) = task.input_file_name {
-        toml.push_str(&format!("input = {}\n", toml_quote(inf)));
+        let leaf = inf.rsplit(['/', '\\']).next().unwrap_or(inf);
+        toml.push_str(&format!("input = {}\n", toml_quote(leaf)));
     }
     if !stdout_check && let Some(ref outf) = task.output_file_name {
-        toml.push_str(&format!("output = {}\n", toml_quote(outf)));
+        let leaf = outf.rsplit(['/', '\\']).next().unwrap_or(outf);
+        toml.push_str(&format!("output = {}\n", toml_quote(leaf)));
     }
     toml.push('\n');
 
@@ -346,7 +348,7 @@ pub fn run_import_lemon(cdf_path: &Path, force: bool, format: OutputFormat) -> E
 
         let data_dir_candidate = base_dir.join("data").join(&task.source_file_name);
         let tests_dir_override = if data_dir_candidate.exists() {
-            Some(format!("../../data/{}", task.source_file_name))
+            Some("tests".to_string())
         } else {
             None
         };
@@ -553,7 +555,7 @@ mod tests {
             }],
         };
 
-        let toml_str = generate_problem_toml(&task, Some("..\\..\\data\\safe_prob"));
+        let toml_str = generate_problem_toml(&task, Some("data\\safe_prob"));
         let cfg = ProblemConfig::from_toml_str(&toml_str, None)
             .expect("Windows backslashes and quotes must serialize to valid TOML");
         assert_eq!(cfg.name, "safe_prob");

@@ -675,6 +675,7 @@ pub fn run_gen_with_session(
     cancel: &CancelToken,
     session: &CompileSession,
 ) -> ExitCode {
+    uj_engine::clear_answer_cache();
     let (_config_path, _content, cfg) = match load_problem(problem_dir, format) {
         Ok(res) => res,
         Err(code) => return code,
@@ -917,6 +918,7 @@ pub fn run_validate_with_session(
     cancel: &CancelToken,
     session: &CompileSession,
 ) -> ExitCode {
+    uj_engine::clear_answer_cache();
     let (_config_path, _content, cfg) = match load_problem(problem_dir, format) {
         Ok(res) => res,
         Err(code) => return code,
@@ -1181,6 +1183,7 @@ pub fn run_ans_with_session(
     cancel: &CancelToken,
     session: &CompileSession,
 ) -> ExitCode {
+    uj_engine::clear_answer_cache();
     let (_config_path, _content, cfg) = match load_problem(problem_dir, format) {
         Ok(res) => res,
         Err(code) => return code,
@@ -3570,6 +3573,7 @@ pub fn pipeline_core(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> (ExitCode, serde_json::Value) {
+    uj_engine::clear_answer_cache();
     let session = CompileSession::new();
     let sub_format = match format {
         OutputFormat::Json => OutputFormat::Silent,

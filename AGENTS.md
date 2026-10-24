@@ -169,6 +169,7 @@ uj mcp
 ```
 MCP 服务端对外暴露的工具包含：
 - `doctor`: 诊断宿主环境与题目健康度。
+- `init_problem`: 初始化题目目录骨架（支持 `type`、`name`、`title`、`force`）。
 - `build`: 编译指定或全部题目组件。
 - `verify`: 批量校验题目中声明的各类解法结论。
 - `pipeline`: 一键执行出题全生命周期流水线。
@@ -177,5 +178,5 @@ MCP 服务端对外暴露的工具包含：
 - `show`: 深入查看某次运行或特定测试点的输入输出差异。
 - `contest`: 批量运行比赛包评测并生成排行榜。
 
-> 注：初始化题目目录骨架请使用 CLI 命令（`uj init <dir> --type <type>`）。详细 Agent 工作流与参数说明请参阅 [docs/specs/AGENT_GUIDE.md](docs/specs/AGENT_GUIDE.md)。
+> 注：详细 Agent 工作流与参数说明请参阅 [docs/specs/AGENT_GUIDE.md](docs/specs/AGENT_GUIDE.md)。
 

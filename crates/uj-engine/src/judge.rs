@@ -183,7 +183,7 @@ pub(crate) fn exit_info_from_status(status: ExitStatus) -> ExitInfo {
 }
 
 pub(crate) fn to_report_diff(d: uj_checker::DiffSummary) -> DiffSummary {
-    let truncated = d.expected.ends_with("...") || d.actual.ends_with("...");
+    let truncated = d.truncated || d.expected.ends_with("...") || d.actual.ends_with("...");
     DiffSummary {
         line: d.line,
         column: d.column,

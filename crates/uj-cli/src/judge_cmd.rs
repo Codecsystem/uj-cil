@@ -641,6 +641,7 @@ pub fn run_show(
 }
 
 pub fn run_clean(problem_dir: &Path, format: OutputFormat) -> ExitCode {
+    uj_engine::clear_answer_cache();
     let uj_dir = problem_dir.join(".uj");
     let existed = uj_dir.exists();
     if existed {
