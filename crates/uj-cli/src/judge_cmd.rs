@@ -1,13 +1,13 @@
 //! CLI handlers for judge, last, show, and clean commands.
 
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::SystemTime;
 
 use crossbeam_channel::unbounded;
-use uj_core::config::ProblemConfig;
 use uj_core::verdict::Verdict;
 use uj_engine::compiler::CompileError;
 use uj_engine::judge::JudgeOptions;
@@ -16,10 +16,10 @@ use uj_report::human::{format_human_report, format_test_details};
 use uj_report::result::{JudgeEvent, SubmissionJudgeReport};
 use uj_sandbox::CancelToken;
 
-use crate::cli::{Cli, OutputFormat, SandboxMode};
+use crate::cli::{Cli, OutputFormat};
 use crate::error::{
-    EXIT_COMPILE_ERROR, EXIT_INTERRUPTED, EXIT_JUDGE_FAILED, EXIT_NON_AC, EXIT_SUCCESS,
-    EXIT_USAGE_OR_CONFIG, handle_config_error,
+    EXIT_COMPILE_ERROR, EXIT_JUDGE_FAILED, EXIT_NON_AC, EXIT_SUCCESS, EXIT_USAGE_OR_CONFIG,
+    emit_error, emit_interrupted, load_problem, validate_run_id,
 };
 
 static RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -74,100 +74,64 @@ pub fn run_judge(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
-    let config_path = problem_dir.join("problem.toml");
-    let config_content = match fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            if format == OutputFormat::Json {
-                let err_obj = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "kind": "ConfigError",
-                        "message": format!("Cannot read problem.toml at '{}': {e}", config_path.display()),
-                        "hint": "Ensure the problem directory exists and contains problem.toml"
-                    }
-                });
-                println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
-            } else {
-                eprintln!(
-                    "Error: Cannot read problem.toml at '{}': {e}",
-                    config_path.display()
-                );
-            }
-            return ExitCode::from(EXIT_USAGE_OR_CONFIG);
-        }
-    };
-
-    let problem_config = match ProblemConfig::from_toml_str(&config_content, Some(&config_path)) {
-        Ok(c) => c,
-        Err(e) => return handle_config_error(e, format == OutputFormat::Json),
+    let (_config_path, _config_content, problem_config) = match load_problem(problem_dir, format) {
+        Ok(res) => res,
+        Err(code) => return code,
     };
 
     let tests = match uj_core::tests::discover_tests(problem_dir, &problem_config) {
         Ok(t) => t,
         Err(e) => {
-            if format == OutputFormat::Json {
-                let err_obj = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "kind": "IoError",
-                        "message": format!("Failed to discover tests: {e}"),
-                    }
-                });
-                println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
-            } else {
-                eprintln!("Error discovering tests: {e}");
-            }
+            emit_error(
+                format,
+                "IoError",
+                format!("Failed to discover tests: {e}"),
+                None,
+            );
             return ExitCode::from(EXIT_USAGE_OR_CONFIG);
         }
     };
 
     if tests.is_empty() {
-        if format == OutputFormat::Json {
-            let err_obj = serde_json::json!({
-                "ok": false,
-                "error": {
-                    "kind": "NoTestsFound",
-                    "message": format!("No test cases (.in files) found in '{}'", problem_dir.join(&problem_config.tests.dir).display()),
-                    "hint": "Check problem.toml [tests.dir] configuration"
-                }
-            });
-            println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
-        } else {
-            eprintln!(
-                "Warning: No test cases found in '{}'.",
+        emit_error(
+            format,
+            "NoTestsFound",
+            format!(
+                "No test cases (.in files) found in '{}'",
                 problem_dir.join(&problem_config.tests.dir).display()
-            );
-        }
+            ),
+            Some("Check problem.toml [tests.dir] configuration"),
+        );
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
 
-    let sandbox_mode_str = match cli.sandbox {
-        SandboxMode::Auto => "auto",
-        SandboxMode::Full => "full",
-        SandboxMode::Degraded => "degraded",
-        SandboxMode::None => "none",
-    };
+    let sandbox_mode_str = cli.sandbox_mode_str();
 
     if cli.require_tier
         && let Err(e) = uj_sandbox::create_sandbox(sandbox_mode_str, true)
     {
-        if format == OutputFormat::Json {
-            let err_obj = serde_json::json!({
-                "schema_version": 1,
-                "problem": problem_config.name,
-                "submission": "",
-                "verdict": "SE",
-                "score": 0.0,
-                "max_time_ms": 0,
-                "max_memory_kb": 0,
-                "subtasks": [],
-                "tests": [],
-                "judge_failed_error": format!("Sandbox tier requirement not met: {e}")
-            });
-            println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
-        } else {
-            eprintln!("Failed to satisfy sandbox tier requirement: {e}");
+        let err_obj = serde_json::json!({
+            "schema_version": 1,
+            "problem": problem_config.name,
+            "submission": "",
+            "verdict": "SE",
+            "score": 0.0,
+            "max_time_ms": 0,
+            "max_memory_kb": 0,
+            "subtasks": [],
+            "tests": [],
+            "judge_failed_error": format!("Sandbox tier requirement not met: {e}")
+        });
+        match format {
+            OutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
+            }
+            OutputFormat::Ndjson => {
+                println!("{}", serde_json::to_string(&err_obj).unwrap());
+            }
+            OutputFormat::Human | OutputFormat::Silent => {
+                eprintln!("Failed to satisfy sandbox tier requirement: {e}");
+            }
         }
         return ExitCode::from(EXIT_JUDGE_FAILED);
     }
@@ -176,7 +140,7 @@ pub fn run_judge(
         sandbox_mode: sandbox_mode_str.to_string(),
         require_tier: cli.require_tier,
         fail_fast: cli.fail_fast,
-        precise: cli.precise,
+        precise: cli.effective_precise(),
     };
 
     let compile_session = uj_engine::compiler::CompileSession::new();
@@ -213,9 +177,11 @@ pub fn run_judge(
         expanded_sources.push(s.clone());
     }
 
+    let use_tui = cli.tui && format == OutputFormat::Human && std::io::stderr().is_terminal();
+
     for source in &expanded_sources {
         if cancel.is_cancelled() {
-            return ExitCode::from(EXIT_INTERRUPTED);
+            return emit_interrupted(format, "Judging");
         }
 
         let source_name = source
@@ -234,22 +200,27 @@ pub fn run_judge(
             .min(test_names.len());
 
         // Set up event streaming: TUI, NDJSON, or indicatif progress bar
-        let (event_sender, event_thread) = if cli.tui {
+        let (event_sender, event_thread) = if use_tui {
             let (tx, rx) = unbounded::<JudgeEvent>();
             let prob_name = problem_config.name.clone();
             let sub_name = source_name.clone();
             let cancel_clone = cancel.clone();
 
             let handle = thread::spawn(move || {
-                let _ = uj_tui::run_tui(
+                if let Err(e) = uj_tui::run_tui(
                     &prob_name,
                     &sub_name,
                     &test_names,
                     slot_count,
-                    rx,
+                    rx.clone(),
                     cancel_clone,
                     true,
-                );
+                ) {
+                    eprintln!(
+                        "Warning: TUI initialization failed ({e}); falling back to non-TUI execution."
+                    );
+                    while rx.recv().is_ok() {}
+                }
             });
             (Some(tx), Some(handle))
         } else if format == OutputFormat::Ndjson {
@@ -334,11 +305,51 @@ pub fn run_judge(
                         final_score: 0.0,
                     });
                 }
+                drop(event_sender);
+                if let Some(h) = event_thread {
+                    let _ = h.join();
+                }
 
                 let err_msg = match &e {
                     CompileError::Failed(msg) => msg.clone(),
                     other => other.to_string(),
                 };
+                let ce_test = uj_report::result::SingleTestResult {
+                    id: "compile".to_string(),
+                    subtask: None,
+                    verdict: Verdict::CompileError,
+                    time_ms: 0,
+                    wall_ms: 0,
+                    memory_kb: 0,
+                    score: 0.0,
+                    exit: uj_report::result::ExitInfo {
+                        code: Some(1),
+                        signal: None,
+                        nt_status: None,
+                    },
+                    message: Some(err_msg.clone()),
+                    checker: Some(err_msg.clone()),
+                    diff: None,
+                    timing: uj_report::result::TimingInfo::default(),
+                    sandbox_tier: None,
+                };
+                let ce_struct = SubmissionJudgeReport {
+                    schema_version: 1,
+                    problem: problem_config.name.clone(),
+                    submission: source
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    verdict: Verdict::CompileError,
+                    score: 0.0,
+                    max_time_ms: 0,
+                    max_memory_kb: 0,
+                    subtasks: Vec::new(),
+                    tests: vec![ce_test],
+                };
+                let _ = save_run_report(problem_dir, &ce_struct);
+
                 let ce_report = serde_json::json!({
                     "schema_version": 1,
                     "problem": problem_config.name,
@@ -348,7 +359,7 @@ pub fn run_judge(
                     "max_time_ms": 0,
                     "max_memory_kb": 0,
                     "subtasks": [],
-                    "tests": [],
+                    "tests": ce_struct.tests,
                     "compile_error": err_msg
                 });
 
@@ -383,7 +394,7 @@ pub fn run_judge(
         }
 
         if cancel.is_cancelled() {
-            return ExitCode::from(EXIT_INTERRUPTED);
+            return emit_interrupted(format, "Judging");
         }
 
         match judge_res {
@@ -429,6 +440,8 @@ pub fn run_judge(
 
                 if format == OutputFormat::Json {
                     json_reports.push(err_obj);
+                } else if format == OutputFormat::Ndjson {
+                    println!("{}", serde_json::to_string(&err_obj).unwrap());
                 } else {
                     eprintln!("Judging failed: {e}");
                 }
@@ -454,9 +467,14 @@ pub fn run_judge(
 pub fn run_last(problem_dir: &Path, format: OutputFormat) -> ExitCode {
     let last_path = problem_dir.join(".uj").join("runs").join("last.json");
     if !last_path.exists() {
-        eprintln!(
-            "No previous run found at '{}'. Run 'uj judge' first.",
-            last_path.display()
+        emit_error(
+            format,
+            "ReportNotFound",
+            format!(
+                "No previous run found at '{}'. Run 'uj judge' first.",
+                last_path.display()
+            ),
+            Some("Run 'uj judge' first to generate a run report."),
         );
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
@@ -464,7 +482,12 @@ pub fn run_last(problem_dir: &Path, format: OutputFormat) -> ExitCode {
     let content = match fs::read_to_string(&last_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to read last run: {e}");
+            emit_error(
+                format,
+                "ReportReadError",
+                format!("Failed to read last run '{}': {e}", last_path.display()),
+                None,
+            );
             return ExitCode::from(EXIT_JUDGE_FAILED);
         }
     };
@@ -472,14 +495,22 @@ pub fn run_last(problem_dir: &Path, format: OutputFormat) -> ExitCode {
     let report: SubmissionJudgeReport = match serde_json::from_str(&content) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to parse last run: {e}");
+            emit_error(
+                format,
+                "ReportParseError",
+                format!("Failed to parse last run '{}': {e}", last_path.display()),
+                None,
+            );
             return ExitCode::from(EXIT_JUDGE_FAILED);
         }
     };
 
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson => {
+        OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
+        OutputFormat::Ndjson => {
+            println!("{}", serde_json::to_string(&report).unwrap());
         }
         OutputFormat::Human => {
             println!("{}", format_human_report(&report));
@@ -501,25 +532,45 @@ pub fn run_show(
     format: OutputFormat,
 ) -> ExitCode {
     let run_file = if let Some(id) = run_id {
-        let name = if id.ends_with(".json") {
-            id.to_string()
-        } else {
-            format!("{id}.json")
+        let valid_id = match validate_run_id(id) {
+            Ok(s) => s,
+            Err(msg) => {
+                emit_error(
+                    format,
+                    "InvalidRunId",
+                    msg,
+                    Some("Provide a safe run ID without path separators or '..'."),
+                );
+                return ExitCode::from(EXIT_USAGE_OR_CONFIG);
+            }
         };
-        problem_dir.join(".uj").join("runs").join(name)
+        problem_dir
+            .join(".uj")
+            .join("runs")
+            .join(format!("{valid_id}.json"))
     } else {
         problem_dir.join(".uj").join("runs").join("last.json")
     };
 
     if !run_file.exists() {
-        eprintln!("Run file '{}' does not exist.", run_file.display());
+        emit_error(
+            format,
+            "ReportNotFound",
+            format!("Run file '{}' does not exist.", run_file.display()),
+            Some("Run 'uj judge' first to generate a run report."),
+        );
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
 
     let content = match fs::read_to_string(&run_file) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to read run file: {e}");
+            emit_error(
+                format,
+                "ReportReadError",
+                format!("Failed to read run file '{}': {e}", run_file.display()),
+                None,
+            );
             return ExitCode::from(EXIT_JUDGE_FAILED);
         }
     };
@@ -527,7 +578,12 @@ pub fn run_show(
     let report: SubmissionJudgeReport = match serde_json::from_str(&content) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to parse run report: {e}");
+            emit_error(
+                format,
+                "ReportParseError",
+                format!("Failed to parse run report '{}': {e}", run_file.display()),
+                None,
+            );
             return ExitCode::from(EXIT_JUDGE_FAILED);
         }
     };
@@ -535,8 +591,11 @@ pub fn run_show(
     if let Some(target_test) = test_id {
         if let Some(test_res) = report.tests.iter().find(|t| t.id == target_test) {
             match format {
-                OutputFormat::Json | OutputFormat::Ndjson => {
+                OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(test_res).unwrap());
+                }
+                OutputFormat::Ndjson => {
+                    println!("{}", serde_json::to_string(test_res).unwrap());
                 }
                 OutputFormat::Human => {
                     println!("{}", format_test_details(test_res));
@@ -549,16 +608,24 @@ pub fn run_show(
                 ExitCode::from(EXIT_NON_AC)
             }
         } else {
-            eprintln!(
-                "Test case '{target_test}' not found in run '{}'.",
-                run_file.display()
+            emit_error(
+                format,
+                "TestNotFound",
+                format!(
+                    "Test case '{target_test}' not found in run '{}'.",
+                    run_file.display()
+                ),
+                None,
             );
             ExitCode::from(EXIT_USAGE_OR_CONFIG)
         }
     } else {
         match format {
-            OutputFormat::Json | OutputFormat::Ndjson => {
+            OutputFormat::Json => {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+            OutputFormat::Ndjson => {
+                println!("{}", serde_json::to_string(&report).unwrap());
             }
             OutputFormat::Human => {
                 println!("{}", format_human_report(&report));
@@ -573,18 +640,42 @@ pub fn run_show(
     }
 }
 
-pub fn run_clean(problem_dir: &Path) -> ExitCode {
+pub fn run_clean(problem_dir: &Path, format: OutputFormat) -> ExitCode {
     let uj_dir = problem_dir.join(".uj");
-    if uj_dir.exists() {
+    let existed = uj_dir.exists();
+    if existed {
         let cache_dir = uj_dir.join("cache");
         let runs_dir = uj_dir.join("runs");
+        let tmp_dir = uj_dir.join("tmp");
 
         let _ = fs::remove_dir_all(&cache_dir);
         let _ = fs::remove_dir_all(&runs_dir);
-
-        println!("Cache and run records in '{}' cleaned.", uj_dir.display());
-    } else {
-        println!("No .uj directory found; nothing to clean.");
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
+
+    let res = serde_json::json!({
+        "schema_version": 1,
+        "ok": true,
+        "cleaned": existed,
+        "path": uj_dir.to_string_lossy(),
+    });
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        }
+        OutputFormat::Ndjson => {
+            println!("{}", serde_json::to_string(&res).unwrap());
+        }
+        OutputFormat::Human => {
+            if existed {
+                println!("Cache and run records in '{}' cleaned.", uj_dir.display());
+            } else {
+                println!("No .uj directory found; nothing to clean.");
+            }
+        }
+        OutputFormat::Silent => {}
+    }
+
     ExitCode::from(EXIT_SUCCESS)
 }

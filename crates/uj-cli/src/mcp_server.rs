@@ -1,42 +1,44 @@
 //! Model Context Protocol (MCP) server implementation over stdio.
 //!
-//! Exposes `uj` functionality (judge, build, verify, stress, pipeline, doctor, show, contest)
+//! Exposes `uj` functionality (judge, build, verify, stress, pipeline, doctor, show, contest, init_problem)
 //! to AI assistants (Claude, Antigravity, Cursor, etc.) via JSON-RPC 2.0.
 
+#![allow(clippy::result_large_err)]
+
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use uj_core::config::ProblemConfig;
-use uj_core::run::{Limits, RunSpec, Stdio};
-use uj_core::verdict::Verdict;
 use uj_engine::compiler::CompileSession;
 use uj_engine::judge::JudgeOptions;
 use uj_engine::scheduler::Scheduler;
 use uj_report::result::SubmissionJudgeReport;
-use uj_sandbox::{CancelToken, create_sandbox};
+use uj_sandbox::CancelToken;
 
-use crate::cli::{Cli, OutputFormat};
+use crate::cli::{Cli, OutputFormat, SandboxMode, parse_duration_str};
 use crate::doctor;
-use crate::error::EXIT_SUCCESS;
+use crate::error::{EXIT_NON_AC, EXIT_SUCCESS, install_ctrlc, subscribe_ctrlc, validate_run_id};
 
-#[derive(Debug, Deserialize, Clone)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: String,
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+#[derive(Debug, Clone)]
+struct ValidatedRpcMessage {
+    /// `None` means notification (`"id"` key was omitted); `Some(Value::Null)` means `"id": null`.
     id: Option<Value>,
     method: String,
-    #[serde(default)]
     params: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct JsonRpcResponse {
     jsonrpc: &'static str,
     id: Value,
@@ -46,7 +48,7 @@ struct JsonRpcResponse {
     error: Option<JsonRpcError>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct JsonRpcError {
     code: i32,
     message: String,
@@ -54,15 +56,162 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
+impl JsonRpcResponse {
+    fn error(id: Value, code: i32, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+
+    fn ok(id: Value, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+}
+
+struct ActiveWorker {
+    id: Value,
+    cancel: CancelToken,
+    resp_rx: crossbeam_channel::Receiver<JsonRpcResponse>,
+    handle: JoinHandle<()>,
+}
+
+fn validate_rpc_object(val: Value) -> Result<ValidatedRpcMessage, Option<JsonRpcResponse>> {
+    let obj = match val {
+        Value::Object(map) => map,
+        _ => {
+            return Err(Some(JsonRpcResponse::error(
+                Value::Null,
+                -32600,
+                "Invalid Request: expected JSON object",
+            )));
+        }
+    };
+
+    let has_id = obj.contains_key("id");
+    let id_val = if has_id {
+        match obj.get("id") {
+            Some(v @ (Value::String(_) | Value::Number(_) | Value::Null)) => Some(v.clone()),
+            _ => {
+                return Err(Some(JsonRpcResponse::error(
+                    Value::Null,
+                    -32600,
+                    "Invalid Request: 'id' must be a string, number, or null",
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    let err_id = id_val.clone().unwrap_or(Value::Null);
+
+    let method = match obj.get("method") {
+        Some(Value::String(m)) if !m.trim().is_empty() => m.clone(),
+        _ => {
+            return Err(Some(JsonRpcResponse::error(
+                err_id,
+                -32600,
+                "Invalid Request: missing or non-string 'method'",
+            )));
+        }
+    };
+
+    match obj.get("jsonrpc") {
+        Some(Value::String(v)) if v == "2.0" => {}
+        _ => {
+            if has_id {
+                return Err(Some(JsonRpcResponse::error(
+                    err_id,
+                    -32600,
+                    "Invalid Request: 'jsonrpc' must be '2.0'",
+                )));
+            } else {
+                return Err(None);
+            }
+        }
+    }
+
+    let params = match obj.get("params") {
+        None | Some(Value::Null) => None,
+        Some(v @ (Value::Object(_) | Value::Array(_))) => Some(v.clone()),
+        Some(_) => {
+            if has_id {
+                return Err(Some(JsonRpcResponse::error(
+                    err_id,
+                    -32600,
+                    "Invalid Request: 'params' must be an object or array",
+                )));
+            } else {
+                return Err(None);
+            }
+        }
+    };
+
+    Ok(ValidatedRpcMessage {
+        id: id_val,
+        method,
+        params,
+    })
+}
+
+fn is_cancel_method(method: &str) -> bool {
+    matches!(
+        method,
+        "notifications/cancelled" | "$/cancelRequest" | "cancelled"
+    )
+}
+
+fn extract_cancel_request_id(params: &Option<Value>) -> Option<Value> {
+    let p = params.as_ref()?;
+    p.get("requestId").or_else(|| p.get("id")).cloned()
+}
+
+fn spawn_tool_worker(msg: ValidatedRpcMessage) -> ActiveWorker {
+    let id = msg.id.clone().unwrap_or(Value::Null);
+    let task_cancel = CancelToken::new();
+    let cancel_for_worker = task_cancel.clone();
+    let (resp_tx, resp_rx) = crossbeam_channel::bounded::<JsonRpcResponse>(1);
+
+    let handle = thread::spawn(move || {
+        if let Some(resp) = handle_rpc_request(msg, &cancel_for_worker) {
+            let _ = resp_tx.send(resp);
+        }
+    });
+
+    ActiveWorker {
+        id,
+        cancel: task_cancel,
+        resp_rx,
+        handle,
+    }
+}
+
+fn shutdown_active_worker(worker: Option<ActiveWorker>) {
+    if let Some(w) = worker {
+        w.cancel.cancel();
+        let _ = w.resp_rx.recv_timeout(Duration::from_secs(5));
+        let _ = w.handle.join();
+    }
+}
+
 pub fn run_mcp_server() -> ExitCode {
     let stdout = io::stdout();
     let mut writer = stdout.lock();
 
-    let cancel = CancelToken::new();
-    let cancel_clone = cancel.clone();
-    let _ = ctrlc::set_handler(move || {
-        cancel_clone.cancel();
-    });
+    let _ = install_ctrlc();
+    let (cancel, ctrlc_rx) = subscribe_ctrlc();
 
     let (line_tx, line_rx) = crossbeam_channel::unbounded::<String>();
     thread::spawn(move || {
@@ -77,144 +226,240 @@ pub fn run_mcp_server() -> ExitCode {
         }
     });
 
-    let active_task_cancel: Arc<Mutex<Option<CancelToken>>> = Arc::new(Mutex::new(None));
+    let mut active_worker: Option<ActiveWorker> = None;
+    let mut pending_calls: VecDeque<ValidatedRpcMessage> = VecDeque::new();
 
-    while let Ok(line) = line_rx.recv() {
+    loop {
         if cancel.is_cancelled() {
+            shutdown_active_worker(active_worker.take());
             break;
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                let err_resp = JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: {e}"),
-                        data: None,
-                    }),
-                };
-                let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
-                let _ = writer.flush();
-                continue;
-            }
-        };
-
-        // Validate JSON-RPC 2.0 version
-        if req.jsonrpc != "2.0" {
-            if req.id.is_some() {
-                let err_resp = JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id.unwrap_or(Value::Null),
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32600,
-                        message: "Invalid Request: jsonrpc must be '2.0'".to_string(),
-                        data: None,
-                    }),
-                };
-                let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
-                let _ = writer.flush();
-            }
-            continue;
-        }
-
-        // Handle cancellation notifications
-        let is_cancel = req.id.is_none()
-            && (req.method == "notifications/cancelled"
-                || req.method == "$/cancelRequest"
-                || req.method == "cancelled");
-        if is_cancel {
-            if let Some(token) = active_task_cancel.lock().unwrap().as_ref() {
-                token.cancel();
-            }
-            continue;
-        }
-
-        // Ignore standard notifications (no response per JSON-RPC spec)
-        if req.id.is_none()
-            && (req.method.starts_with("notifications/") || req.method.starts_with("$/"))
+        if active_worker.is_none()
+            && let Some(next_call) = pending_calls.pop_front()
         {
-            continue;
+            active_worker = Some(spawn_tool_worker(next_call));
         }
 
-        if req.method == "tools/call" {
-            let task_cancel = CancelToken::new();
-            *active_task_cancel.lock().unwrap() = Some(task_cancel.clone());
-            let (resp_tx, resp_rx) = crossbeam_channel::bounded::<JsonRpcResponse>(1);
-            let cancel_for_worker = task_cancel.clone();
-            let req_clone = req;
-
-            thread::spawn(move || {
-                let resp = handle_rpc_request(req_clone, &cancel_for_worker);
-                if let Some(r) = resp {
-                    let _ = resp_tx.send(r);
+        if let Some(ref worker) = active_worker {
+            let worker_rx = worker.resp_rx.clone();
+            crossbeam_channel::select! {
+                recv(ctrlc_rx) -> _ => {
+                    shutdown_active_worker(active_worker.take());
+                    break;
                 }
-            });
-
-            loop {
-                crossbeam_channel::select! {
-                    recv(resp_rx) -> resp_res => {
-                        if let Ok(resp) = resp_res {
-                            let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
-                            let _ = writer.flush();
-                        }
-                        *active_task_cancel.lock().unwrap() = None;
-                        break;
+                recv(worker_rx) -> resp_res => {
+                    if let Ok(resp) = resp_res {
+                        let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
+                        let _ = writer.flush();
                     }
-                    recv(line_rx) -> incoming_res => {
-                        match incoming_res {
-                            Ok(inc_line) => {
-                                let inc_trimmed = inc_line.trim();
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(inc_trimmed) {
-                                    let method = val.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                                    let cancel_notify = val.get("id").is_none()
-                                        && (method == "notifications/cancelled"
-                                            || method == "$/cancelRequest"
-                                            || method == "cancelled");
-                                    if cancel_notify {
-                                        task_cancel.cancel();
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                task_cancel.cancel();
-                                *active_task_cancel.lock().unwrap() = None;
-                                break;
-                            }
+                    if let Some(w) = active_worker.take() {
+                        let _ = w.handle.join();
+                    }
+                }
+                recv(line_rx) -> incoming_res => {
+                    match incoming_res {
+                        Ok(line) => {
+                            process_incoming_line(
+                                &line,
+                                &mut writer,
+                                &cancel,
+                                &mut active_worker,
+                                &mut pending_calls,
+                            );
+                        }
+                        Err(_) => {
+                            // stdin EOF: cancel any running task and wait for clean shutdown
+                            shutdown_active_worker(active_worker.take());
+                            break;
                         }
                     }
                 }
             }
-        } else if let Some(resp) = handle_rpc_request(req, &cancel) {
-            let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
-            let _ = writer.flush();
+        } else {
+            crossbeam_channel::select! {
+                recv(ctrlc_rx) -> _ => {
+                    break;
+                }
+                recv(line_rx) -> incoming_res => {
+                    match incoming_res {
+                        Ok(line) => {
+                            process_incoming_line(
+                                &line,
+                                &mut writer,
+                                &cancel,
+                                &mut active_worker,
+                                &mut pending_calls,
+                            );
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
     ExitCode::from(EXIT_SUCCESS)
 }
 
-fn handle_rpc_request(req: JsonRpcRequest, cancel: &CancelToken) -> Option<JsonRpcResponse> {
-    let id = req.id.unwrap_or(Value::Null);
-
-    // Notifications (no id)
-    if id.is_null() && req.method.starts_with("notifications/") {
-        return None;
+fn process_incoming_line(
+    line: &str,
+    writer: &mut impl Write,
+    cancel: &CancelToken,
+    active_worker: &mut Option<ActiveWorker>,
+    pending_calls: &mut VecDeque<ValidatedRpcMessage>,
+) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
     }
+
+    let parsed: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            let err_resp = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
+            let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
+            let _ = writer.flush();
+            return;
+        }
+    };
+
+    if let Value::Array(batch) = parsed {
+        if batch.is_empty() {
+            let err_resp = JsonRpcResponse::error(
+                Value::Null,
+                -32600,
+                "Invalid Request: batch array must not be empty",
+            );
+            let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
+            let _ = writer.flush();
+            return;
+        }
+        let mut batch_responses: Vec<JsonRpcResponse> = Vec::new();
+        for item in batch {
+            match validate_rpc_object(item) {
+                Ok(msg) => {
+                    if msg.id.is_none() {
+                        handle_notification(&msg, active_worker, pending_calls, writer);
+                    } else if let Some(resp) = handle_rpc_request(msg, cancel) {
+                        batch_responses.push(resp);
+                    }
+                }
+                Err(Some(err_resp)) => batch_responses.push(err_resp),
+                Err(None) => {}
+            }
+        }
+        if !batch_responses.is_empty() {
+            let _ = writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&batch_responses).unwrap()
+            );
+            let _ = writer.flush();
+        }
+        return;
+    }
+
+    let msg = match validate_rpc_object(parsed) {
+        Ok(m) => m,
+        Err(Some(err_resp)) => {
+            let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
+            let _ = writer.flush();
+            return;
+        }
+        Err(None) => return,
+    };
+
+    // Notifications (absent "id") never receive a response
+    if msg.id.is_none() {
+        handle_notification(&msg, active_worker, pending_calls, writer);
+        return;
+    }
+
+    if msg.method == "tools/call" {
+        let id = msg.id.clone().unwrap_or(Value::Null);
+        if let Err(err_resp) = prevalidate_tool_call(id, &msg.params) {
+            let _ = writeln!(writer, "{}", serde_json::to_string(&err_resp).unwrap());
+            let _ = writer.flush();
+            return;
+        }
+        if active_worker.is_some() {
+            pending_calls.push_back(msg);
+        } else {
+            *active_worker = Some(spawn_tool_worker(msg));
+        }
+    } else if let Some(resp) = handle_rpc_request(msg, cancel) {
+        let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
+        let _ = writer.flush();
+    }
+}
+
+fn handle_notification(
+    msg: &ValidatedRpcMessage,
+    active_worker: &mut Option<ActiveWorker>,
+    pending_calls: &mut VecDeque<ValidatedRpcMessage>,
+    writer: &mut impl Write,
+) {
+    if is_cancel_method(&msg.method) {
+        let target_id = extract_cancel_request_id(&msg.params);
+        match target_id {
+            Some(ref req_id) => {
+                if let Some(w) = active_worker.as_ref()
+                    && &w.id == req_id
+                {
+                    w.cancel.cancel();
+                    return;
+                }
+                if let Some(pos) = pending_calls
+                    .iter()
+                    .position(|queued| queued.id.as_ref() == Some(req_id))
+                    && let Some(removed) = pending_calls.remove(pos)
+                {
+                    let resp = JsonRpcResponse::ok(
+                        removed.id.unwrap_or(Value::Null),
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": "Error: Cancelled" }],
+                            "isError": true
+                        }),
+                    );
+                    let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
+                    let _ = writer.flush();
+                }
+            }
+            None => {
+                if let Some(w) = active_worker.as_ref() {
+                    w.cancel.cancel();
+                }
+            }
+        }
+    }
+}
+
+fn negotiate_protocol_version(params: &Option<Value>) -> &'static str {
+    if let Some(client_ver) = params
+        .as_ref()
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(|v| v.as_str())
+    {
+        for &supported in SUPPORTED_PROTOCOL_VERSIONS {
+            if client_ver == supported {
+                return supported;
+            }
+        }
+    }
+    DEFAULT_PROTOCOL_VERSION
+}
+
+fn handle_rpc_request(req: ValidatedRpcMessage, cancel: &CancelToken) -> Option<JsonRpcResponse> {
+    let id = req.id?;
 
     match req.method.as_str() {
         "initialize" => {
+            let negotiated = negotiate_protocol_version(&req.params);
             let res = serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiated,
                 "capabilities": {
                     "tools": {}
                 },
@@ -223,32 +468,26 @@ fn handle_rpc_request(req: JsonRpcRequest, cancel: &CancelToken) -> Option<JsonR
                     "version": env!("CARGO_PKG_VERSION")
                 }
             });
-            Some(JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(res),
-                error: None,
-            })
+            Some(JsonRpcResponse::ok(id, res))
         }
-        "ping" => Some(JsonRpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(serde_json::json!({})),
-            error: None,
-        }),
+        "ping" => Some(JsonRpcResponse::ok(id, serde_json::json!({}))),
         "tools/list" => {
             let tools = get_tools_list();
-            Some(JsonRpcResponse {
-                jsonrpc: "2.0",
+            Some(JsonRpcResponse::ok(
                 id,
-                result: Some(serde_json::json!({ "tools": tools })),
-                error: None,
-            })
+                serde_json::json!({ "tools": tools }),
+            ))
         }
         "tools/call" => {
+            if let Err(err_resp) = prevalidate_tool_call(id.clone(), &req.params) {
+                return Some(err_resp);
+            }
             let params = req.params.unwrap_or_default();
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let arguments = params.get("arguments").cloned().unwrap_or_default();
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
             let tool_res = dispatch_tool_call(name, &arguments, cancel);
             match tool_res {
@@ -262,12 +501,7 @@ fn handle_rpc_request(req: JsonRpcRequest, cancel: &CancelToken) -> Option<JsonR
                         ],
                         "isError": false
                     });
-                    Some(JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: Some(res),
-                        error: None,
-                    })
+                    Some(JsonRpcResponse::ok(id, res))
                 }
                 Err(e) => {
                     let res = serde_json::json!({
@@ -279,25 +513,322 @@ fn handle_rpc_request(req: JsonRpcRequest, cancel: &CancelToken) -> Option<JsonR
                         ],
                         "isError": true
                     });
-                    Some(JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: Some(res),
-                        error: None,
-                    })
+                    Some(JsonRpcResponse::ok(id, res))
                 }
             }
         }
-        _ => Some(JsonRpcResponse {
-            jsonrpc: "2.0",
+        _ => Some(JsonRpcResponse::error(
             id,
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32601,
-                message: format!("Method '{}' not found", req.method),
-                data: None,
-            }),
-        }),
+            -32601,
+            format!("Method '{}' not found", req.method),
+        )),
+    }
+}
+
+fn validate_optional_string(
+    id: &Value,
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, JsonRpcResponse> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(JsonRpcResponse::error(
+            id.clone(),
+            -32602,
+            format!("Invalid params: '{key}' must be a string"),
+        )),
+    }
+}
+
+fn validate_required_string(
+    id: &Value,
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, JsonRpcResponse> {
+    match args.get(key) {
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
+        Some(Value::String(_)) => Err(JsonRpcResponse::error(
+            id.clone(),
+            -32602,
+            format!("Invalid params: '{key}' must not be empty"),
+        )),
+        Some(_) => Err(JsonRpcResponse::error(
+            id.clone(),
+            -32602,
+            format!("Invalid params: '{key}' must be a string"),
+        )),
+        None => Err(JsonRpcResponse::error(
+            id.clone(),
+            -32602,
+            format!("Invalid params: missing required parameter '{key}'"),
+        )),
+    }
+}
+
+fn validate_optional_bool(
+    id: &Value,
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<bool>, JsonRpcResponse> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(JsonRpcResponse::error(
+            id.clone(),
+            -32602,
+            format!("Invalid params: '{key}' must be a boolean"),
+        )),
+    }
+}
+
+fn validate_optional_string_array(
+    id: &Value,
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<String>>, JsonRpcResponse> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(JsonRpcResponse::error(
+                            id.clone(),
+                            -32602,
+                            format!("Invalid params: all elements of '{key}' must be strings"),
+                        ));
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(JsonRpcResponse::error(
+            id.clone(),
+            -32602,
+            format!("Invalid params: '{key}' must be an array of strings"),
+        )),
+    }
+}
+
+fn validate_sandbox_params(
+    id: &Value,
+    args: &serde_json::Map<String, Value>,
+) -> Result<(SandboxMode, bool), JsonRpcResponse> {
+    let mode = match validate_optional_string(id, args, "sandbox")? {
+        None => SandboxMode::Auto,
+        Some(s) => match s.as_str() {
+            "auto" => SandboxMode::Auto,
+            "full" => SandboxMode::Full,
+            "none" => SandboxMode::None,
+            other => {
+                return Err(JsonRpcResponse::error(
+                    id.clone(),
+                    -32602,
+                    format!(
+                        "Invalid params: 'sandbox' must be 'auto', 'full', or 'none' (got '{other}')"
+                    ),
+                ));
+            }
+        },
+    };
+    let require_tier = validate_optional_bool(id, args, "require_tier")?.unwrap_or(false);
+    Ok((mode, require_tier))
+}
+
+fn prevalidate_tool_call(id: Value, params_opt: &Option<Value>) -> Result<(), JsonRpcResponse> {
+    let params = match params_opt {
+        Some(Value::Object(map)) => map,
+        _ => {
+            return Err(JsonRpcResponse::error(
+                id,
+                -32602,
+                "Invalid params: tools/call requires a 'params' object",
+            ));
+        }
+    };
+
+    let name = match params.get("name") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.as_str(),
+        _ => {
+            return Err(JsonRpcResponse::error(
+                id,
+                -32602,
+                "Invalid params: missing or non-string tool 'name'",
+            ));
+        }
+    };
+
+    let empty_map = serde_json::Map::new();
+    let args = match params.get("arguments") {
+        None | Some(Value::Null) => &empty_map,
+        Some(Value::Object(map)) => map,
+        Some(_) => {
+            return Err(JsonRpcResponse::error(
+                id,
+                -32602,
+                "Invalid params: 'arguments' must be an object",
+            ));
+        }
+    };
+
+    match name {
+        "doctor" => {
+            if let Some(p) = args.get("problem") {
+                match p {
+                    Value::Bool(_) | Value::String(_) | Value::Null => {}
+                    _ => {
+                        return Err(JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            "Invalid params: 'problem' must be a boolean or string path",
+                        ));
+                    }
+                }
+            }
+            validate_optional_string(&id, args, "problem_dir")?;
+            Ok(())
+        }
+        "build" => {
+            validate_optional_string(&id, args, "problem")?;
+            validate_optional_string_array(&id, args, "targets")?;
+            validate_optional_bool(&id, args, "no_cache")?;
+            Ok(())
+        }
+        "judge" => {
+            validate_optional_string(&id, args, "problem")?;
+            validate_sandbox_params(&id, args)?;
+            let sub = validate_optional_string(&id, args, "submission")?;
+            let sources = validate_optional_string_array(&id, args, "sources")?;
+            let has_sub = sub.as_ref().is_some_and(|s| !s.trim().is_empty());
+            let has_sources = sources
+                .as_ref()
+                .is_some_and(|arr| !arr.is_empty() && arr.iter().all(|s| !s.trim().is_empty()));
+            if !has_sub && !has_sources {
+                return Err(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: 'judge' requires 'submission' (string) or non-empty 'sources' (array of strings)",
+                ));
+            }
+            Ok(())
+        }
+        "verify" | "pipeline" => {
+            validate_optional_string(&id, args, "problem")?;
+            validate_sandbox_params(&id, args)?;
+            Ok(())
+        }
+        "stress" => {
+            validate_optional_string(&id, args, "problem")?;
+            validate_required_string(&id, args, "generator")?;
+            validate_required_string(&id, args, "solution")?;
+            validate_required_string(&id, args, "brute")?;
+            validate_optional_string(&id, args, "gen_args")?;
+            validate_sandbox_params(&id, args)?;
+            if let Some(c) = args.get("count")
+                && !c.is_null()
+            {
+                match c.as_u64() {
+                    Some(n) if n >= 1 => {}
+                    _ => {
+                        return Err(JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            "Invalid params: 'count' must be a positive integer",
+                        ));
+                    }
+                }
+            }
+            if let Some(s) = args.get("seed")
+                && !s.is_null()
+                && s.as_u64().is_none()
+            {
+                return Err(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: 'seed' must be a non-negative integer",
+                ));
+            }
+            if let Some(tb) = args.get("time_budget")
+                && !tb.is_null()
+            {
+                match tb {
+                    Value::String(s) => {
+                        if let Err(e) = parse_duration_str(s) {
+                            return Err(JsonRpcResponse::error(
+                                id,
+                                -32602,
+                                format!("Invalid params: {e}"),
+                            ));
+                        }
+                    }
+                    Value::Number(n) if n.as_u64().is_some_and(|v| v >= 1) => {}
+                    _ => {
+                        return Err(JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            "Invalid params: 'time_budget' must be a duration string (e.g. '60s') or positive integer seconds",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "show" => {
+            validate_optional_string(&id, args, "problem")?;
+            validate_optional_string(&id, args, "test")?;
+            if let Some(rid) = validate_optional_string(&id, args, "run_id")?
+                && !rid.trim().is_empty()
+                && let Err(e) = validate_run_id(&rid)
+            {
+                return Err(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("Invalid params: {e}"),
+                ));
+            }
+            Ok(())
+        }
+        "contest" => {
+            validate_required_string(&id, args, "dir")?;
+            validate_optional_string_array(&id, args, "problems")?;
+            validate_optional_string_array(&id, args, "contestants")?;
+            validate_sandbox_params(&id, args)?;
+            Ok(())
+        }
+        "init_problem" => {
+            validate_required_string(&id, args, "dir")?;
+            validate_optional_string(&id, args, "name")?;
+            validate_optional_string(&id, args, "title")?;
+            validate_optional_bool(&id, args, "force")?;
+            if let Some(ptype) = validate_optional_string(&id, args, "type")?
+                && !matches!(
+                    ptype.as_str(),
+                    "traditional"
+                        | "interactive"
+                        | "grader"
+                        | "communication"
+                        | "output_only"
+                        | "output-only"
+                )
+            {
+                return Err(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!(
+                        "Invalid params: unknown problem type '{ptype}' (expected traditional, interactive, grader, communication, or output_only)"
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        other => Err(JsonRpcResponse::error(
+            id,
+            -32602,
+            format!("Invalid params: unknown tool '{other}'"),
+        )),
     }
 }
 
@@ -320,15 +851,23 @@ fn get_tools_list() -> Vec<Value> {
                     "sources": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "List of submission source paths (if multiple)"
+                        "description": "List of submission source paths (if judging multiple files)"
+                    },
+                    "sandbox": {
+                        "type": "string",
+                        "enum": ["auto", "full", "none"],
+                        "description": "Sandbox isolation mode (default: 'auto')"
+                    },
+                    "require_tier": {
+                        "type": "boolean",
+                        "description": "Fail closed if full sandbox tier is unavailable (default: false)"
                     }
-                },
-                "required": ["submission"]
+                }
             }
         }),
         serde_json::json!({
             "name": "build",
-            "description": "Compile problem binaries (checker, validator, solutions, generators)",
+            "description": "Compile problem binaries (checker, validator, interactor, manager, solutions, generators)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -340,6 +879,10 @@ fn get_tools_list() -> Vec<Value> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Specific compilation targets or empty for all"
+                    },
+                    "no_cache": {
+                        "type": "boolean",
+                        "description": "Disable compilation cache and force rebuild (default: false)"
                     }
                 }
             }
@@ -353,6 +896,15 @@ fn get_tools_list() -> Vec<Value> {
                     "problem": {
                         "type": "string",
                         "description": "Problem directory containing problem.toml (default: '.')"
+                    },
+                    "sandbox": {
+                        "type": "string",
+                        "enum": ["auto", "full", "none"],
+                        "description": "Sandbox isolation mode (default: 'auto')"
+                    },
+                    "require_tier": {
+                        "type": "boolean",
+                        "description": "Fail closed if full sandbox tier is unavailable (default: false)"
                     }
                 }
             }
@@ -366,6 +918,15 @@ fn get_tools_list() -> Vec<Value> {
                     "problem": {
                         "type": "string",
                         "description": "Problem directory containing problem.toml (default: '.')"
+                    },
+                    "sandbox": {
+                        "type": "string",
+                        "enum": ["auto", "full", "none"],
+                        "description": "Sandbox isolation mode (default: 'auto')"
+                    },
+                    "require_tier": {
+                        "type": "boolean",
+                        "description": "Fail closed if full sandbox tier is unavailable (default: false)"
                     }
                 }
             }
@@ -403,6 +964,19 @@ fn get_tools_list() -> Vec<Value> {
                     "gen_args": {
                         "type": "string",
                         "description": "Generator argument template; placeholders {seed} and {iter} are expanded (default: '{seed}')"
+                    },
+                    "time_budget": {
+                        "type": "string",
+                        "description": "Maximum wall-clock time budget, e.g. '60s', '5m', '500ms' (default: '60s')"
+                    },
+                    "sandbox": {
+                        "type": "string",
+                        "enum": ["auto", "full", "none"],
+                        "description": "Sandbox isolation mode (default: 'auto')"
+                    },
+                    "require_tier": {
+                        "type": "boolean",
+                        "description": "Fail closed if full sandbox tier is unavailable (default: false)"
                     }
                 },
                 "required": ["generator", "solution", "brute"]
@@ -415,8 +989,7 @@ fn get_tools_list() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "problem": {
-                        "type": "boolean",
-                        "description": "Whether to check problem test data and configuration health"
+                        "description": "Boolean (true checks '.') or string path to a problem directory to diagnose"
                     }
                 }
             }
@@ -461,6 +1034,15 @@ fn get_tools_list() -> Vec<Value> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional list of contestant names to filter"
+                    },
+                    "sandbox": {
+                        "type": "string",
+                        "enum": ["auto", "full", "none"],
+                        "description": "Sandbox isolation mode (default: 'auto')"
+                    },
+                    "require_tier": {
+                        "type": "boolean",
+                        "description": "Fail closed if full sandbox tier is unavailable (default: false)"
                     }
                 },
                 "required": ["dir"]
@@ -486,13 +1068,34 @@ fn get_tools_list() -> Vec<Value> {
                     },
                     "type": {
                         "type": "string",
-                        "description": "Problem type: traditional, interactive, etc."
+                        "enum": ["traditional", "interactive", "grader", "communication", "output_only"],
+                        "description": "Problem type (default: 'traditional')"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Overwrite existing files if target directory isalready initialized (default: false)"
                     }
                 },
                 "required": ["dir"]
             }
         }),
     ]
+}
+
+fn configure_cli_from_args(cli: &mut Cli, args: &Value) {
+    if let Some(sb) = args.get("sandbox").and_then(|v| v.as_str()) {
+        cli.sandbox = match sb {
+            "full" => SandboxMode::Full,
+            "none" => SandboxMode::None,
+            _ => SandboxMode::Auto,
+        };
+    }
+    if let Some(rt) = args.get("require_tier").and_then(|v| v.as_bool()) {
+        cli.require_tier = rt;
+    }
+    if let Some(nc) = args.get("no_cache").and_then(|v| v.as_bool()) {
+        cli.no_cache = nc;
+    }
 }
 
 fn dispatch_tool_call(
@@ -502,71 +1105,56 @@ fn dispatch_tool_call(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     match name {
         "doctor" => {
-            let problem_mode = args
-                .get("problem")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let report = doctor::run_doctor(problem_mode, false);
+            let prob_dir_buf: Option<PathBuf> = match args.get("problem") {
+                Some(Value::Bool(true)) => Some(
+                    args.get("problem_dir")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(".")),
+                ),
+                Some(Value::String(s)) if !s.trim().is_empty() => Some(PathBuf::from(s)),
+                _ => args
+                    .get("problem_dir")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from),
+            };
+            let report = doctor::run_doctor(prob_dir_buf.as_deref(), false);
             Ok(serde_json::to_string_pretty(&report)?)
         }
         "build" => {
             let prob_str = args.get("problem").and_then(|v| v.as_str()).unwrap_or(".");
             let problem_dir = Path::new(prob_str);
-            let config_path = problem_dir.join("problem.toml");
-            let content = fs::read_to_string(&config_path)?;
-            let cfg = ProblemConfig::from_toml_str(&content, Some(&config_path))?;
-
-            let mut targets: Vec<(PathBuf, bool)> = Vec::new();
-            if let Some(arr) = args.get("targets").and_then(|v| v.as_array()) {
-                for t in arr {
-                    if let Some(s) = t.as_str() {
-                        let p = problem_dir.join(s);
-                        let is_sol = cfg.solutions.iter().any(|sol| {
-                            problem_dir.join(&sol.path) == p || sol.path == Path::new(s)
-                        });
-                        targets.push((p, is_sol));
-                    }
-                }
-            } else {
-                if let Some(ref v) = cfg.validator {
-                    targets.push((problem_dir.join(v), false));
-                }
-                if let Some(ref chk) = cfg.checker.path {
-                    targets.push((problem_dir.join(chk), false));
-                }
-                if let Some(ref int) = cfg.interactor {
-                    targets.push((problem_dir.join(int), false));
-                }
-                for g in &cfg.tests.generators {
-                    targets.push((problem_dir.join(&g.generator), false));
-                }
-                for sol in &cfg.solutions {
-                    targets.push((problem_dir.join(&sol.path), true));
-                }
-            }
+            let targets: Vec<String> = args
+                .get("targets")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let no_cache = args
+                .get("no_cache")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let session = CompileSession::new();
-            let mut results = Vec::new();
-            for (target, is_sol) in targets {
-                if target.extension().is_some_and(|e| e == "exe") {
-                    continue;
-                }
-                let c = if is_sol {
-                    session.compile_problem_solution(problem_dir, &cfg, &target, false)?
-                } else {
-                    session.compile(&target, false)?
-                };
-                results.push(serde_json::json!({
-                    "target": target.to_string_lossy(),
-                    "duration_ms": c.duration_ms,
-                    "cached": c.cached
-                }));
+            let (code, val) = crate::author_cmd::build_core(
+                problem_dir,
+                &targets,
+                no_cache,
+                OutputFormat::Silent,
+                &session,
+            );
+            if code != ExitCode::from(EXIT_SUCCESS) {
+                let msg = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Build failed");
+                return Err(msg.to_string().into());
             }
-
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "compiled": results
-            }))?)
+            Ok(serde_json::to_string_pretty(&val)?)
         }
         "judge" => {
             let prob_str = args.get("problem").and_then(|v| v.as_str()).unwrap_or(".");
@@ -577,12 +1165,20 @@ fn dispatch_tool_call(
             let tests = uj_core::tests::discover_tests(problem_dir, &cfg)?;
 
             let mut sources = Vec::new();
-            if let Some(sub) = args.get("submission").and_then(|v| v.as_str()) {
+            if let Some(sub) = args.get("submission").and_then(|v| v.as_str())
+                && !sub.trim().is_empty()
+            {
                 sources.push(PathBuf::from(sub));
-            } else if let Some(arr) = args.get("sources").and_then(|v| v.as_array()) {
+            }
+            if let Some(arr) = args.get("sources").and_then(|v| v.as_array()) {
                 for s in arr {
-                    if let Some(str_val) = s.as_str() {
-                        sources.push(PathBuf::from(str_val));
+                    if let Some(str_val) = s.as_str()
+                        && !str_val.trim().is_empty()
+                    {
+                        let p = PathBuf::from(str_val);
+                        if !sources.contains(&p) {
+                            sources.push(p);
+                        }
                     }
                 }
             }
@@ -591,18 +1187,32 @@ fn dispatch_tool_call(
                 return Err("No submission source provided".into());
             }
 
+            let mut cli = Cli::parse_from(["uj", "mcp"]);
+            configure_cli_from_args(&mut cli, args);
+
             let judge_options = JudgeOptions {
-                sandbox_mode: "auto".to_string(),
-                require_tier: false,
+                sandbox_mode: cli.sandbox_mode_str().to_string(),
+                require_tier: cli.require_tier,
                 fail_fast: false,
-                precise: true,
+                precise: cli.effective_precise(),
             };
             let session = CompileSession::new();
             let scheduler = Scheduler::with_session(judge_options, session.clone());
             let mut reports = Vec::new();
 
             for src in &sources {
-                let compiled = session.compile_problem_solution(problem_dir, &cfg, src, false)?;
+                let resolved_src = if src.exists() {
+                    src.clone()
+                } else {
+                    let cand = problem_dir.join(src);
+                    if cand.exists() { cand } else { src.clone() }
+                };
+                let compiled = session.compile_problem_solution(
+                    problem_dir,
+                    &cfg,
+                    &resolved_src,
+                    cli.no_cache,
+                )?;
                 let sub_name = src
                     .file_name()
                     .unwrap_or_default()
@@ -631,80 +1241,26 @@ fn dispatch_tool_call(
         "verify" => {
             let prob_str = args.get("problem").and_then(|v| v.as_str()).unwrap_or(".");
             let problem_dir = Path::new(prob_str);
-            let config_path = problem_dir.join("problem.toml");
-            let content = fs::read_to_string(&config_path)?;
-            let cfg = ProblemConfig::from_toml_str(&content, Some(&config_path))?;
-            let tests = uj_core::tests::discover_tests(problem_dir, &cfg)?;
+            let mut cli = Cli::parse_from(["uj", "verify"]);
+            configure_cli_from_args(&mut cli, args);
 
-            let judge_options = JudgeOptions {
-                sandbox_mode: "auto".to_string(),
-                require_tier: false,
-                fail_fast: false,
-                precise: true,
-            };
             let session = CompileSession::new();
-            let scheduler = Scheduler::with_session(judge_options, session.clone());
-
-            let mut verifications = Vec::new();
-            let mut all_match = true;
-
-            for sol in &cfg.solutions {
-                let sol_path = problem_dir.join(&sol.path);
-                let compiled =
-                    session.compile_problem_solution(problem_dir, &cfg, &sol_path, false)?;
-                let sub_name = sol.path.to_string_lossy().to_string();
-                let report = scheduler.judge_submission(
-                    problem_dir,
-                    &cfg,
-                    &compiled,
-                    &sub_name,
-                    tests.clone(),
-                    None,
-                    None,
-                    cancel,
-                )?;
-
-                let failures = crate::author_cmd::check_solution_tag(sol, &report, &cfg);
-                let matched = failures.is_empty();
-                let reason = if matched {
-                    format!("{:?} as expected (score: {:.1})", sol.tag, report.score)
-                } else {
-                    all_match = false;
-                    failures.join("; ")
-                };
-
-                let max_time_test = report
-                    .tests
-                    .iter()
-                    .max_by_key(|t| t.time_ms)
-                    .map(|t| t.id.clone());
-                let first_fail = report
-                    .tests
-                    .iter()
-                    .find(|t| t.verdict != Verdict::Accepted && t.verdict != Verdict::Skipped);
-
-                verifications.push(serde_json::json!({
-                    "solution": sol.path.to_string_lossy(),
-                    "path": sol.path.to_string_lossy().replace('\\', "/"),
-                    "tag": sol.tag.as_str(),
-                    "actual_verdict": report.verdict,
-                    "verdict": report.verdict,
-                    "score": report.score,
-                    "max_time_ms": report.max_time_ms,
-                    "max_time_test": max_time_test,
-                    "max_memory_kb": report.max_memory_kb,
-                    "first_fail_test": first_fail.map(|t| t.id.clone()),
-                    "first_fail_verdict": first_fail.map(|t| t.verdict),
-                    "matched": matched,
-                    "matches_tag": matched,
-                    "reason": reason
-                }));
+            let (code, val) = crate::author_cmd::verify_core(
+                problem_dir,
+                &cli,
+                OutputFormat::Silent,
+                cancel,
+                &session,
+            );
+            if code != ExitCode::from(EXIT_SUCCESS) && code != ExitCode::from(EXIT_NON_AC) {
+                let msg = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Verification failed");
+                return Err(msg.to_string().into());
             }
-
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "ok": all_match,
-                "solutions": verifications
-            }))?)
+            Ok(serde_json::to_string_pretty(&val)?)
         }
         "pipeline" => {
             let prob_str = args.get("problem").and_then(|v| v.as_str()).unwrap_or(".");
@@ -730,13 +1286,26 @@ fn dispatch_tool_call(
                 }
             }
 
-            let cli = Cli::parse_from(["uj", "pipeline"]);
-            let code =
-                crate::author_cmd::run_pipeline(problem_dir, &cli, OutputFormat::Silent, cancel);
+            let mut cli = Cli::parse_from(["uj", "pipeline"]);
+            configure_cli_from_args(&mut cli, args);
+
+            let (code, val) =
+                crate::author_cmd::pipeline_core(problem_dir, &cli, OutputFormat::Silent, cancel);
             if code != ExitCode::from(EXIT_SUCCESS) {
-                return Err(
-                    format!("Pipeline execution failed for '{}'", problem_dir.display()).into(),
-                );
+                let failed_step = val
+                    .get("failed_step")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown");
+                let detail = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("step failed");
+                return Err(format!(
+                    "Pipeline execution failed at step '{failed_step}' for '{}': {detail}",
+                    problem_dir.display()
+                )
+                .into());
             }
 
             let tests = uj_core::tests::discover_tests(problem_dir, &cfg)?;
@@ -749,9 +1318,11 @@ fn dispatch_tool_call(
             }
 
             Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
                 "ok": true,
                 "step": "pipeline_complete",
-                "tests_count": tests.len()
+                "tests_count": tests.len(),
+                "steps": val["steps"]
             }))?)
         }
         "stress" => {
@@ -775,281 +1346,46 @@ fn dispatch_tool_call(
                 .get("gen_args")
                 .and_then(|v| v.as_str())
                 .unwrap_or("{seed}");
-
-            let config_path = problem_dir.join("problem.toml");
-            let cfg_opt = if config_path.exists() {
-                let content = fs::read_to_string(&config_path)?;
-                Some(ProblemConfig::from_toml_str(&content, Some(&config_path))?)
-            } else {
-                None
+            let budget = match args.get("time_budget") {
+                Some(Value::String(s)) => parse_duration_str(s)?,
+                Some(Value::Number(n)) => Duration::from_secs(n.as_u64().unwrap_or(60)),
+                _ => Duration::from_secs(60),
             };
 
-            let session = CompileSession::new();
-            let compiled_gen = session.compile(&problem_dir.join(gen_str), false)?;
-            let compiled_sol = if let Some(ref cfg) = cfg_opt {
-                session.compile_problem_solution(
-                    problem_dir,
-                    cfg,
-                    &problem_dir.join(sol_str),
-                    false,
-                )?
-            } else {
-                session.compile(&problem_dir.join(sol_str), false)?
-            };
-            let compiled_brute = if let Some(ref cfg) = cfg_opt {
-                session.compile_problem_solution(
-                    problem_dir,
-                    cfg,
-                    &problem_dir.join(brute_str),
-                    false,
-                )?
-            } else {
-                session.compile(&problem_dir.join(brute_str), false)?
-            };
-            let (resolved_checker, pe_as_wa, sol_limits) = if let Some(ref cfg) = cfg_opt {
-                let lim = cfg
-                    .to_limits()
-                    .unwrap_or_else(|_| Limits::new(2000, 256 * 1024 * 1024));
-                let pe = cfg.checker.pe_as_wa;
-                let chk = match uj_engine::context::ProblemContext::prepare(
-                    0,
-                    problem_dir,
-                    cfg,
-                    &session,
-                ) {
-                    Ok(p_ctx) => p_ctx.resolved_checker.clone(),
-                    Err(_) => {
-                        let name = cfg.checker.name.as_deref().unwrap_or("wcmp");
-                        uj_engine::judge::ResolvedChecker::Builtin(
-                            uj_checker::builtin::BuiltinCheckerType::parse(name)
-                                .unwrap_or(uj_checker::builtin::BuiltinCheckerType::Wcmp),
-                        )
-                    }
-                };
-                (chk, pe, lim)
-            } else {
-                (
-                    uj_engine::judge::ResolvedChecker::Builtin(
-                        uj_checker::builtin::BuiltinCheckerType::Wcmp,
-                    ),
-                    false,
-                    Limits::new(2000, 256 * 1024 * 1024),
-                )
-            };
-            let mut brute_limits = sol_limits.clone();
-            brute_limits.cpu_time_ms = brute_limits.cpu_time_ms.saturating_mul(3).max(5000);
-            brute_limits.wall_time_ms = brute_limits.cpu_time_ms.saturating_mul(3).max(15000);
+            let mut cli = Cli::parse_from(["uj", "mcp"]);
+            configure_cli_from_args(&mut cli, args);
 
-            let sandbox = create_sandbox("auto", false)?;
-            let slot_box = uj_sandbox::create_slot_box_dir(problem_dir, 6000)?;
-            let gen_bin = uj_sandbox::get_or_prepare_authorized_binary(
-                &compiled_gen.binary_path,
+            let (code, val) = crate::author_cmd::stress_core(
                 problem_dir,
-            )
-            .unwrap_or_else(|_| compiled_gen.binary_path.clone());
-            let sol_bin = uj_sandbox::get_or_prepare_authorized_binary(
-                &compiled_sol.binary_path,
-                problem_dir,
-            )
-            .unwrap_or_else(|_| compiled_sol.binary_path.clone());
-            let brute_bin = uj_sandbox::get_or_prepare_authorized_binary(
-                &compiled_brute.binary_path,
-                problem_dir,
-            )
-            .unwrap_or_else(|_| compiled_brute.binary_path.clone());
-            let _ = sandbox.authorize_executable(&gen_bin);
-            let _ = sandbox.authorize_executable(&sol_bin);
-            let _ = sandbox.authorize_executable(&brute_bin);
-            match &resolved_checker {
-                uj_engine::judge::ResolvedChecker::Testlib(chk_exe)
-                | uj_engine::judge::ResolvedChecker::Lemon { path: chk_exe, .. } => {
-                    let _ = sandbox.authorize_executable(chk_exe);
-                }
-                uj_engine::judge::ResolvedChecker::Builtin(_) => {}
+                gen_str,
+                sol_str,
+                brute_str,
+                count,
+                Some(seed_start),
+                gen_args_tmpl,
+                budget,
+                &cli,
+                OutputFormat::Silent,
+                cancel,
+            );
+            if code != ExitCode::from(EXIT_SUCCESS) && code != ExitCode::from(EXIT_NON_AC) {
+                let msg = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Stress test execution failed");
+                return Err(msg.to_string().into());
             }
-
-            let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
-            let mut tested = 0;
-
-            for iter_idx in 0..count {
-                if cancel.is_cancelled() {
-                    return Err("Cancelled".into());
-                }
-
-                let iter_num = iter_idx + 1;
-                let seed = seed_start + iter_idx as u64;
-                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
-
-                let rendered_args = gen_args_tmpl
-                    .replace("{seed}", &seed.to_string())
-                    .replace("{iter}", &iter_num.to_string());
-                let mut gen_argv = vec![gen_bin.as_os_str().to_os_string()];
-                for arg in rendered_args.split_whitespace() {
-                    gen_argv.push(std::ffi::OsString::from(arg));
-                }
-
-                // Run generator in isolated slot box
-                let gen_spec = RunSpec {
-                    argv: gen_argv,
-                    env: vec![(
-                        std::ffi::OsString::from("UJ_STRESS"),
-                        std::ffi::OsString::from("1"),
-                    )],
-                    work_dir: slot_box.box_dir.clone(),
-                    ro_binds: vec![],
-                    stdin: Stdio::Null,
-                    stdout: Stdio::Pipe,
-                    stderr: Stdio::Pipe,
-                    extra_fds: vec![],
-                    limits: Limits::new(5000, 512 * 1024 * 1024),
-                    cpu_affinity: None,
-                    seccomp_profile: Default::default(),
-                    trusted: true,
-                };
-                let gen_res = sandbox.run(&gen_spec, cancel)?;
-                if !gen_res.status.is_success() || gen_res.killed_by.is_some() || gen_res.oom_killed
-                {
-                    let stderr_msg = String::from_utf8_lossy(&gen_res.stderr_tail);
-                    return Err(format!(
-                        "Generator failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
-                        gen_res.status,
-                        gen_res.killed_by,
-                        gen_res.oom_killed,
-                        stderr_msg.trim()
-                    )
-                    .into());
-                }
-                let in_bytes = gen_res.stdout.map(|o| o.bytes).unwrap_or_default();
-                if in_bytes.is_empty() {
-                    return Err(format!(
-                        "Generator produced empty stdout on seed {seed} (hint: check if gen.cpp ignores seeds outside fixed test IDs)"
-                    )
-                    .into());
-                }
-                let tmp_in_path = scratch_dir.join(format!("mcp_stress_{seed}.in"));
-                let _ = fs::write(&tmp_in_path, &in_bytes);
-
-                // Run sol in isolated slot box
-                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
-                let sol_spec = RunSpec {
-                    argv: vec![sol_bin.as_os_str().to_os_string()],
-                    env: vec![],
-                    work_dir: slot_box.box_dir.clone(),
-                    ro_binds: vec![],
-                    stdin: Stdio::File(tmp_in_path.clone()),
-                    stdout: Stdio::Pipe,
-                    stderr: Stdio::Pipe,
-                    extra_fds: vec![],
-                    limits: sol_limits.clone(),
-                    cpu_affinity: None,
-                    seccomp_profile: Default::default(),
-                    trusted: false,
-                };
-                let sol_res = sandbox.run(&sol_spec, cancel)?;
-                let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
-
-                // Run brute in isolated slot box
-                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
-                let brute_spec = RunSpec {
-                    argv: vec![brute_bin.as_os_str().to_os_string()],
-                    env: vec![],
-                    work_dir: slot_box.box_dir.clone(),
-                    ro_binds: vec![],
-                    stdin: Stdio::File(tmp_in_path.clone()),
-                    stdout: Stdio::Pipe,
-                    stderr: Stdio::Pipe,
-                    extra_fds: vec![],
-                    limits: brute_limits.clone(),
-                    cpu_affinity: None,
-                    seccomp_profile: Default::default(),
-                    trusted: false,
-                };
-                let brute_res = sandbox.run(&brute_spec, cancel)?;
-                let brute_bytes = brute_res.stdout.map(|o| o.bytes).unwrap_or_default();
-
-                tested += 1;
-
-                let cmp_res = match &resolved_checker {
-                    uj_engine::judge::ResolvedChecker::Builtin(b) => {
-                        let mut cr = b.check(&sol_bytes, &brute_bytes);
-                        if pe_as_wa && cr.verdict == Verdict::PresentationError {
-                            cr.verdict = Verdict::WrongAnswer;
-                        }
-                        cr
-                    }
-                    uj_engine::judge::ResolvedChecker::Testlib(chk_exe) => {
-                        let out_tmp = scratch_dir.join(format!("mcp_stress_{seed}.out"));
-                        let ans_tmp = scratch_dir.join(format!("mcp_stress_{seed}.ans"));
-                        let _ = fs::write(&out_tmp, &sol_bytes);
-                        let _ = fs::write(&ans_tmp, &brute_bytes);
-                        let cr = uj_checker::testlib::run_testlib_checker(
-                            sandbox.as_ref(),
-                            chk_exe,
-                            &tmp_in_path,
-                            &out_tmp,
-                            &ans_tmp,
-                            pe_as_wa,
-                            cancel,
-                        );
-                        let _ = fs::remove_file(&out_tmp);
-                        let _ = fs::remove_file(&ans_tmp);
-                        cr
-                    }
-                    uj_engine::judge::ResolvedChecker::Lemon {
-                        path: chk_exe,
-                        full_score,
-                    } => {
-                        let out_tmp = scratch_dir.join(format!("mcp_stress_{seed}.out"));
-                        let ans_tmp = scratch_dir.join(format!("mcp_stress_{seed}.ans"));
-                        let _ = fs::write(&out_tmp, &sol_bytes);
-                        let _ = fs::write(&ans_tmp, &brute_bytes);
-                        let cr = uj_checker::lemon::run_lemon_checker(
-                            sandbox.as_ref(),
-                            chk_exe,
-                            &tmp_in_path,
-                            &out_tmp,
-                            &ans_tmp,
-                            *full_score,
-                            cancel,
-                        );
-                        let _ = fs::remove_file(&out_tmp);
-                        let _ = fs::remove_file(&ans_tmp);
-                        cr
-                    }
-                };
-                let _ = fs::remove_file(&tmp_in_path);
-
-                if !cmp_res.verdict.is_accepted() {
-                    return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": false,
-                        "mismatch": {
-                            "seed": seed,
-                            "input": String::from_utf8_lossy(&in_bytes),
-                            "solution_output": String::from_utf8_lossy(&sol_bytes),
-                            "brute_output": String::from_utf8_lossy(&brute_bytes),
-                            "message": cmp_res.message
-                        },
-                        "iterations": tested
-                    }))?);
-                }
-            }
-
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "tested": tested,
-                "message": "All stress tests passed"
-            }))?)
+            Ok(serde_json::to_string_pretty(&val)?)
         }
         "show" => {
             let prob_str = args.get("problem").and_then(|v| v.as_str()).unwrap_or(".");
             let problem_dir = Path::new(prob_str);
-            let run_file = if let Some(id) = args.get("run_id").and_then(|v| v.as_str()) {
-                let name = if id.ends_with(".json") {
-                    id.to_string()
-                } else {
-                    format!("{id}.json")
-                };
-                problem_dir.join(".uj").join("runs").join(name)
+            let run_file = if let Some(id) = args.get("run_id").and_then(|v| v.as_str())
+                && !id.trim().is_empty()
+            {
+                let filename = validate_run_id(id)?;
+                problem_dir.join(".uj").join("runs").join(filename)
             } else {
                 problem_dir.join(".uj").join("runs").join("last.json")
             };
@@ -1061,7 +1397,9 @@ fn dispatch_tool_call(
             let content = fs::read_to_string(&run_file)?;
             let report: SubmissionJudgeReport = serde_json::from_str(&content)?;
 
-            if let Some(target_test) = args.get("test").and_then(|v| v.as_str()) {
+            if let Some(target_test) = args.get("test").and_then(|v| v.as_str())
+                && !target_test.trim().is_empty()
+            {
                 if let Some(test_res) = report.tests.iter().find(|t| t.id == target_test) {
                     Ok(serde_json::to_string_pretty(test_res)?)
                 } else {
@@ -1078,7 +1416,7 @@ fn dispatch_tool_call(
                 .ok_or("dir required")?;
             let contest_dir = Path::new(dir_str);
             if !contest_dir.exists() {
-                return Err(format!("Contest directory '{}' not found", dir_str).into());
+                return Err(format!("Contest directory '{dir_str}' not found").into());
             }
 
             let problems: Vec<String> = args
@@ -1100,7 +1438,9 @@ fn dispatch_tool_call(
                 })
                 .unwrap_or_default();
 
-            let cli = Cli::parse_from(["uj", "contest", dir_str]);
+            let mut cli = Cli::parse_from(["uj", "contest", dir_str]);
+            configure_cli_from_args(&mut cli, args);
+
             let code = crate::contest_cmd::run_contest(
                 contest_dir,
                 &problems,
@@ -1123,6 +1463,7 @@ fn dispatch_tool_call(
             }
 
             Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
                 "ok": true,
                 "contest_dir": dir_str,
                 "csv_report": report_path.to_string_lossy().to_string()
@@ -1138,15 +1479,23 @@ fn dispatch_tool_call(
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("traditional");
+            let name = args.get("name").and_then(|v| v.as_str());
+            let title = args.get("title").and_then(|v| v.as_str());
+            let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
-            let code = crate::author_cmd::run_init(dir, ptype, OutputFormat::Silent);
+            let code =
+                crate::author_cmd::run_init(dir, ptype, name, title, force, OutputFormat::Silent);
             if code != ExitCode::from(EXIT_SUCCESS) {
                 return Err(format!("Failed to initialize problem at '{dir_str}'").into());
             }
 
             Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
                 "ok": true,
                 "dir": dir_str,
+                "name": name,
+                "title": title,
+                "type": ptype,
                 "message": format!("Problem initialized at '{dir_str}'")
             }))?)
         }

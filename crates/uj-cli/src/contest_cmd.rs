@@ -3,11 +3,12 @@
 //! Supports evaluating multiple contestants across multiple problems in parallel
 //! with standard OI/LemonLime directory structures.
 
-use crate::cli::{Cli, OutputFormat, SandboxMode};
-use crate::error::{EXIT_INTERRUPTED, EXIT_SUCCESS, EXIT_USAGE_OR_CONFIG};
+use crate::cli::{Cli, OutputFormat};
+use crate::error::{EXIT_SUCCESS, EXIT_USAGE_OR_CONFIG, emit_error, emit_interrupted};
 use crossbeam_channel::unbounded;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -19,7 +20,9 @@ use uj_core::verdict::Verdict;
 use uj_engine::context::{ProblemContext, SubmissionContext};
 use uj_engine::pool::{JudgePool, PoolOptions, PoolSubmission};
 use uj_engine::topology::Topology;
-use uj_report::result::{JudgeEvent, PoolEvent, SubmissionJudgeReport, SubmissionRef};
+use uj_report::result::{
+    JudgeEvent, PoolEvent, SingleTestResult, SubmissionJudgeReport, SubmissionRef,
+};
 use uj_sandbox::CancelToken;
 use uj_tui::multi::{SubmissionMeta, run_multi_tui};
 
@@ -178,9 +181,14 @@ pub fn run_contest(
     cancel: &CancelToken,
 ) -> ExitCode {
     if !contest_dir.exists() {
-        eprintln!(
-            "Contest directory '{}' does not exist.",
-            contest_dir.display()
+        emit_error(
+            format,
+            "ContestDirNotFound",
+            format!(
+                "Contest directory '{}' does not exist.",
+                contest_dir.display()
+            ),
+            None,
         );
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
@@ -199,22 +207,12 @@ pub fn run_contest(
         });
     }
     if problems.is_empty() {
-        if format == OutputFormat::Json {
-            let err_obj = serde_json::json!({
-                "ok": false,
-                "error": {
-                    "kind": "NoProblemsFound",
-                    "message": format!("No problem.toml found in '{}'", contest_dir.display()),
-                    "hint": "Check contest directory layout (e.g. problems/<p>/problem.toml)"
-                }
-            });
-            println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
-        } else {
-            eprintln!(
-                "No problems (problem.toml) found in '{}'.",
-                contest_dir.display()
-            );
-        }
+        emit_error(
+            format,
+            "NoProblemsFound",
+            format!("No problem.toml found in '{}'", contest_dir.display()),
+            Some("Check contest directory layout (e.g. problems/<p>/problem.toml)"),
+        );
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
 
@@ -223,31 +221,20 @@ pub fn run_contest(
         submissions.retain(|player, _| contestant_filter.iter().any(|f| f == player));
     }
     if submissions.is_empty() {
-        if format == OutputFormat::Json {
-            let err_obj = serde_json::json!({
-                "ok": false,
-                "error": {
-                    "kind": "NoSubmissionsFound",
-                    "message": format!("No player submissions found in '{}/source' or '{}/players'", contest_dir.display(), contest_dir.display()),
-                }
-            });
-            println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
-        } else {
-            eprintln!(
-                "No participant submissions found in '{}/source' or '{}/players'.",
+        emit_error(
+            format,
+            "NoSubmissionsFound",
+            format!(
+                "No player submissions found in '{}/source' or '{}/players'",
                 contest_dir.display(),
                 contest_dir.display()
-            );
-        }
+            ),
+            None,
+        );
         return ExitCode::from(EXIT_USAGE_OR_CONFIG);
     }
 
-    let sandbox_mode_str = match cli.sandbox {
-        SandboxMode::Auto => "auto",
-        SandboxMode::Full => "full",
-        SandboxMode::Degraded => "degraded",
-        SandboxMode::None => "none",
-    };
+    let sandbox_mode_str = cli.sandbox_mode_str();
 
     let compile_session = uj_engine::compiler::CompileSession::new();
     let mut all_reports: Vec<SubmissionJudgeReport> = Vec::new();
@@ -341,7 +328,7 @@ pub fn run_contest(
         let tx = prep_tx.clone();
         let session = compile_session.clone();
         let no_cache = cli.no_cache;
-        let precise = cli.precise;
+        let precise = cli.effective_precise();
         let fail_fast = cli.fail_fast;
         let problem_contexts = problem_contexts.clone();
         let problems_meta: Vec<(String, Vec<TestCase>)> = problems
@@ -376,7 +363,8 @@ pub fn run_contest(
                     no_cache,
                 );
                 match compile_res {
-                    Err(_e) => {
+                    Err(e) => {
+                        let err_msg = e.to_string();
                         let ce_report = SubmissionJudgeReport {
                             schema_version: 1,
                             problem: candidate.prob_name.clone(),
@@ -386,7 +374,25 @@ pub fn run_contest(
                             max_time_ms: 0,
                             max_memory_kb: 0,
                             subtasks: vec![],
-                            tests: vec![],
+                            tests: vec![SingleTestResult {
+                                id: "compile".to_string(),
+                                subtask: None,
+                                verdict: Verdict::CompileError,
+                                time_ms: 0,
+                                wall_ms: 0,
+                                memory_kb: 0,
+                                score: 0.0,
+                                exit: uj_report::result::ExitInfo {
+                                    code: Some(1),
+                                    signal: None,
+                                    nt_status: None,
+                                },
+                                message: Some(err_msg.clone()),
+                                checker: Some(err_msg),
+                                diff: None,
+                                timing: uj_report::result::TimingInfo::default(),
+                                sandbox_tier: None,
+                            }],
                         };
                         let _ = tx.send(PreparedCandidate::CompileError(
                             candidate.sub_id,
@@ -456,7 +462,7 @@ pub fn run_contest(
     }
 
     if cancel.is_cancelled() {
-        return ExitCode::from(EXIT_INTERRUPTED);
+        return emit_interrupted(format, "Contest judging");
     }
 
     prepared_list.sort_by_key(|p| match p {
@@ -476,15 +482,17 @@ pub fn run_contest(
         })
         .sum();
 
+    let use_tui = cli.tui && format == OutputFormat::Human && std::io::stderr().is_terminal();
+
     let (pool_event_tx, pool_event_rx) = unbounded::<PoolEvent>();
     let pool_events_opt =
-        if cli.tui || format == OutputFormat::Ndjson || format == OutputFormat::Human {
+        if use_tui || format == OutputFormat::Ndjson || format == OutputFormat::Human {
             Some(pool_event_tx.clone())
         } else {
             None
         };
 
-    let pb = if format == OutputFormat::Human && !cli.tui {
+    let pb = if format == OutputFormat::Human && !use_tui {
         let p = indicatif::ProgressBar::new(total_test_points as u64);
         p.set_draw_target(indicatif::ProgressDrawTarget::stderr());
         p.set_style(
@@ -498,7 +506,7 @@ pub fn run_contest(
         None
     };
 
-    let listener_handle = if format == OutputFormat::Human && !cli.tui {
+    let listener_handle = if format == OutputFormat::Human && !use_tui {
         let pb = pb.clone();
         let completed_counter = Arc::clone(&completed_submissions_count);
         let rx = pool_event_rx.clone();
@@ -551,7 +559,7 @@ pub fn run_contest(
         match item {
             PreparedCandidate::CompileError(sub_id, player, prob_name, ce_report) => {
                 let done = completed_submissions_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if format == OutputFormat::Human && !cli.tui {
+                if format == OutputFormat::Human && !use_tui {
                     let msg = format!(
                         "[{done}/{total_submissions_count}] {player} / {prob_name} -> CE 0.0"
                     );
@@ -561,9 +569,23 @@ pub fn run_contest(
                         println!("{msg}");
                     }
                 }
-                if (cli.tui || format == OutputFormat::Ndjson)
+                if (use_tui || format == OutputFormat::Ndjson)
                     && let Some(ref ptx) = pool_events_opt
                 {
+                    let err_output = ce_report.tests.first().and_then(|t| t.message.clone());
+                    let _ = ptx.send(PoolEvent {
+                        submission: SubmissionRef {
+                            id: sub_id,
+                            problem: prob_name.clone(),
+                            name: player.clone(),
+                        },
+                        inner: JudgeEvent::CompileDone {
+                            target: format!("{player}/{prob_name}"),
+                            success: false,
+                            duration_ms: 0,
+                            error_output: err_output,
+                        },
+                    });
                     let _ = ptx.send(PoolEvent {
                         submission: SubmissionRef {
                             id: sub_id,
@@ -577,7 +599,7 @@ pub fn run_contest(
             }
             PreparedCandidate::Failed(sub_id, player, prob_name, err) => {
                 let done = completed_submissions_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if format == OutputFormat::Human && !cli.tui {
+                if format == OutputFormat::Human && !use_tui {
                     let msg = format!(
                         "[{done}/{total_submissions_count}] {player} / {prob_name} -> JudgeFailed ({err})"
                     );
@@ -598,7 +620,7 @@ pub fn run_contest(
                     subtasks: vec![],
                     tests: vec![],
                 };
-                if (cli.tui || format == OutputFormat::Ndjson)
+                if (use_tui || format == OutputFormat::Ndjson)
                     && let Some(ref ptx) = pool_events_opt
                 {
                     let _ = ptx.send(PoolEvent {
@@ -627,7 +649,7 @@ pub fn run_contest(
     let slots = topology.slots.len().max(1);
     let slot_cpus: Vec<Option<usize>> = topology.slots.iter().map(|s| s.cpu_core).collect();
 
-    let tui_handle = if cli.tui {
+    let tui_handle = if use_tui {
         let sub_metas: Vec<SubmissionMeta> = candidates
             .iter()
             .map(|cand| {
@@ -658,7 +680,20 @@ pub fn run_contest(
         let cancel_tui = cancel.clone();
         let rx = pool_event_rx.clone();
         Some(std::thread::spawn(move || {
-            let _ = run_multi_tui(&title, &sub_metas, slots, slot_cpus, rx, cancel_tui, true);
+            if let Err(e) = run_multi_tui(
+                &title,
+                &sub_metas,
+                slots,
+                slot_cpus,
+                rx.clone(),
+                cancel_tui,
+                true,
+            ) {
+                eprintln!(
+                    "Warning: Contest TUI initialization failed ({e}); falling back to non-TUI execution."
+                );
+                while rx.recv().is_ok() {}
+            }
         }))
     } else {
         None
@@ -699,7 +734,7 @@ pub fn run_contest(
     }
 
     if cancel.is_cancelled() {
-        return ExitCode::from(EXIT_INTERRUPTED);
+        return emit_interrupted(format, "Contest judging");
     }
 
     for ((sub_id, player, prob_name), rep_res) in pool_sub_meta.into_iter().zip(reports) {
@@ -784,35 +819,9 @@ pub fn run_contest(
 
     // Output results
     if format == OutputFormat::Ndjson {
-        let standings_json: Vec<serde_json::Value> = standings
-            .iter()
-            .map(|st| {
-                let prob_map: serde_json::Map<String, serde_json::Value> = st
-                    .problem_results
-                    .iter()
-                    .map(|(p, (v, s, t))| {
-                        (
-                            p.clone(),
-                            serde_json::json!({
-                                "verdict": v,
-                                "score": s,
-                                "time_ms": t,
-                            }),
-                        )
-                    })
-                    .collect();
-
-                serde_json::json!({
-                    "rank": st.rank,
-                    "name": st.name,
-                    "total_score": st.total_score,
-                    "total_time_ms": st.total_time_ms,
-                    "problems": prob_map,
-                })
-            })
-            .collect();
-
+        let standings_json = standings_to_json(&standings);
         let out = serde_json::json!({
+            "schema_version": 1,
             "event": "contest_finished",
             "ok": true,
             "standings": standings_json,
@@ -820,35 +829,9 @@ pub fn run_contest(
         println!("{}", serde_json::to_string(&out).unwrap());
         return ExitCode::from(EXIT_SUCCESS);
     } else if format == OutputFormat::Json {
-        let standings_json: Vec<serde_json::Value> = standings
-            .iter()
-            .map(|st| {
-                let prob_map: serde_json::Map<String, serde_json::Value> = st
-                    .problem_results
-                    .iter()
-                    .map(|(p, (v, s, t))| {
-                        (
-                            p.clone(),
-                            serde_json::json!({
-                                "verdict": v,
-                                "score": s,
-                                "time_ms": t,
-                            }),
-                        )
-                    })
-                    .collect();
-
-                serde_json::json!({
-                    "rank": st.rank,
-                    "name": st.name,
-                    "total_score": st.total_score,
-                    "total_time_ms": st.total_time_ms,
-                    "problems": prob_map,
-                })
-            })
-            .collect();
-
+        let standings_json = standings_to_json(&standings);
         let out = serde_json::json!({
+            "schema_version": 1,
             "ok": true,
             "contest_dir": contest_dir.to_string_lossy().to_string(),
             "problems_count": problems.len(),
@@ -895,4 +878,34 @@ pub fn run_contest(
     }
 
     ExitCode::from(EXIT_SUCCESS)
+}
+
+fn standings_to_json(standings: &[ContestantStanding]) -> Vec<serde_json::Value> {
+    standings
+        .iter()
+        .map(|st| {
+            let prob_map: serde_json::Map<String, serde_json::Value> = st
+                .problem_results
+                .iter()
+                .map(|(p, (v, s, t))| {
+                    (
+                        p.clone(),
+                        serde_json::json!({
+                            "verdict": v,
+                            "score": s,
+                            "time_ms": t,
+                        }),
+                    )
+                })
+                .collect();
+
+            serde_json::json!({
+                "rank": st.rank,
+                "name": st.name,
+                "total_score": st.total_score,
+                "total_time_ms": st.total_time_ms,
+                "problems": prob_map,
+            })
+        })
+        .collect()
 }
