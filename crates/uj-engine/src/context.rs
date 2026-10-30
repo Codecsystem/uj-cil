@@ -240,6 +240,12 @@ pub struct SubmissionContext {
     pub base_dir_path: PathBuf,
     pub tests: Vec<TestCase>,
     pub fail_fast: bool,
+    /// Skip the remaining tests of a `scoring = "min"` subtask once one of its tests has a
+    /// non-borderline hard failure (WA/PE/RE/MLE/OLE/RF with zero score, or a TLE that the
+    /// precise rejudge could never rescue). The subtask score is 0 either way, so the total
+    /// score is unaffected. Off by default; enabled by `uj contest` (opt out with
+    /// `--no-early-stop`). See [`SubmissionContext::with_min_early_stop`].
+    pub min_early_stop: bool,
     pub failed_subtasks: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub subtask_remaining: Arc<Mutex<std::collections::HashMap<u32, usize>>>,
     pub dep_condvar: Arc<parking_lot::Condvar>,
@@ -328,10 +334,17 @@ impl SubmissionContext {
             base_dir_path,
             tests,
             fail_fast,
+            min_early_stop: false,
             failed_subtasks: Arc::new(Mutex::new(std::collections::HashSet::new())),
             subtask_remaining: Arc::new(Mutex::new(remaining)),
             dep_condvar: Arc::new(parking_lot::Condvar::new()),
         })
+    }
+
+    /// Builder: enable/disable Min-subtask early stop (see [`SubmissionContext::min_early_stop`]).
+    pub fn with_min_early_stop(mut self, enabled: bool) -> Self {
+        self.min_early_stop = enabled;
+        self
     }
 
     pub fn is_subtask_failed(&self, subtask_id: u32) -> bool {
@@ -345,6 +358,10 @@ impl SubmissionContext {
 
     /// Wait until all transitive dependency subtasks of `subtask_id` have completed, or return
     /// `Some(failed_dep_id)` immediately if any transitive dependency has already failed.
+    ///
+    /// Note: since Round 14 the [`crate::pool::JudgePool`] no longer calls this (dependent
+    /// tests are only released into the ready queue once their dependencies have completed),
+    /// so no worker thread ever blocks here. Kept for API compatibility.
     pub fn wait_for_dependencies(&self, subtask_id: u32, cancel: &CancelToken) -> Option<u32> {
         let deps = self.problem.subtask_transitive_deps.get(&subtask_id)?;
         if deps.is_empty() {

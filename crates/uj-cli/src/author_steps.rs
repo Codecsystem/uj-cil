@@ -592,6 +592,8 @@ pub fn run_case_stages(
             answer_path,
             subtask_id: None,
             weight: 0,
+            // Inputs may still be generated at this point; 0 = "unknown, stat lazily".
+            input_size: 0,
         });
     }
 

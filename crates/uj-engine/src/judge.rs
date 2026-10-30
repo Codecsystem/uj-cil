@@ -1859,6 +1859,7 @@ mod tests {
                 answer_path: Some(PathBuf::from(format!("{i}.ans"))),
                 subtask_id: None,
                 weight: 0,
+                input_size: 0,
             })
             .collect();
         assign_subtasks_and_weights(&mut cases, config);

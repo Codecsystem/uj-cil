@@ -15,6 +15,12 @@ pub struct TestCase {
     pub subtask_id: Option<u32>,
     /// Base points allocated to this test case (scaled by 1e6 for fixed-point integer precision).
     pub weight: u64,
+    /// Byte size of the input file captured at discovery time (PERF-03).
+    ///
+    /// Used by the judging pool for LPT (longest-processing-time-first) ordering without a
+    /// per-test `stat` call. `0` means "unknown"; consumers fall back to
+    /// [`get_input_file_size`] in that case (see [`TestCase::effective_input_size`]).
+    pub input_size: u64,
 }
 
 /// Natural sort comparison for strings containing numbers (e.g., "test2" < "test10").
@@ -63,27 +69,26 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     a_chars.peek().is_some().cmp(&b_chars.peek().is_some())
 }
 
-fn input_size_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u64>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+/// Lookup of a test input file's byte size (compatibility helper).
+///
+/// The judging pool now uses [`TestCase::input_size`], captured once by [`discover_tests`].
+/// This function remains for callers that only have a path; it performs a single `stat`
+/// and keeps no global cache (the previous global map was wiped wholesale at 4096 entries,
+/// which caused cache thrash on large contests).
+pub fn get_input_file_size(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Fast cached lookup of test input file byte size for LPT scheduling.
-pub fn get_input_file_size(path: &Path) -> u64 {
-    if let Ok(guard) = input_size_cache().lock()
-        && let Some(&sz) = guard.get(path)
-    {
-        return sz;
-    }
-    let sz = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if let Ok(mut guard) = input_size_cache().lock() {
-        if guard.len() >= 4096 {
-            guard.clear();
+impl TestCase {
+    /// Input size for LPT ordering: the size captured at discovery, or a fresh `stat` when the
+    /// test case was constructed without one.
+    pub fn effective_input_size(&self) -> u64 {
+        if self.input_size > 0 {
+            self.input_size
+        } else {
+            get_input_file_size(&self.input_path)
         }
-        guard.insert(path.to_path_buf(), sz);
     }
-    sz
 }
 
 /// Detect test cases that match patterns of more than one subtask.
@@ -156,13 +161,8 @@ pub fn discover_tests(
     found_inputs.sort_by(|a, b| natural_cmp(&a.0, &b.0));
 
     let mut cases = Vec::with_capacity(found_inputs.len());
-    if let Ok(mut cache) = input_size_cache().lock() {
-        for (_, in_path, len) in &found_inputs {
-            cache.insert(in_path.clone(), *len);
-        }
-    }
 
-    for (stem, in_path, _) in found_inputs {
+    for (stem, in_path, input_size) in found_inputs {
         // Look for matching .ans or .out
         let ans_candidate = tests_dir.join(format!("{stem}.ans"));
         let out_candidate = tests_dir.join(format!("{stem}.out"));
@@ -181,6 +181,7 @@ pub fn discover_tests(
             answer_path,
             subtask_id: None,
             weight: 0,
+            input_size,
         });
     }
 
@@ -455,6 +456,7 @@ memory = "256MiB"
                     answer_path: Some(PathBuf::from(format!("{i}.ans"))),
                     subtask_id: None,
                     weight: 0,
+                    input_size: 0,
                 })
                 .collect();
             assign_subtasks_and_weights(&mut tests, &config);
@@ -479,6 +481,7 @@ memory = "256MiB"
                 answer_path: Some(PathBuf::from(format!("{i}.ans"))),
                 subtask_id: None,
                 weight: 0,
+                input_size: 0,
             })
             .collect();
         let mut config = ProblemConfig::from_toml_str(
