@@ -1,3 +1,4 @@
+pub(crate) mod author_cache;
 mod author_cmd;
 pub(crate) mod author_steps;
 mod cli;

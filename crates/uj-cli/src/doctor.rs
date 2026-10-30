@@ -48,6 +48,45 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
     )
 }
 
+/// Hashes the inputs at `indices` on a few scoped threads; returns one slot per test
+/// (`None` = not requested or unreadable).
+fn hash_inputs_parallel(
+    tests: &[uj_core::tests::TestCase],
+    indices: &[usize],
+    cache: &crate::author_cache::InputHashCache,
+) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = vec![None; tests.len()];
+    if indices.is_empty() {
+        return out;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(indices.len());
+    let chunk = indices.len().div_ceil(threads);
+    let results: Vec<Vec<(usize, Option<String>)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = indices
+            .chunks(chunk)
+            .map(|part| {
+                s.spawn(move || {
+                    part.iter()
+                        .map(|&i| (i, cache.hash(&tests[i].input_path).ok()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    for (i, h) in results.into_iter().flatten() {
+        out[i] = h;
+    }
+    out
+}
+
 pub fn run_doctor(problem_dir: Option<&Path>, fix_apparmor: bool) -> DoctorReport {
     let mut checks = Vec::new();
 
@@ -388,30 +427,71 @@ fn run_problem_checks(checks: &mut Vec<DoctorCheckItem>, root: &Path) {
                         });
                     }
 
-                    // 2. Check for duplicate test data (streaming hash) and answer cache freshness
-                    let mut hashes: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
+                    // 2. Check for duplicate test data and answer cache freshness.
+                    //
+                    // Only inputs whose size collides with another input can be duplicates, so
+                    // they are the only ones hashed for the uniqueness check. The stale-answer
+                    // check compares each input's current hash with the hash recorded in
+                    // `.uj/cache/ans_state.json` when its `.ans` was generated (by `uj ans` /
+                    // `uj pipeline`). Hashes come from the persisted input-hash cache, so
+                    // unchanged inputs are not re-read.
                     let mut duplicates = Vec::new();
-                    let ans_cache_path = root.join(".uj").join("cache").join("ans_state.json");
-                    let ans_cache: Option<std::collections::BTreeMap<String, String>> =
-                        std::fs::read_to_string(&ans_cache_path)
-                            .ok()
-                            .and_then(|s| serde_json::from_str(&s).ok());
+                    let ans_cache = crate::author_cache::load_ans_state(root);
+                    let input_cache = crate::author_cache::InputHashCache::load(root, true);
                     let mut stale_ans = Vec::new();
 
-                    for t in &discovered {
-                        if let Ok(hash) = crate::author_steps::hash_file_streaming(&t.input_path) {
-                            if let Some(ref cache_map) = ans_cache
-                                && let Some(cached_hash) = cache_map.get(&t.name)
-                                && cached_hash != &hash
-                            {
-                                stale_ans.push(t.name.clone());
+                    let mut by_size: std::collections::BTreeMap<u64, Vec<usize>> =
+                        std::collections::BTreeMap::new();
+                    let sizes: Vec<Option<u64>> = discovered
+                        .iter()
+                        .map(|t| std::fs::metadata(&t.input_path).ok().map(|m| m.len()))
+                        .collect();
+                    for (i, size) in sizes.iter().enumerate() {
+                        if let Some(sz) = size {
+                            by_size.entry(*sz).or_default().push(i);
+                        }
+                    }
+                    let mut need_hash = vec![false; discovered.len()];
+                    for group in by_size.values().filter(|g| g.len() > 1) {
+                        for &i in group {
+                            need_hash[i] = true;
+                        }
+                    }
+                    if let Some(ref cache_map) = ans_cache {
+                        for (i, t) in discovered.iter().enumerate() {
+                            if cache_map.contains_key(&t.name) {
+                                need_hash[i] = true;
                             }
-                            if let Some(existing) = hashes.get(&hash) {
-                                duplicates.push(format!("'{}' == '{}'", t.name, existing));
-                            } else {
-                                hashes.insert(hash, t.name.clone());
-                            }
+                        }
+                    }
+                    let to_hash: Vec<usize> = (0..discovered.len()).filter(|&i| need_hash[i]).collect();
+                    let hashes = hash_inputs_parallel(&discovered, &to_hash, &input_cache);
+                    if root.join(".uj").is_dir() {
+                        input_cache.save();
+                    }
+
+                    let mut seen: std::collections::HashMap<&str, &str> =
+                        std::collections::HashMap::new();
+                    for (i, t) in discovered.iter().enumerate() {
+                        let Some(hash) = hashes[i].as_deref() else {
+                            continue;
+                        };
+                        if let Some(ref cache_map) = ans_cache
+                            && let Some(cached_hash) = cache_map.get(&t.name)
+                            && cached_hash != hash
+                        {
+                            stale_ans.push(t.name.clone());
+                        }
+                        let size_collides = sizes[i]
+                            .and_then(|sz| by_size.get(&sz))
+                            .is_some_and(|g| g.len() > 1);
+                        if !size_collides {
+                            continue;
+                        }
+                        if let Some(existing) = seen.get(hash) {
+                            duplicates.push(format!("'{}' == '{}'", t.name, existing));
+                        } else {
+                            seen.insert(hash, t.name.as_str());
                         }
                     }
                     if duplicates.is_empty() {

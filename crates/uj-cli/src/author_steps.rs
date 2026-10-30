@@ -35,24 +35,12 @@ pub enum StepError {
 pub struct AnsOutcome {
     pub elapsed_ms: u64,
     pub cached: bool,
+    /// Content hash of the input the answer corresponds to.
+    pub in_hash: String,
 }
 
 pub fn hash_file_streaming(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                hasher.update(&buf[..n]);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(hasher.finalize().to_hex().to_string())
+    crate::author_cache::hash_file_streaming(path)
 }
 
 pub fn plan_gen_jobs(
@@ -97,9 +85,11 @@ pub fn plan_gen_jobs(
             }
         };
 
+        // Key generator outputs by the (memoized) binary content hash instead of re-reading the
+        // whole generator binary for every `[[tests.gen]]` entry.
         let mut base_hasher = blake3::Hasher::new();
-        if let Ok(b) = fs::read(&compiled_gen.binary_path) {
-            base_hasher.update(&b);
+        if let Ok(h) = crate::author_cache::binary_hash(&compiled_gen.binary_path) {
+            base_hasher.update(h.as_bytes());
         }
         base_hasher.update(gen_spec.args.as_bytes());
 
@@ -252,34 +242,37 @@ pub fn exec_ans(
     problem_dir: &Path,
     work_dir: &Path,
     precomputed_in_hash: Option<&str>,
+    input_cache: Option<&crate::author_cache::InputHashCache>,
     limits: &Limits,
     force: bool,
     cancel: &CancelToken,
 ) -> Result<AnsOutcome, StepError> {
     let in_hash = match precomputed_in_hash {
         Some(h) => h.to_string(),
-        None => match hash_file_streaming(input) {
-            Ok(h) => h,
-            Err(e) => {
-                return Err(StepError::Runtime(format!(
-                    "Failed to read input file for hash {}: {e}",
-                    input.display()
-                )));
+        None => {
+            let hashed = match input_cache {
+                Some(c) => c.hash(input),
+                None => hash_file_streaming(input),
+            };
+            match hashed {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(StepError::Runtime(format!(
+                        "Failed to read input file for hash {}: {e}",
+                        input.display()
+                    )));
+                }
             }
-        },
+        }
     };
 
-    let cache_meta = problem_dir
-        .join(".uj")
-        .join("cache")
-        .join("ans")
-        .join(main_hash)
-        .join(format!("{in_hash}.ans"));
-
-    if !force && ans_path.exists() && cache_meta.exists() {
+    // Cache hit = a tiny marker `<main_hash>/<in_hash>.mark` exists and the `.ans` file on disk
+    // still matches it (size, plus content hash when the file was touched since).
+    if !force && crate::author_cache::ans_marker_hit(problem_dir, main_hash, &in_hash, ans_path) {
         return Ok(AnsOutcome {
             elapsed_ms: 0,
             cached: true,
+            in_hash,
         });
     }
 
@@ -336,10 +329,11 @@ pub fn exec_ans(
             ans_path.display()
         )));
     }
-    let _ = safe_write_file(&cache_meta, &stdout_bytes);
+    crate::author_cache::write_ans_marker(problem_dir, main_hash, &in_hash, ans_path, &stdout_bytes);
     Ok(AnsOutcome {
         elapsed_ms: start.elapsed().as_millis() as u64,
         cached: false,
+        in_hash,
     })
 }
 
@@ -402,6 +396,8 @@ enum CaseFailure {
 enum CaseResult {
     Success {
         idx: usize,
+        name: String,
+        in_hash: String,
     },
     Failed(CaseFailure),
     RuntimeError {
@@ -532,7 +528,7 @@ pub fn run_case_stages(
         }
     };
 
-    let main_hash = match hash_file_streaming(&compiled_sol.binary_path) {
+    let main_hash = match crate::author_cache::binary_hash(&compiled_sol.binary_path) {
         Ok(h) => h,
         Err(e) => {
             let msg = format!("Failed to read binary for hash: {e}");
@@ -665,6 +661,20 @@ pub fn run_case_stages(
         (None, None)
     };
 
+    // Validator results are cached by (validator binary hash, input hash, --group) — successes
+    // only. `--no-cache` disables both validator-result and input-hash reuse.
+    let val_hash: Option<String> = if cli.no_cache {
+        None
+    } else {
+        compiled_val
+            .as_ref()
+            .and_then(|c| crate::author_cache::binary_hash(&c.binary_path).ok())
+    };
+    let input_cache = Arc::new(crate::author_cache::InputHashCache::load(
+        problem_dir,
+        !cli.no_cache,
+    ));
+
     let val_binary = compiled_val.map(|c| c.binary_path);
     let sol_binary =
         uj_sandbox::get_or_prepare_authorized_binary(&compiled_sol.binary_path, problem_dir)
@@ -683,6 +693,8 @@ pub fn run_case_stages(
         let stop = stop_flag.clone();
         let cancel = cancel.clone();
         let val_bin = val_binary.clone();
+        let val_h = val_hash.clone();
+        let in_cache = Arc::clone(&input_cache);
         let sol_bin = sol_binary.clone();
         let p_dir = prob_dir.clone();
         let g_dir = gen_work_dir.clone();
@@ -721,6 +733,7 @@ pub fn run_case_stages(
             }
             let _ = sandbox.authorize_executable(&sol_bin);
 
+            let mut box_dirty = false;
             while let Ok(job) = job_rx.recv() {
                 if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
                     break;
@@ -739,6 +752,7 @@ pub fn run_case_stages(
 
                     match exec_gen(sandbox.as_ref(), g_job, &g_dir, &cancel) {
                         Ok((gen_ms, in_hash)) => {
+                            in_cache.record(&g_job.target_in, &in_hash);
                             gen_in_hash = Some(in_hash);
                             if let Some(ref tx) = etx {
                                 let _ = tx.send(CaseStageEvent::StageDone {
@@ -788,6 +802,36 @@ pub fn run_case_stages(
                     break;
                 }
 
+                // Input content hash: known from the generator output, otherwise reused from the
+                // persisted input-hash cache when the file stamp is unchanged.
+                let in_hash = match gen_in_hash.take() {
+                    Some(h) => h,
+                    None => match in_cache.hash(&job.input_path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            let stage = if val_bin.is_some() {
+                                Stage::Validate
+                            } else {
+                                Stage::Ans
+                            };
+                            let err = format!(
+                                "Failed to read input file for hash {}: {e}",
+                                job.input_path.display()
+                            );
+                            if let Some(ref tx) = etx {
+                                let _ = tx.send(CaseStageEvent::Failed {
+                                    idx: job.idx,
+                                    stage,
+                                    message: err.clone(),
+                                });
+                            }
+                            let _ = res_tx.send(CaseResult::RuntimeError { stage, err });
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    },
+                };
+
                 // 2. Stage: Validate
                 if let Some(ref vb) = val_bin {
                     if let Some(ref tx) = etx {
@@ -797,21 +841,45 @@ pub fn run_case_stages(
                         });
                     }
 
-                    match exec_validate(
-                        sandbox.as_ref(),
-                        vb,
-                        &job.input_path,
-                        job.subtask_id,
-                        &p_dir,
-                        &cancel,
-                    ) {
+                    let cached_ok = val_h.as_deref().is_some_and(|vh| {
+                        crate::author_cache::validator_cached_ok(
+                            &p_dir,
+                            vh,
+                            &in_hash,
+                            job.subtask_id,
+                        )
+                    });
+                    let val_res = if cached_ok {
+                        Ok(None)
+                    } else {
+                        exec_validate(
+                            sandbox.as_ref(),
+                            vb,
+                            &job.input_path,
+                            job.subtask_id,
+                            &p_dir,
+                            &cancel,
+                        )
+                        .map(Some)
+                    };
+                    match val_res {
                         Ok(val_ms) => {
+                            if val_ms.is_some()
+                                && let Some(ref vh) = val_h
+                            {
+                                crate::author_cache::record_validator_ok(
+                                    &p_dir,
+                                    vh,
+                                    &in_hash,
+                                    job.subtask_id,
+                                );
+                            }
                             if let Some(ref tx) = etx {
                                 let _ = tx.send(CaseStageEvent::StageDone {
                                     idx: job.idx,
                                     stage: Stage::Validate,
-                                    ms: val_ms,
-                                    cached: false,
+                                    ms: val_ms.unwrap_or(0),
+                                    cached: val_ms.is_none(),
                                 });
                             }
                         }
@@ -868,7 +936,11 @@ pub fn run_case_stages(
                     });
                 }
 
-                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+                // Only clean the slot box when a previous solution run may have left files in it
+                // (cache hits never touch the box).
+                if box_dirty {
+                    let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+                }
                 match exec_ans(
                     sandbox.as_ref(),
                     &sol_bin,
@@ -877,12 +949,14 @@ pub fn run_case_stages(
                     &job.ans_path,
                     &p_dir,
                     &slot_box.box_dir,
-                    gen_in_hash.as_deref(),
+                    Some(&in_hash),
+                    Some(&in_cache),
                     &limits,
                     force,
                     &cancel,
                 ) {
                     Ok(outcome) => {
+                        box_dirty = !outcome.cached;
                         if let Some(ref tx) = etx {
                             let _ = tx.send(CaseStageEvent::StageDone {
                                 idx: job.idx,
@@ -891,7 +965,11 @@ pub fn run_case_stages(
                                 cached: outcome.cached,
                             });
                         }
-                        let _ = res_tx.send(CaseResult::Success { idx: job.idx });
+                        let _ = res_tx.send(CaseResult::Success {
+                            idx: job.idx,
+                            name: job.name.clone(),
+                            in_hash: outcome.in_hash,
+                        });
                     }
                     Err(StepError::Failed(reason)) => {
                         if let Some(ref tx) = etx {
@@ -933,6 +1011,8 @@ pub fn run_case_stages(
     drop(event_tx);
 
     let mut success_count = 0;
+    let mut ans_state_updates: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut first_failure: Option<CaseFailure> = None;
     let mut runtime_error: Option<(Stage, String)> = None;
 
@@ -953,8 +1033,9 @@ pub fn run_case_stages(
 
     while let Ok(res) = res_rx.recv() {
         match res {
-            CaseResult::Success { .. } => {
+            CaseResult::Success { name, in_hash, .. } => {
                 success_count += 1;
+                ans_state_updates.insert(name, in_hash);
                 if let Some(ref p) = pb {
                     p.inc(1);
                 }
@@ -989,6 +1070,10 @@ pub fn run_case_stages(
     for h in handles {
         let _ = h.join();
     }
+
+    // Persist caches even on failure/interrupt: every recorded entry is individually valid.
+    input_cache.save();
+    crate::author_cache::update_ans_state(problem_dir, &ans_state_updates);
 
     if let Some(p) = pb {
         p.finish_and_clear();
