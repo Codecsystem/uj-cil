@@ -216,10 +216,7 @@ fn grant_tree_full_locked(dir: &Path, sid: PSID) -> std::io::Result<()> {
 }
 
 fn grant_protected_descendants_locked(dir: &Path, sid: PSID) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => return Err(e),
-    };
+    let entries = std::fs::read_dir(dir)?;
     for entry in entries {
         let entry = entry?;
         let ft = entry.file_type()?;
