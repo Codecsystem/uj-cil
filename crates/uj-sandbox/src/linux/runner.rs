@@ -535,6 +535,10 @@ pub fn execute_in_sandbox_with_stdio(
         )
     };
 
+    // Build the seccomp BPF program in the parent (cached per process) so the forked
+    // contestant only installs it; no allocation happens after fork.
+    let seccomp_filter = crate::linux::seccomp::prebuilt_filter();
+
     unsafe {
         cmd.pre_exec(move || {
             // Raw async-signal-safe file writer using direct libc syscalls
@@ -1120,7 +1124,11 @@ pub fn execute_in_sandbox_with_stdio(
                             libc::_exit(125);
                         }
 
-                        if crate::linux::seccomp::apply_seccomp_filter().is_err() {
+                        let seccomp_ok = match seccomp_filter {
+                            Some(f) => crate::linux::seccomp::install_filter(f).is_ok(),
+                            None => false,
+                        };
+                        if !seccomp_ok {
                             libc::_exit(125);
                         }
 

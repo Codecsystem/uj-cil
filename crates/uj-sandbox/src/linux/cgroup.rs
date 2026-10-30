@@ -1,8 +1,10 @@
 //! Linux cgroup v2 resource management.
 
 use std::fs;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::SystemTime;
 
@@ -11,11 +13,24 @@ use uj_core::run::Limits;
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Number of sandbox helper processes counted against `pids.max` in addition to the
+/// contestant's own `max_processes` budget on the legacy spawn path
+/// (intermediate `unshare` process + PID 1 init + PID 2 contestant).
+pub const LEGACY_HELPER_PROCS: u64 = 3;
+
 #[derive(Debug)]
 pub struct CgroupV2 {
     path: PathBuf,
     cpu_stat_file: parking_lot::Mutex<Option<fs::File>>,
     mem_events_file: parking_lot::Mutex<Option<fs::File>>,
+    /// `memory.peak` handle kept open for the whole run. On Linux >= 6.12 the file is opened
+    /// `O_RDWR` and the sandbox resets the *per-open-file* watermark through this very open
+    /// file description right before the contestant starts, so reads through it report the
+    /// per-run peak. On older kernels it is a read-only handle (global cgroup watermark).
+    mem_peak_file: parking_lot::Mutex<Option<fs::File>>,
+    /// Set once `cgroup.kill` has been issued; further kills are no-ops (a killed cgroup cannot
+    /// gain new members because every member is already SIGKILLed).
+    killed: AtomicBool,
 }
 
 /// Reference-counted handle to the per-process cgroup base directory (`.../uj/proc_<pid>`).
@@ -373,6 +388,14 @@ impl CgroupV2 {
     }
 
     /// Create a dedicated sub-cgroup for a single test run.
+    ///
+    /// Note (Round 14): a per-slot reusable cgroup was evaluated and deliberately not adopted;
+    /// see `docs/opt/ROUND_14_SANDBOX_LINUX.md` (page-cache / kmem charges of files written to
+    /// `/box` stay charged to a reused memcg and would leak into the next run's `memory.peak`
+    /// and `memory.max` headroom). Per-run creation is kept, but its cost is reduced: control
+    /// file existence checks are cached process-wide, the contestant is placed in the cgroup with
+    /// `CLONE_INTO_CGROUP` (no `cgroup.procs` migration), and teardown issues a single
+    /// `cgroup.kill`.
     pub fn create_for_run(base_dir: &Path, prefix: &str) -> Result<Self, SandboxError> {
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -392,6 +415,8 @@ impl CgroupV2 {
             path: sub_path,
             cpu_stat_file: parking_lot::Mutex::new(None),
             mem_events_file: parking_lot::Mutex::new(None),
+            mem_peak_file: parking_lot::Mutex::new(None),
+            killed: AtomicBool::new(false),
         })
     }
 
@@ -400,6 +425,20 @@ impl CgroupV2 {
         limits: &Limits,
         cpu_affinity: Option<&[usize]>,
     ) -> Result<(), SandboxError> {
+        self.set_limits_with_helpers(limits, cpu_affinity, LEGACY_HELPER_PROCS)
+    }
+
+    /// Writes resource limits. `helper_procs` is the number of sandbox-internal processes
+    /// (init, intermediate) that live in the cgroup next to the contestant and must not eat
+    /// into the contestant's `max_processes` budget (nor enlarge it).
+    pub fn set_limits_with_helpers(
+        &self,
+        limits: &Limits,
+        cpu_affinity: Option<&[usize]>,
+        helper_procs: u64,
+    ) -> Result<(), SandboxError> {
+        let caps = control_files(&self.path);
+
         // 1. memory.max & memory.swap.max
         if limits.memory_bytes > 0 {
             let mem_file = self.path.join("memory.max");
@@ -410,8 +449,8 @@ impl CgroupV2 {
                 ))
             })?;
             // Enforce hard memory limit by forbidding swap when swap exists on host
-            let swap_file = self.path.join("memory.swap.max");
-            if swap_file.exists() || host_has_active_swap() {
+            if caps.swap_max || host_has_active_swap() {
+                let swap_file = self.path.join("memory.swap.max");
                 fs::write(&swap_file, "0").map_err(|e| {
                     SandboxError::Internal(format!(
                         "Failed to set memory.swap.max in {}: {e}",
@@ -419,41 +458,41 @@ impl CgroupV2 {
                     ))
                 })?;
             }
-            let oom_group_file = self.path.join("memory.oom.group");
-            if oom_group_file.exists() {
-                let _ = fs::write(oom_group_file, "1");
+            if caps.oom_group {
+                let _ = fs::write(self.path.join("memory.oom.group"), "1");
             }
         }
 
         // 2. pids.max
         if limits.max_processes > 0 {
-            let pids_file = self.path.join("pids.max");
-            // Allow max_processes + 3 for mini-init and helper
-            let max_pids = limits.max_processes + 3;
-            fs::write(&pids_file, max_pids.to_string()).map_err(|e| {
-                SandboxError::Internal(format!(
-                    "Failed to set pids.max in {}: {e}",
-                    self.path.display()
-                ))
-            })?;
+            self.set_pids_max(limits.max_processes.saturating_add(helper_procs))?;
         }
 
         // 3. cpuset.cpus (affinity)
         if let Some(cpus) = cpu_affinity
             && !cpus.is_empty()
+            && caps.cpuset
         {
-            let cpuset_file = self.path.join("cpuset.cpus");
-            if cpuset_file.exists() {
-                let mask = cpus
-                    .iter()
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let _ = fs::write(cpuset_file, mask);
-            }
+            let mask = cpus
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = fs::write(self.path.join("cpuset.cpus"), mask);
         }
 
         Ok(())
+    }
+
+    /// Overwrites `pids.max`.
+    pub fn set_pids_max(&self, max_pids: u64) -> Result<(), SandboxError> {
+        let pids_file = self.path.join("pids.max");
+        fs::write(&pids_file, max_pids.to_string()).map_err(|e| {
+            SandboxError::Internal(format!(
+                "Failed to set pids.max in {}: {e}",
+                self.path.display()
+            ))
+        })
     }
 
     /// Add a process PID to this cgroup.
@@ -467,8 +506,59 @@ impl CgroupV2 {
         })
     }
 
+    /// Opens a directory fd for `clone3(CLONE_INTO_CGROUP)`.
+    pub fn open_dir_fd(&self) -> Option<fs::File> {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(&self.path)
+            .ok()
+    }
+
+    /// Opens a dedicated `cpu.stat` handle to be inherited by the sandbox init process, which
+    /// samples `usage_usec` right before starting / right after reaping the contestant.
+    pub fn open_cpu_stat_for_child(&self) -> Option<fs::File> {
+        fs::File::open(self.path.join("cpu.stat")).ok()
+    }
+
+    /// Opens `memory.peak` for the lifetime of this run and keeps the handle.
+    ///
+    /// Returns the raw fd (owned by `self`) that the sandbox child must write a reset to right
+    /// before the contestant starts, if the kernel supports per-open-file peak reset
+    /// (Linux >= 6.12, file is writable). Returns `None` on older kernels, where the handle is
+    /// read-only and reports the cgroup-lifetime watermark (still per-run because every run
+    /// gets a fresh cgroup).
+    pub fn open_peak_tracking(&self) -> Option<i32> {
+        let path = self.path.join("memory.peak");
+        let mut guard = self.mem_peak_file.lock();
+        match fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => {
+                let fd = f.as_raw_fd();
+                *guard = Some(f);
+                Some(fd)
+            }
+            Err(_) => {
+                *guard = fs::File::open(&path).ok();
+                None
+            }
+        }
+    }
+
     /// Read peak memory consumed by the cgroup in bytes.
+    ///
+    /// Uses the run-long `memory.peak` handle opened by [`Self::open_peak_tracking`] when
+    /// available (so a per-fd reset done through it is honoured), else a fresh open.
     pub fn read_peak_memory(&self) -> u64 {
+        if let Some(ref f) = *self.mem_peak_file.lock() {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = f.read_at(&mut buf, 0)
+                && let Some(v) = std::str::from_utf8(&buf[..n])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                return v;
+            }
+        }
         let peak_file = self.path.join("memory.peak");
         fs::read_to_string(peak_file)
             .ok()
@@ -478,7 +568,6 @@ impl CgroupV2 {
 
     /// Read total CPU time consumed by the cgroup in microseconds.
     pub fn read_cpu_time_us(&self) -> u64 {
-        use std::os::unix::fs::FileExt;
         let mut guard = self.cpu_stat_file.lock();
         if guard.is_none() {
             *guard = fs::File::open(self.path.join("cpu.stat")).ok();
@@ -486,13 +575,9 @@ impl CgroupV2 {
         if let Some(ref f) = *guard {
             let mut buf = [0u8; 512];
             if let Ok(n) = f.read_at(&mut buf, 0)
-                && let Ok(content) = std::str::from_utf8(&buf[..n])
+                && let Some(v) = parse_usage_usec(&buf[..n])
             {
-                for line in content.lines() {
-                    if let Some(rest) = line.strip_prefix("usage_usec ") {
-                        return rest.trim().parse::<u64>().unwrap_or(0);
-                    }
-                }
+                return v;
             }
         }
         0
@@ -500,7 +585,6 @@ impl CgroupV2 {
 
     /// Check if the cgroup triggered an out-of-memory event.
     pub fn read_oom_killed(&self) -> bool {
-        use std::os::unix::fs::FileExt;
         let mut guard = self.mem_events_file.lock();
         if guard.is_none() {
             *guard = fs::File::open(self.path.join("memory.events")).ok();
@@ -525,9 +609,19 @@ impl CgroupV2 {
     }
 
     /// Atomically terminate all processes in this cgroup.
+    ///
+    /// Idempotent: once `cgroup.kill` succeeded, later calls are no-ops (every member was
+    /// SIGKILLed atomically, so no member can fork new ones). On kernels without
+    /// `cgroup.kill` (< 5.14) the racy per-pid fallback is repeated on every call.
     pub fn kill(&self) {
+        if self.killed.load(Ordering::Acquire) {
+            return;
+        }
         let kill_file = self.path.join("cgroup.kill");
-        let _ = fs::write(kill_file, "1");
+        if fs::write(kill_file, "1").is_ok() {
+            self.killed.store(true, Ordering::Release);
+            return;
+        }
 
         let procs_file = self.path.join("cgroup.procs");
         if let Ok(content) = fs::read_to_string(&procs_file) {
@@ -541,17 +635,28 @@ impl CgroupV2 {
         }
     }
 
+    /// Whether `cgroup.kill` has already been issued for this cgroup.
+    pub fn is_killed(&self) -> bool {
+        self.killed.load(Ordering::Acquire)
+    }
+
     /// Clean up and remove this cgroup directory.
     pub fn cleanup(&self) {
         let _ = self.cpu_stat_file.lock().take();
         let _ = self.mem_events_file.lock().take();
+        let _ = self.mem_peak_file.lock().take();
         self.kill();
-        // Give kernel a brief moment to reap processes, then rmdir
-        for _ in 0..10 {
-            if fs::remove_dir(&self.path).is_ok() {
-                break;
+        // rmdir usually succeeds immediately (all members were reaped). If killed members are
+        // still exiting, back off exponentially instead of a fixed 5 ms sleep (~50 ms budget).
+        let mut delay_us = 100u64;
+        for _ in 0..16 {
+            match fs::remove_dir(&self.path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => {}
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_micros(delay_us));
+            delay_us = (delay_us * 2).min(5_000);
         }
     }
 
@@ -563,5 +668,78 @@ impl CgroupV2 {
 impl Drop for CgroupV2 {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+/// Which optional control files exist in per-run cgroups (identical for every child of the
+/// process-wide base, so probed once instead of three `stat`s per run).
+#[derive(Debug, Clone, Copy)]
+struct ControlFiles {
+    swap_max: bool,
+    oom_group: bool,
+    cpuset: bool,
+}
+
+fn control_files(sample_cgroup: &Path) -> ControlFiles {
+    static CACHE: OnceLock<ControlFiles> = OnceLock::new();
+    *CACHE.get_or_init(|| ControlFiles {
+        swap_max: sample_cgroup.join("memory.swap.max").exists(),
+        oom_group: sample_cgroup.join("memory.oom.group").exists(),
+        cpuset: sample_cgroup.join("cpuset.cpus").exists(),
+    })
+}
+
+/// Parses the `usage_usec` value from the content of a `cpu.stat` file.
+///
+/// Allocation-free and panic-free so it can run in a post-fork sandbox child.
+pub(crate) fn parse_usage_usec(content: &[u8]) -> Option<u64> {
+    const KEY: &[u8] = b"usage_usec ";
+    let mut line_start = 0usize;
+    while line_start < content.len() {
+        let rest = &content[line_start..];
+        if rest.starts_with(KEY) {
+            let mut value: u64 = 0;
+            let mut seen_digit = false;
+            for &b in &rest[KEY.len()..] {
+                if b.is_ascii_digit() {
+                    value = value.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+                    seen_digit = true;
+                } else if b == b' ' && !seen_digit {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            return if seen_digit { Some(value) } else { None };
+        }
+        // advance to next line
+        let mut i = line_start;
+        while i < content.len() && content[i] != b'\n' {
+            i += 1;
+        }
+        line_start = i + 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_usage_usec;
+
+    #[test]
+    fn test_parse_usage_usec() {
+        assert_eq!(
+            parse_usage_usec(b"usage_usec 12345\nuser_usec 1\nsystem_usec 2\n"),
+            Some(12345)
+        );
+        assert_eq!(
+            parse_usage_usec(b"nr_periods 0\nusage_usec 7\nuser_usec 1\n"),
+            Some(7)
+        );
+        assert_eq!(parse_usage_usec(b"usage_usec 0"), Some(0));
+        assert_eq!(parse_usage_usec(b"user_usec 1\n"), None);
+        assert_eq!(parse_usage_usec(b""), None);
+        assert_eq!(parse_usage_usec(b"usage_usec \n"), None);
+        assert_eq!(parse_usage_usec(b"usage_usec 99999999999999999999999\n"), None);
     }
 }

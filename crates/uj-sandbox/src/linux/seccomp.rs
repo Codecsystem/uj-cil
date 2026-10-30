@@ -401,49 +401,83 @@ pub(crate) fn build_bpf_filter(
     filter
 }
 
-pub fn apply_seccomp_filter() -> Result<(), std::io::Error> {
-    #[cfg(target_arch = "x86_64")]
-    let filter = build_bpf_filter(
+/// Returns the BPF program for the host architecture, built exactly once per process.
+///
+/// The filter is compiled (with its heap allocation and jump-offset assertions) in the
+/// supervisor **before** any fork/clone, so the sandboxed child only has to issue the
+/// `prctl(PR_SET_SECCOMP)` syscall on an already-built, immutable buffer. This keeps the
+/// post-fork child strictly async-signal-safe (no malloc / panics after fork in a
+/// multi-threaded parent).
+///
+/// Returns `None` on CPU architectures without a filter table.
+pub(crate) fn prebuilt_filter() -> Option<&'static [sock_filter]> {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        static FILTER: std::sync::OnceLock<Vec<sock_filter>> = std::sync::OnceLock::new();
+        Some(FILTER.get_or_init(build_host_filter).as_slice())
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_host_filter() -> Vec<sock_filter> {
+    build_bpf_filter(
         AUDIT_ARCH_X86_64,
         true,
         x86_64_nr::SYS_CLONE3,
         x86_64_nr::SYS_CLONE,
         &x86_64_nr::BLACKLIST,
-    );
+    )
+}
 
-    #[cfg(target_arch = "aarch64")]
-    let filter = build_bpf_filter(
+#[cfg(target_arch = "aarch64")]
+fn build_host_filter() -> Vec<sock_filter> {
+    build_bpf_filter(
         AUDIT_ARCH_AARCH64,
         false,
         aarch64_nr::SYS_CLONE3,
         aarch64_nr::SYS_CLONE,
         &aarch64_nr::BLACKLIST,
-    );
+    )
+}
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        return Err(std::io::Error::new(
+/// Installs an already-built filter: `PR_SET_NO_NEW_PRIVS` followed by `PR_SET_SECCOMP`.
+///
+/// Async-signal-safe: performs only two raw syscalls and never allocates, so it may be
+/// called in a freshly forked/cloned child of a multi-threaded process.
+///
+/// # Safety
+/// `filter` must be a valid, fully resolved BPF program (as returned by [`prebuilt_filter`]).
+pub(crate) unsafe fn install_filter(filter: &[sock_filter]) -> Result<(), std::io::Error> {
+    let prog = sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Builds (once, cached) and installs the seccomp filter on the calling thread.
+///
+/// Prefer calling [`prebuilt_filter`] in the parent and [`install_filter`] in the child;
+/// this convenience wrapper is kept for API compatibility.
+pub fn apply_seccomp_filter() -> Result<(), std::io::Error> {
+    match prebuilt_filter() {
+        Some(filter) => unsafe { install_filter(filter) },
+        None => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Seccomp BPF filter is not supported on this CPU architecture",
-        ));
-    }
-
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    {
-        let prog = sock_fprog {
-            len: filter.len() as u16,
-            filter: filter.as_ptr(),
-        };
-
-        unsafe {
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        Ok(())
+        )),
     }
 }
 
@@ -492,6 +526,14 @@ mod tests {
             }
         }
         panic!("BPF program did not terminate");
+    }
+
+    #[test]
+    fn test_prebuilt_filter_is_cached_and_matches_fresh_build() {
+        let a = prebuilt_filter().expect("supported arch");
+        let b = prebuilt_filter().expect("supported arch");
+        assert_eq!(a.as_ptr(), b.as_ptr(), "filter must be built once and cached");
+        assert_eq!(a, build_host_filter().as_slice());
     }
 
     #[test]
