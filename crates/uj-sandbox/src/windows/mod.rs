@@ -91,14 +91,13 @@ impl WindowsSandbox {
 
 impl Drop for WindowsSandbox {
     fn drop(&mut self) {
-        if let Some(ref ac) = self.app_container
-            && let Ok(sid_str) = ac.sid_string()
-        {
+        if let Some(ref ac) = self.app_container {
             let paths: Vec<std::path::PathBuf> =
                 self.authorized_slot_dirs.get_mut().drain().collect();
             for path in paths {
                 if path.exists() {
-                    let _ = security::AppContainerProfile::revoke_path_access(&path, &sid_str);
+                    // In-process DACL update (no icacls.exe spawn per path).
+                    let _ = ac.revoke_access(&path);
                 }
             }
         }
@@ -147,12 +146,9 @@ impl Sandbox for WindowsSandbox {
         if let Some(ref ac) = self.app_container {
             let mut set = self.authorized_slot_dirs.lock();
             if !set.contains(path) {
-                let sid = ac
-                    .sid_string()
-                    .map_err(|e| SandboxError::Internal(format!("Failed to get SID: {e}")))?;
-                security::AppContainerProfile::grant_path_read_execute(path, &sid).map_err(
-                    |e| SandboxError::Internal(format!("Failed to grant RX to executable: {e}")),
-                )?;
+                ac.grant_read_execute(path).map_err(|e| {
+                    SandboxError::Internal(format!("Failed to grant RX to executable: {e}"))
+                })?;
                 set.insert(path.to_path_buf());
             }
         }

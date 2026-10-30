@@ -1,15 +1,29 @@
 //! AppContainer and token isolation for Windows sandbox.
+//!
+//! Directory / executable ACL grants for the per-slot AppContainer SID are applied
+//! in-process through the Win32 security APIs (`GetNamedSecurityInfoW` +
+//! `SetEntriesInAclW` + `SetNamedSecurityInfoW`) instead of spawning `icacls.exe`
+//! (Round 14: ~37 ms per spawn → sub-millisecond).
 
-use std::ffi::OsString;
-use std::mem::size_of;
-use windows::Win32::Foundation::CloseHandle;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
+use std::ptr::null_mut;
+use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HLOCAL, LocalFree, WIN32_ERROR};
+use windows::Win32::Security::Authorization::{
+    ACCESS_MODE, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+};
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
-use windows::Win32::Security::{FreeSid, PSID};
-use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    STARTUPINFOW, WaitForSingleObject,
+use windows::Win32::Security::{
+    ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, FreeSid, GetSecurityDescriptorControl,
+    NO_INHERITANCE, OBJECT_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
 };
 use windows_core::{PCWSTR, PWSTR};
 
@@ -17,6 +31,8 @@ pub struct AppContainerProfile {
     sid: PSID,
     name: String,
     is_transient: bool,
+    /// Cached textual SID (`S-1-15-2-...`), computed on first use.
+    sid_str: OnceLock<String>,
 }
 
 // SAFETY: PSID points to an OS-allocated immutable SID structure that is safe to read across threads.
@@ -30,57 +46,272 @@ use std::sync::{Arc, OnceLock};
 static SHARED_PROFILE: OnceLock<Result<Arc<AppContainerProfile>, String>> = OnceLock::new();
 static PROFILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Execute `icacls.exe` with `bInheritHandles = FALSE` and `CREATE_NO_WINDOW` so that
-/// concurrent worker threads never leak inheritable pipe handles into `icacls.exe`.
-fn run_icacls(args: &[OsString]) -> Result<(), std::io::Error> {
-    let mut full_argv = Vec::with_capacity(args.len() + 1);
-    full_argv.push(OsString::from("icacls.exe"));
-    full_argv.extend_from_slice(args);
+/// Serializes read-modify-write DACL updates inside this process. Several worker slots may
+/// grant `RX` on the same shared `.uj/tmp/bin/<hash>.exe` concurrently; without the lock two
+/// interleaved `Get → SetEntriesInAcl → Set` sequences would lose one slot's ACE.
+static ACL_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-    let cmd_line_str = crate::windows::process::build_windows_cmd_line(&full_argv);
-    let mut cmd_line_utf16: Vec<u16> = cmd_line_str.encode_utf16().chain(Some(0)).collect();
+/// `PROTECTED_DACL_SECURITY_INFORMATION` (winnt.h).
+const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 
-    let si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    let mut pi = PROCESS_INFORMATION::default();
+/// Full control (`icacls ... F`).
+const ACCESS_FULL: u32 = FILE_ALL_ACCESS.0;
+/// Read + execute (`icacls ... RX`).
+const ACCESS_READ_EXECUTE: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 
-    let spawn_res = unsafe {
-        CreateProcessW(
-            PCWSTR::null(),
-            PWSTR(cmd_line_utf16.as_mut_ptr()),
+/// Frees a `LocalAlloc`-ed buffer returned by the security APIs on drop.
+struct LocalAllocGuard(*mut core::ffi::c_void);
+
+impl Drop for LocalAllocGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.0));
+            }
+        }
+    }
+}
+
+fn to_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+fn win32_io_error(code: WIN32_ERROR, what: &str, path: &Path) -> std::io::Error {
+    let os = std::io::Error::from_raw_os_error(code.0 as i32);
+    std::io::Error::new(
+        os.kind(),
+        format!("{what} failed for '{}': {os}", path.display()),
+    )
+}
+
+/// Read the DACL protection bit of an object (`SE_DACL_PROTECTED`).
+fn dacl_is_protected(path: &Path) -> std::io::Result<bool> {
+    let wide = to_wide(path);
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
             None,
             None,
-            false, // CRITICAL: bInheritHandles = FALSE prevents inheriting any pipe handles
-            CREATE_NO_WINDOW,
             None,
-            PCWSTR::null(),
-            &si,
-            &mut pi,
+            None,
+            &mut psd,
         )
     };
-
-    if let Err(e) = spawn_res {
-        return Err(std::io::Error::other(format!(
-            "Failed to spawn icacls.exe: {e}"
-        )));
+    if rc != ERROR_SUCCESS {
+        return Err(win32_io_error(rc, "GetNamedSecurityInfoW", path));
     }
-
-    let mut exit_code: u32 = 1;
+    let _sd_guard = LocalAllocGuard(psd.0);
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
     unsafe {
-        let _ = WaitForSingleObject(pi.hProcess, INFINITE);
-        let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
+        GetSecurityDescriptorControl(psd, &mut control, &mut revision)
+            .map_err(|e| std::io::Error::other(format!("GetSecurityDescriptorControl: {e}")))?;
     }
+    Ok(control & SE_DACL_PROTECTED.0 != 0)
+}
 
-    if exit_code != 0 {
-        return Err(std::io::Error::other(format!(
-            "icacls failed with exit code {exit_code}"
-        )));
+/// Merge a single explicit ACE for `sid` into the DACL of `path` (one object; the system
+/// automatically propagates inheritable ACEs to non-protected children).
+///
+/// Must be called with `ACL_LOCK` held.
+fn apply_explicit_ace_locked(
+    path: &Path,
+    sid: PSID,
+    mask: u32,
+    mode: ACCESS_MODE,
+    inheritance: ACE_FLAGS,
+) -> std::io::Result<()> {
+    let wide = to_wide(path);
+    let mut old_dacl: *mut ACL = null_mut();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old_dacl),
+            None,
+            &mut psd,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(win32_io_error(rc, "GetNamedSecurityInfoW", path));
+    }
+    let _sd_guard = LocalAllocGuard(psd.0);
+
+    // Preserve the existing protection state of the DACL.
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
+    let protected = unsafe { GetSecurityDescriptorControl(psd, &mut control, &mut revision) }
+        .is_ok()
+        && (control & SE_DACL_PROTECTED.0) != 0;
+
+    let ea = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: mask,
+        grfAccessMode: mode,
+        grfInheritance: inheritance,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(sid.0 as *mut u16),
+        },
+    };
+    let mut new_dacl: *mut ACL = null_mut();
+    let old_opt = if old_dacl.is_null() {
+        None
+    } else {
+        Some(old_dacl as *const ACL)
+    };
+    let rc = unsafe { SetEntriesInAclW(Some(&[ea]), old_opt, &mut new_dacl) };
+    if rc != ERROR_SUCCESS {
+        return Err(win32_io_error(rc, "SetEntriesInAclW", path));
+    }
+    let _acl_guard = LocalAllocGuard(new_dacl as *mut _);
+
+    let mut info = DACL_SECURITY_INFORMATION.0;
+    if protected {
+        info |= PROTECTED_DACL_SECURITY_INFORMATION;
+    }
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OBJECT_SECURITY_INFORMATION(info),
+            PSID::default(),
+            PSID::default(),
+            Some(new_dacl as *const ACL),
+            None,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(win32_io_error(rc, "SetNamedSecurityInfoW", path));
     }
     Ok(())
+}
+
+/// Equivalent of `icacls <dir> /grant *SID:(OI)(CI)F /T /C`:
+/// adds an inheritable full-control ACE on `dir` (the system propagates it to every
+/// non-protected descendant) and adds explicit ACEs to descendants whose DACL is
+/// protected (they would not receive the inherited ACE).
+///
+/// Reparse points (symlinks / junctions) inside the tree are never followed.
+fn grant_tree_full_locked(dir: &Path, sid: PSID) -> std::io::Result<()> {
+    let root_inherit = if dir.is_dir() {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    };
+    apply_explicit_ace_locked(dir, sid, ACCESS_FULL, GRANT_ACCESS, root_inherit)?;
+    if root_inherit == NO_INHERITANCE {
+        return Ok(());
+    }
+    grant_protected_descendants_locked(dir, sid)
+}
+
+fn grant_protected_descendants_locked(dir: &Path, sid: PSID) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            // Never follow (or modify the target of) reparse points.
+            continue;
+        }
+        let p = entry.path();
+        if dacl_is_protected(&p)? {
+            let inherit = if ft.is_dir() {
+                SUB_CONTAINERS_AND_OBJECTS_INHERIT
+            } else {
+                NO_INHERITANCE
+            };
+            apply_explicit_ace_locked(&p, sid, ACCESS_FULL, GRANT_ACCESS, inherit)?;
+        }
+        if ft.is_dir() {
+            grant_protected_descendants_locked(&p, sid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Owned SID parsed from its string form (freed with `LocalFree`).
+struct OwnedStringSid(PSID);
+
+impl OwnedStringSid {
+    fn parse(sid_str: &str) -> std::io::Result<Self> {
+        let wide: Vec<u16> = sid_str.encode_utf16().chain(Some(0)).collect();
+        let mut psid = PSID::default();
+        unsafe {
+            ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut psid).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid SID string '{sid_str}': {e}"),
+                )
+            })?;
+        }
+        Ok(Self(psid))
+    }
+}
+
+impl Drop for OwnedStringSid {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.0.0));
+            }
+        }
+    }
+}
+
+/// Refuse to hand an untrusted AppContainer a recursive write ACL on a problem directory.
+fn ensure_not_problem_dir(path: &Path) -> std::io::Result<()> {
+    let is_problem_dir = path.join("problem.toml").exists();
+    let is_problem_tests_dir = path.file_name().is_some_and(|n| n == "tests")
+        && path
+            .parent()
+            .is_some_and(|p| p.join("problem.toml").exists());
+    if is_problem_dir || is_problem_tests_dir {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Security violation: refusing to grant untrusted AppContainer recursive write ACL to problem directory '{}'",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Grant `sid` recursive full control on `path` (Fail-Closed: any error is returned).
+pub fn grant_path_access_sid(path: &Path, sid: PSID) -> std::io::Result<()> {
+    ensure_not_problem_dir(path)?;
+    let _g = ACL_LOCK.lock();
+    grant_tree_full_locked(path, sid)
+}
+
+/// Grant `sid` read + execute on a single file (`icacls <path> /grant *SID:RX`).
+pub fn grant_path_read_execute_sid(path: &Path, sid: PSID) -> std::io::Result<()> {
+    let _g = ACL_LOCK.lock();
+    apply_explicit_ace_locked(path, sid, ACCESS_READ_EXECUTE, GRANT_ACCESS, NO_INHERITANCE)
+}
+
+/// Remove every explicit allow ACE for `sid` from `path` (`icacls <path> /remove *SID`).
+/// Inherited copies on descendants disappear through automatic propagation.
+pub fn revoke_path_access_sid(path: &Path, sid: PSID) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let _g = ACL_LOCK.lock();
+    apply_explicit_ace_locked(path, sid, 0, REVOKE_ACCESS, NO_INHERITANCE)
 }
 
 impl AppContainerProfile {
@@ -143,6 +374,7 @@ impl AppContainerProfile {
                 sid,
                 name: name_str.to_string(),
                 is_transient,
+                sid_str: OnceLock::new(),
             }),
             Err(e) => {
                 // If profile already exists (HRESULT: 0x800700B7 or ERROR_ALREADY_EXISTS), derive existing SID
@@ -154,6 +386,7 @@ impl AppContainerProfile {
                         sid,
                         name: name_str.to_string(),
                         is_transient,
+                        sid_str: OnceLock::new(),
                     });
                 }
                 Err(std::io::Error::from_raw_os_error(e.code().0))
@@ -170,77 +403,61 @@ impl AppContainerProfile {
     }
 
     pub fn sid_string(&self) -> Result<String, std::io::Error> {
+        if let Some(s) = self.sid_str.get() {
+            return Ok(s.clone());
+        }
+        let s = Self::compute_sid_string(self.sid)?;
+        Ok(self.sid_str.get_or_init(|| s).clone())
+    }
+
+    fn compute_sid_string(sid: PSID) -> Result<String, std::io::Error> {
         use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 
         let mut str_ptr = PWSTR::null();
         unsafe {
-            ConvertSidToStringSidW(self.sid, &mut str_ptr)?;
+            ConvertSidToStringSidW(sid, &mut str_ptr)?;
         }
+        let _guard = LocalAllocGuard(str_ptr.0 as *mut _);
         let s = unsafe {
             str_ptr
                 .to_string()
                 .map_err(|e| std::io::Error::other(e.to_string()))?
         };
-        unsafe {
-            let _ = windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(
-                str_ptr.0 as *mut _,
-            ));
-        }
         Ok(s)
     }
 
-    pub fn grant_access_to_path(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-        let sid_str = self.sid_string()?;
-        Self::grant_path_access(path, &sid_str)
+    /// Grant this profile's SID recursive full control on `path` (in-process ACL update).
+    pub fn grant_access_to_path(&self, path: &Path) -> Result<(), std::io::Error> {
+        grant_path_access_sid(path, self.sid)
     }
 
-    pub fn grant_path_access(path: &std::path::Path, sid_str: &str) -> Result<(), std::io::Error> {
-        let is_problem_dir = path.join("problem.toml").exists();
-        let is_problem_tests_dir = path.file_name().is_some_and(|n| n == "tests")
-            && path
-                .parent()
-                .is_some_and(|p| p.join("problem.toml").exists());
-        if is_problem_dir || is_problem_tests_dir {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "Security violation: refusing to grant untrusted AppContainer recursive write ACL to problem directory '{}'",
-                    path.display()
-                ),
-            ));
-        }
-        run_icacls(&[
-            path.as_os_str().to_os_string(),
-            OsString::from("/grant"),
-            OsString::from(format!("*{sid_str}:(OI)(CI)F")),
-            OsString::from("/T"),
-            OsString::from("/C"),
-            OsString::from("/Q"),
-        ])
+    /// Grant this profile's SID read + execute on a single executable.
+    pub fn grant_read_execute(&self, path: &Path) -> Result<(), std::io::Error> {
+        grant_path_read_execute_sid(path, self.sid)
     }
 
-    pub fn grant_path_read_execute(
-        path: &std::path::Path,
-        sid_str: &str,
-    ) -> Result<(), std::io::Error> {
-        run_icacls(&[
-            path.as_os_str().to_os_string(),
-            OsString::from("/grant"),
-            OsString::from(format!("*{sid_str}:RX")),
-            OsString::from("/Q"),
-        ])
+    /// Remove this profile's explicit ACEs from `path`.
+    pub fn revoke_access(&self, path: &Path) -> Result<(), std::io::Error> {
+        revoke_path_access_sid(path, self.sid)
     }
 
-    pub fn revoke_path_access(path: &std::path::Path, sid_str: &str) -> Result<(), std::io::Error> {
+    pub fn grant_path_access(path: &Path, sid_str: &str) -> Result<(), std::io::Error> {
+        ensure_not_problem_dir(path)?;
+        let sid = OwnedStringSid::parse(sid_str)?;
+        grant_path_access_sid(path, sid.0)
+    }
+
+    pub fn grant_path_read_execute(path: &Path, sid_str: &str) -> Result<(), std::io::Error> {
+        let sid = OwnedStringSid::parse(sid_str)?;
+        grant_path_read_execute_sid(path, sid.0)
+    }
+
+    pub fn revoke_path_access(path: &Path, sid_str: &str) -> Result<(), std::io::Error> {
         if !path.exists() {
             return Ok(());
         }
-        run_icacls(&[
-            path.as_os_str().to_os_string(),
-            OsString::from("/remove"),
-            OsString::from(format!("*{sid_str}")),
-            OsString::from("/Q"),
-        ])
+        let sid = OwnedStringSid::parse(sid_str)?;
+        revoke_path_access_sid(path, sid.0)
     }
 }
 
