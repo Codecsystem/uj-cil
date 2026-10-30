@@ -754,6 +754,12 @@ pub fn run_gen_with_session(
     let t_dir = tests_dir.clone();
     let sandbox_mode_str = cli.sandbox_mode_str().to_string();
     let require_tier = cli.require_tier;
+    // Generator outputs are hashed from the bytes just written; record them so a following
+    // `uj ans` / `uj pipeline` does not re-hash the fresh inputs.
+    let input_cache = Arc::new(crate::author_cache::InputHashCache::load(
+        problem_dir,
+        !cli.no_cache,
+    ));
     let mut handles = Vec::new();
     for _ in 0..num_workers {
         let job_rx = job_rx.clone();
@@ -762,6 +768,7 @@ pub fn run_gen_with_session(
         let cancel = cancel.clone();
         let work_dir = t_dir.clone();
         let sb_mode = sandbox_mode_str.clone();
+        let in_cache = Arc::clone(&input_cache);
 
         let handle = std::thread::spawn(move || {
             let sandbox = match create_sandbox(&sb_mode, require_tier) {
@@ -781,7 +788,8 @@ pub fn run_gen_with_session(
                 }
 
                 match exec_gen(sandbox.as_ref(), &job, &work_dir, &cancel) {
-                    Ok(_) => {
+                    Ok((_, in_hash)) => {
+                        in_cache.record(&job.target_in, &in_hash);
                         let _ = res_tx.send(GenResult::Generated);
                     }
                     Err(StepError::Failed(msg)) => {
@@ -858,6 +866,7 @@ pub fn run_gen_with_session(
     for h in handles {
         let _ = h.join();
     }
+    input_cache.save();
 
     if let Some(p) = pb {
         p.finish_and_clear();
@@ -1234,7 +1243,7 @@ pub fn run_ans_with_session(
         }
     };
 
-    let main_hash = match crate::author_steps::hash_file_streaming(&compiled.binary_path) {
+    let main_hash = match crate::author_cache::binary_hash(&compiled.binary_path) {
         Ok(h) => h,
         Err(e) => {
             emit_error(
@@ -1258,15 +1267,22 @@ pub fn run_ans_with_session(
         name: String,
         input_path: PathBuf,
         ans_path: PathBuf,
-        in_hash: String,
     }
 
     enum AnsResult {
-        Generated,
+        Done {
+            name: String,
+            in_hash: String,
+            cached: bool,
+        },
         Failed {
             idx: usize,
             name: String,
             reason: String,
+        },
+        Io {
+            idx: usize,
+            err: String,
         },
         Error {
             err: String,
@@ -1277,49 +1293,22 @@ pub fn run_ans_with_session(
     let (res_tx, res_rx) = crossbeam_channel::unbounded::<AnsResult>();
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Input hashing happens inside the workers (in parallel, reusing the persisted input-hash
+    // cache) instead of serially on the main thread before any worker starts.
     for (idx, test) in tests.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return emit_interrupted(format, "Answer generation");
-        }
-
-        let in_hash = match crate::author_steps::hash_file_streaming(&test.input_path) {
-            Ok(h) => h,
-            Err(e) => {
-                emit_error(
-                    format,
-                    "IoError",
-                    format!(
-                        "Failed to read input file for hash {}: {e}",
-                        test.input_path.display()
-                    ),
-                    None,
-                );
-                return ExitCode::from(EXIT_JUDGE_FAILED);
-            }
-        };
-
-        let ans_path = test.input_path.with_extension("ans");
-        let cache_meta = problem_dir
-            .join(".uj")
-            .join("cache")
-            .join("ans")
-            .join(&main_hash)
-            .join(format!("{in_hash}.ans"));
-
-        if !force && ans_path.exists() && cache_meta.exists() {
-            continue;
-        }
-
         let _ = job_tx.send(AnsJob {
             idx,
             name: test.name.clone(),
             input_path: test.input_path.clone(),
-            ans_path,
-            in_hash,
+            ans_path: test.input_path.with_extension("ans"),
         });
     }
     drop(job_tx);
 
+    let input_cache = Arc::new(crate::author_cache::InputHashCache::load(
+        problem_dir,
+        !cli.no_cache,
+    ));
     let sol_binary =
         uj_sandbox::get_or_prepare_authorized_binary(&compiled.binary_path, problem_dir)
             .unwrap_or_else(|_| compiled.binary_path.clone());
@@ -1339,6 +1328,7 @@ pub fn run_ans_with_session(
         let limits = run_limits.clone();
         let main_hash_w = main_hash.clone();
         let sb_mode = sandbox_mode_str.clone();
+        let in_cache = Arc::clone(&input_cache);
 
         let handle = std::thread::spawn(move || {
             let sandbox = match create_sandbox(&sb_mode, require_tier) {
@@ -1362,13 +1352,31 @@ pub fn run_ans_with_session(
                 }
             };
             let _ = sandbox.authorize_executable(&sol_bin);
+            let mut box_dirty = false;
 
             while let Ok(job) = job_rx.recv() {
                 if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
                     break;
                 }
 
-                let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+                let in_hash = match in_cache.hash(&job.input_path) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = res_tx.send(AnsResult::Io {
+                            idx: job.idx,
+                            err: format!(
+                                "Failed to read input file for hash {}: {e}",
+                                job.input_path.display()
+                            ),
+                        });
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                if box_dirty {
+                    let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
+                }
                 match crate::author_steps::exec_ans(
                     sandbox.as_ref(),
                     &sol_bin,
@@ -1377,13 +1385,19 @@ pub fn run_ans_with_session(
                     &job.ans_path,
                     &p_dir,
                     &slot_box.box_dir,
-                    Some(&job.in_hash),
+                    Some(&in_hash),
+                    None,
                     &limits,
                     force,
                     &cancel,
                 ) {
-                    Ok(_outcome) => {
-                        let _ = res_tx.send(AnsResult::Generated);
+                    Ok(outcome) => {
+                        box_dirty = !outcome.cached;
+                        let _ = res_tx.send(AnsResult::Done {
+                            name: job.name,
+                            in_hash: outcome.in_hash,
+                            cached: outcome.cached,
+                        });
                     }
                     Err(crate::author_steps::StepError::Failed(reason)) => {
                         let _ = res_tx.send(AnsResult::Failed {
@@ -1422,24 +1436,35 @@ pub fn run_ans_with_session(
     };
 
     let mut generated_count = 0;
+    let mut ans_state_updates: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut first_failure: Option<(usize, String, String)> = None;
+    let mut first_io_error: Option<(usize, String)> = None;
     let mut runtime_error: Option<String> = None;
 
     while let Ok(res) = res_rx.recv() {
         match res {
-            AnsResult::Generated => {
-                generated_count += 1;
+            AnsResult::Done {
+                name,
+                in_hash,
+                cached,
+            } => {
+                if !cached {
+                    generated_count += 1;
+                }
+                ans_state_updates.insert(name, in_hash);
                 if let Some(ref p) = pb {
                     p.inc(1);
                 }
             }
             AnsResult::Failed { idx, name, reason } => {
-                if let Some((f_idx, _, _)) = first_failure {
-                    if idx < f_idx {
-                        first_failure = Some((idx, name, reason));
-                    }
-                } else {
+                if first_failure.as_ref().is_none_or(|(f_idx, _, _)| idx < *f_idx) {
                     first_failure = Some((idx, name, reason));
+                }
+            }
+            AnsResult::Io { idx, err } => {
+                if first_io_error.as_ref().is_none_or(|(f_idx, _)| idx < *f_idx) {
+                    first_io_error = Some((idx, err));
                 }
             }
             AnsResult::Error { err } => {
@@ -1454,6 +1479,9 @@ pub fn run_ans_with_session(
         let _ = h.join();
     }
 
+    input_cache.save();
+    crate::author_cache::update_ans_state(problem_dir, &ans_state_updates);
+
     if let Some(p) = pb {
         p.finish_and_clear();
     }
@@ -1462,6 +1490,10 @@ pub fn run_ans_with_session(
         return emit_interrupted(format, "Answer generation");
     }
 
+    if let Some((_, err)) = first_io_error {
+        emit_error(format, "IoError", err, None);
+        return ExitCode::from(EXIT_JUDGE_FAILED);
+    }
     if let Some(err) = runtime_error {
         emit_error(format, "SandboxError", err, None);
         return ExitCode::from(EXIT_JUDGE_FAILED);
@@ -1774,16 +1806,34 @@ struct CachedVerifyTlState {
     entries: Vec<CachedVerifyTlEntry>,
 }
 
+/// Fingerprint of the discovered test set used to invalidate the verify→tl report cache.
+///
+/// Includes each test's name, subtask and the metadata stamp (size + mtime, plus inode/ctime on
+/// Unix) of both its input and answer file, so a regenerated input or answer with an unchanged
+/// size still invalidates the cached reports. One `metadata` call per file.
 fn compute_tests_fingerprint(tests: &[uj_core::tests::TestCase]) -> String {
     let mut hasher = blake3::Hasher::new();
+    fn feed(hasher: &mut blake3::Hasher, path: &Path) {
+        if let Ok(meta) = fs::metadata(path) {
+            let st = crate::author_cache::FileStamp::from_metadata(&meta);
+            hasher.update(&st.size.to_le_bytes());
+            hasher.update(&st.mtime_ns.to_le_bytes());
+            hasher.update(&st.ino.to_le_bytes());
+            hasher.update(&st.ctime_ns.to_le_bytes());
+        } else {
+            hasher.update(b"missing");
+        }
+    }
     for t in tests {
         hasher.update(t.name.as_bytes());
         hasher.update(&[0]);
         if let Some(st) = t.subtask_id {
             hasher.update(&st.to_le_bytes());
         }
-        if let Ok(meta) = fs::metadata(&t.input_path) {
-            hasher.update(&meta.len().to_le_bytes());
+        feed(&mut hasher, &t.input_path);
+        if let Some(ref ans) = t.answer_path {
+            hasher.update(b"ans");
+            feed(&mut hasher, ans);
         }
     }
     hasher.finalize().to_hex().to_string()
@@ -2298,7 +2348,7 @@ pub fn verify_core(
                     && report.verdict.is_accepted()
                     && let Some(sub_ctx) = ready_map.get(&idx)
                     && let Ok(bin_hash) =
-                        crate::author_steps::hash_file_streaming(&sub_ctx.compiled_binary_path)
+                        crate::author_cache::binary_hash(&sub_ctx.compiled_binary_path)
                 {
                     cached_tl_entries.push(CachedVerifyTlEntry {
                         path: path_norm,
@@ -2577,7 +2627,7 @@ pub fn run_tl_with_session(
 
         let path_norm = sol.path.to_string_lossy().replace('\\', "/");
         if let Some(ref state) = cached_verify_state
-            && let Ok(bin_hash) = crate::author_steps::hash_file_streaming(&compiled.binary_path)
+            && let Ok(bin_hash) = crate::author_cache::binary_hash(&compiled.binary_path)
             && let Some(entry) = state
                 .entries
                 .iter()
@@ -2857,6 +2907,39 @@ pub fn stress_core(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> (ExitCode, serde_json::Value) {
+    let session = CompileSession::new();
+    stress_core_with_session(
+        problem_dir,
+        gen_src,
+        sol_src,
+        brute_src,
+        count,
+        seed_opt,
+        gen_args_template,
+        budget,
+        cli,
+        format,
+        cancel,
+        &session,
+    )
+}
+
+/// Like [`stress_core`] but reuses a caller-owned [`CompileSession`].
+#[allow(clippy::too_many_arguments)]
+pub fn stress_core_with_session(
+    problem_dir: &Path,
+    gen_src: &str,
+    sol_src: &str,
+    brute_src: &str,
+    count: usize,
+    seed_opt: Option<u64>,
+    gen_args_template: &str,
+    budget: Duration,
+    cli: &Cli,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    compile_session: &CompileSession,
+) -> (ExitCode, serde_json::Value) {
     let start_time = Instant::now();
 
     let gen_path = problem_dir.join(gen_src);
@@ -2899,7 +2982,6 @@ pub fn stress_core(
         None
     };
 
-    let compile_session = CompileSession::new();
     let compiled_gen = match compile_session.compile(&gen_path, cli.no_cache) {
         Ok(c) => c,
         Err(e) => {
@@ -3017,6 +3099,27 @@ pub fn stress_core(
     let sandbox_mode = cli.sandbox_mode_str().to_string();
     let require_tier = cli.require_tier;
     let pid = std::process::id();
+    // Per-run nonce + scratch dir resolved once; each worker reuses fixed scratch file names
+    // (overwritten every iteration) instead of creating/deleting three files per iteration.
+    let run_nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
+
+    /// Removes a worker's scratch files when the worker exits (any path).
+    struct ScratchFiles {
+        input: PathBuf,
+        output: PathBuf,
+        answer: PathBuf,
+    }
+    impl Drop for ScratchFiles {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.input);
+            let _ = fs::remove_file(&self.output);
+            let _ = fs::remove_file(&self.answer);
+        }
+    }
 
     enum StressFailure {
         GeneratorFailed {
@@ -3063,8 +3166,15 @@ pub fn stress_core(
         let sol_limits = sol_limits.clone();
         let gen_args_tmpl = gen_args_tmpl.clone();
         let sandbox_mode = sandbox_mode.clone();
+        let scratch = ScratchFiles {
+            input: scratch_dir.join(format!("stress_{pid}_{run_nonce}_{worker_idx}.in")),
+            output: scratch_dir.join(format!("stress_{pid}_{run_nonce}_{worker_idx}.out")),
+            answer: scratch_dir.join(format!("stress_{pid}_{run_nonce}_{worker_idx}.ans")),
+        };
 
         let handle = std::thread::spawn(move || {
+            // Owned by the worker; its Drop removes the scratch files on every exit path.
+            let scratch = scratch;
             let sandbox = match create_sandbox(&sandbox_mode, require_tier) {
                 Ok(s) => s,
                 Err(e) => {
@@ -3179,9 +3289,15 @@ pub fn stress_core(
                     let _ = fail_tx.send(StressFailure::GeneratorFailed { seed, reason });
                     break;
                 }
-                let scratch_dir = uj_sandbox::get_sandbox_scratch_dir();
-                let in_tmp = scratch_dir.join(format!("stress_{pid}_{worker_idx}_{seed}.in"));
-                let _ = fs::write(&in_tmp, &in_bytes);
+                let in_tmp = scratch.input.clone();
+                if let Err(e) = fs::write(&in_tmp, &in_bytes) {
+                    // Never fall back to a stale input from a previous iteration.
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = fail_tx.send(StressFailure::ExecutionError {
+                        message: format!("Failed to write stress input {}: {e}", in_tmp.display()),
+                    });
+                    break;
+                }
 
                 // 2. Run target solution inside isolated slot box
                 let _ = uj_sandbox::clean_box_dir_contents(&slot_box.box_dir);
@@ -3203,7 +3319,6 @@ pub fn stress_core(
                 let sol_res = match sandbox.run(&spec_sol, &cancel) {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = fs::remove_file(&in_tmp);
                         stop.store(true, Ordering::Relaxed);
                         let _ = fail_tx.send(StressFailure::ExecutionError {
                             message: format!("Solution execution failed: {e}"),
@@ -3214,7 +3329,6 @@ pub fn stress_core(
 
                 if !sol_res.status.is_success() || sol_res.killed_by.is_some() || sol_res.oom_killed
                 {
-                    let _ = fs::remove_file(&in_tmp);
                     let sol_bytes = sol_res.stdout.map(|o| o.bytes).unwrap_or_default();
                     let reason = format!(
                         "Solution failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
@@ -3256,7 +3370,6 @@ pub fn stress_core(
                 let brute_res = match sandbox.run(&spec_brute, &cancel) {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = fs::remove_file(&in_tmp);
                         stop.store(true, Ordering::Relaxed);
                         let _ = fail_tx.send(StressFailure::ExecutionError {
                             message: format!("Brute execution failed: {e}"),
@@ -3269,7 +3382,6 @@ pub fn stress_core(
                     || brute_res.killed_by.is_some()
                     || brute_res.oom_killed
                 {
-                    let _ = fs::remove_file(&in_tmp);
                     let stderr_msg = String::from_utf8_lossy(&brute_res.stderr_tail);
                     let reason = format!(
                         "Brute oracle failed on seed {seed}: status={:?}, killed_by={:?}, oom={}. Stderr: {}",
@@ -3296,50 +3408,55 @@ pub fn stress_core(
                         cr
                     }
                     uj_engine::judge::ResolvedChecker::Testlib(chk_exe) => {
-                        let out_tmp =
-                            scratch_dir.join(format!("stress_{pid}_{worker_idx}_{seed}.out"));
-                        let ans_tmp =
-                            scratch_dir.join(format!("stress_{pid}_{worker_idx}_{seed}.ans"));
-                        let _ = fs::write(&out_tmp, &sol_bytes);
-                        let _ = fs::write(&ans_tmp, &brute_bytes);
+                        let out_tmp = &scratch.output;
+                        let ans_tmp = &scratch.answer;
+                        if let Err(e) = fs::write(out_tmp, &sol_bytes)
+                            .and_then(|_| fs::write(ans_tmp, &brute_bytes))
+                        {
+                            stop.store(true, Ordering::Relaxed);
+                            let _ = fail_tx.send(StressFailure::ExecutionError {
+                                message: format!("Failed to write checker scratch files: {e}"),
+                            });
+                            break;
+                        }
                         let cr = uj_checker::testlib::run_testlib_checker(
                             sandbox.as_ref(),
                             chk_exe,
                             &in_tmp,
-                            &out_tmp,
-                            &ans_tmp,
+                            out_tmp,
+                            ans_tmp,
                             pe_as_wa,
                             &cancel,
                         );
-                        let _ = fs::remove_file(&out_tmp);
-                        let _ = fs::remove_file(&ans_tmp);
                         cr
                     }
                     uj_engine::judge::ResolvedChecker::Lemon {
                         path: chk_exe,
                         full_score,
                     } => {
-                        let out_tmp =
-                            scratch_dir.join(format!("stress_{pid}_{worker_idx}_{seed}.out"));
-                        let ans_tmp =
-                            scratch_dir.join(format!("stress_{pid}_{worker_idx}_{seed}.ans"));
-                        let _ = fs::write(&out_tmp, &sol_bytes);
-                        let _ = fs::write(&ans_tmp, &brute_bytes);
+                        let out_tmp = &scratch.output;
+                        let ans_tmp = &scratch.answer;
+                        if let Err(e) = fs::write(out_tmp, &sol_bytes)
+                            .and_then(|_| fs::write(ans_tmp, &brute_bytes))
+                        {
+                            stop.store(true, Ordering::Relaxed);
+                            let _ = fail_tx.send(StressFailure::ExecutionError {
+                                message: format!("Failed to write checker scratch files: {e}"),
+                            });
+                            break;
+                        }
                         let cr = uj_checker::lemon::run_lemon_checker(
                             sandbox.as_ref(),
                             chk_exe,
                             &in_tmp,
-                            &out_tmp,
-                            &ans_tmp,
+                            out_tmp,
+                            ans_tmp,
                             *full_score,
                             &cancel,
                         );
-                        let _ = fs::remove_file(&out_tmp);
-                        let _ = fs::remove_file(&ans_tmp);
                         cr
                     }
                 };
-                let _ = fs::remove_file(&in_tmp);
 
                 if !check.verdict.is_accepted() {
                     stop.store(true, Ordering::Relaxed);
@@ -3573,8 +3690,21 @@ pub fn pipeline_core(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> (ExitCode, serde_json::Value) {
-    uj_engine::clear_answer_cache();
     let session = CompileSession::new();
+    pipeline_core_with_session(problem_dir, cli, format, cancel, &session)
+}
+
+/// Like [`pipeline_core`] but reuses a caller-owned [`CompileSession`] (e.g. the long-lived MCP
+/// server session) so compiler lookup / `--version` probes are not repeated per call.
+pub fn pipeline_core_with_session(
+    problem_dir: &Path,
+    cli: &Cli,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    session: &CompileSession,
+) -> (ExitCode, serde_json::Value) {
+    uj_engine::clear_answer_cache();
+    let session = session.clone();
     let sub_format = match format {
         OutputFormat::Json => OutputFormat::Silent,
         other => other,
