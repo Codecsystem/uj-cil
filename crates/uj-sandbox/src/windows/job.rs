@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 use windows::Win32::System::JobObjects::{
@@ -14,12 +15,31 @@ use windows::Win32::System::JobObjects::{
 };
 use windows_core::PCWSTR;
 
+pub const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+pub const JOB_OBJECT_MSG_EXIT_PROCESS: u32 = 7;
+pub const JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
 pub const JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT: u32 = 9;
 pub const JOB_OBJECT_MSG_JOB_MEMORY_LIMIT: u32 = 10;
+
+/// `WAIT_TIMEOUT` as returned by `GetLastError()` after a timed-out `GetQueuedCompletionStatus`.
+const WAIT_TIMEOUT_CODE: i32 = 258;
 
 pub struct JobObject {
     handle: HANDLE,
     iocp: HANDLE,
+    /// Sticky flag: a memory-limit notification has been observed on the IOCP.
+    mem_violation_seen: AtomicBool,
+    /// Sticky flag: `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` has been observed on the IOCP.
+    active_zero_seen: AtomicBool,
+}
+
+/// A notification dequeued from the job's I/O completion port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobMessage {
+    /// `JOB_OBJECT_MSG_*` code.
+    pub code: u32,
+    /// Message-specific value (the process id for per-process messages).
+    pub value: usize,
 }
 
 impl JobObject {
@@ -57,7 +77,63 @@ impl JobObject {
             return Err(e.into());
         }
 
-        Ok(Self { handle, iocp })
+        Ok(Self {
+            handle,
+            iocp,
+            mem_violation_seen: AtomicBool::new(false),
+            active_zero_seen: AtomicBool::new(false),
+        })
+    }
+
+    fn record_message(&self, code: u32) {
+        if code == JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT || code == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT {
+            self.mem_violation_seen.store(true, Ordering::SeqCst);
+        } else if code == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO {
+            self.active_zero_seen.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Block for at most `timeout_ms` waiting for the next job notification
+    /// (`EXIT_PROCESS`, `ACTIVE_PROCESS_ZERO`, memory-limit, ...).
+    ///
+    /// Returns `None` on timeout. Memory-limit and active-process-zero notifications are
+    /// recorded in sticky flags so `check_memory_limit_violation` still observes them.
+    /// Never busy-spins: if the port itself fails, the call sleeps for the slice instead.
+    pub fn wait_message(&self, timeout_ms: u32) -> Option<JobMessage> {
+        let mut msg_code: u32 = 0;
+        let mut key: usize = 0;
+        let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+        let res = unsafe {
+            GetQueuedCompletionStatus(
+                self.iocp,
+                &mut msg_code,
+                &mut key,
+                &mut overlapped,
+                timeout_ms,
+            )
+        };
+        match res {
+            Ok(()) => {
+                self.record_message(msg_code);
+                Some(JobMessage {
+                    code: msg_code,
+                    value: overlapped as usize,
+                })
+            }
+            Err(e) => {
+                let is_timeout =
+                    e.code() == windows_core::HRESULT::from_win32(WAIT_TIMEOUT_CODE as u32);
+                if !is_timeout && overlapped.is_null() && timeout_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(timeout_ms as u64));
+                }
+                None
+            }
+        }
+    }
+
+    /// Whether `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` has been observed.
+    pub fn active_process_zero_seen(&self) -> bool {
+        self.active_zero_seen.load(Ordering::SeqCst)
     }
 
     pub fn set_limits(
@@ -210,11 +286,10 @@ impl JobObject {
         }
         .is_ok()
         {
-            if msg_code == JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
-                || msg_code == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
-            {
-                return true;
-            }
+            self.record_message(msg_code);
+        }
+        if self.mem_violation_seen.load(Ordering::SeqCst) {
+            return true;
         }
 
         // 2. Query JobObjectLimitViolationInformation

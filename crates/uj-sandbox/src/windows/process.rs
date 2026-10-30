@@ -7,18 +7,20 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use uj_core::run::{CapturedOutput, ExitStatus, KillReason, RunResult, RunSpec, Stdio, Tier};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::SECURITY_CAPABILITIES;
+use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows_core::{PCWSTR, PWSTR};
 
@@ -33,6 +35,95 @@ pub const ATTR_SECURITY_CAPABILITIES: usize = 0x00020009;
 pub const ATTR_CHILD_PROCESS_POLICY: usize = 0x0002000E;
 pub const PROCESS_CREATION_CHILD_PROCESS_RESTRICTED: u32 = 0x01;
 
+/// Upper bound of a monitor wait slice: limits (CPU / wall / output / cancel) are re-checked
+/// at least this often while the monitored processes are running.
+const MONITOR_SLICE_MS: u64 = 5;
+
+/// `MAXIMUM_WAIT_OBJECTS` for `WaitForMultipleObjects`.
+const MAX_WAIT_OBJECTS: usize = 64;
+
+/// `memory_bytes == 0` means "unlimited" (consistent with the Linux backend and the job
+/// limit setup, which only installs a memory cap when the limit is non-zero).
+#[inline]
+pub(crate) fn exceeds_memory_limit(peak_bytes: u64, limit_bytes: u64) -> bool {
+    limit_bytes > 0 && peak_bytes > limit_bytes
+}
+
+/// Wait slice for the monitor loops: `min(MONITOR_SLICE_MS, remaining wall + 1)`, at least 1 ms.
+#[inline]
+fn monitor_slice_ms(remaining_wall_ms: u64) -> u32 {
+    remaining_wall_ms
+        .saturating_add(1)
+        .clamp(1, MONITOR_SLICE_MS) as u32
+}
+
+fn filetime_to_u64(ft: FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+}
+
+/// Current system time as a FILETIME value (100 ns units).
+fn precise_now_filetime() -> u64 {
+    filetime_to_u64(unsafe { GetSystemTimePreciseAsFileTime() })
+}
+
+/// Exit time of a terminated process as a FILETIME value (100 ns units).
+fn process_exit_filetime(h_process: HANDLE) -> Option<u64> {
+    let (mut creation, mut exit, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    unsafe { GetProcessTimes(h_process, &mut creation, &mut exit, &mut kernel, &mut user) }
+        .ok()
+        .map(|_| filetime_to_u64(exit))
+        .filter(|&t| t != 0)
+}
+
+/// Resolve `argv[0]` to an executable path (PATH / PATHEXT search via `which`).
+///
+/// Bare command names (no path separator, e.g. `cmd.exe`, `python`) are resolved once per
+/// process and memoized: the PATH walk costs several filesystem probes per spawn. Explicit
+/// paths are not cached because the file may be (re)created between runs.
+pub(crate) fn resolve_executable(arg0: &std::ffi::OsStr) -> std::path::PathBuf {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::LazyLock;
+
+    static WHICH_CACHE: LazyLock<parking_lot::Mutex<HashMap<OsString, PathBuf>>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    let s = arg0.to_string_lossy();
+    let is_bare_name = !s.is_empty() && !s.contains(['/', '\\', ':']);
+    if is_bare_name && let Some(p) = WHICH_CACHE.lock().get(arg0) {
+        return p.clone();
+    }
+    match which::which(arg0) {
+        Ok(p) => {
+            if is_bare_name {
+                WHICH_CACHE.lock().insert(arg0.to_os_string(), p.clone());
+            }
+            p
+        }
+        Err(_) => PathBuf::from(arg0),
+    }
+}
+
+/// Apply the process-wide error mode once (inherited by every spawned child): never show
+/// critical-error / GP-fault / open-file dialog boxes that would hang an unattended judge.
+///
+/// `SetErrorMode` is process-global state, so setting it on every spawn was redundant.
+fn ensure_process_error_mode() {
+    use windows::Win32::System::Diagnostics::Debug::{
+        SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode,
+    };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    });
+}
+
 pub(crate) unsafe fn spawn_suspended_process(
     spec: &RunSpec,
     h_stdin: HANDLE,
@@ -44,8 +135,7 @@ pub(crate) unsafe fn spawn_suspended_process(
         return Err(SandboxError::Internal("Empty argv in RunSpec".to_string()));
     }
 
-    let exe_path =
-        which::which(&spec.argv[0]).unwrap_or_else(|_| std::path::PathBuf::from(&spec.argv[0]));
+    let exe_path = resolve_executable(&spec.argv[0]);
     let mut full_argv = spec.argv.clone();
     full_argv[0] = exe_path.clone().into_os_string();
 
@@ -149,13 +239,7 @@ pub(crate) unsafe fn spawn_suspended_process(
     let app_name_utf16: Vec<u16> = exe_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let pcwstr_app_name = PCWSTR(app_name_utf16.as_ptr());
 
-    unsafe {
-        windows::Win32::System::Diagnostics::Debug::SetErrorMode(
-            windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
-                | windows::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX
-                | windows::Win32::System::Diagnostics::Debug::SEM_NOOPENFILEERRORBOX,
-        );
-    }
+    ensure_process_error_mode();
 
     let spawn_res = unsafe {
         CreateProcessW(
@@ -258,8 +342,17 @@ pub fn execute_in_job(
         let _ = CloseHandle(pi.hThread);
     }
 
-    // Monitoring loop
+    // Monitoring loop (event-driven).
+    //
+    // The thread blocks on the job's I/O completion port with a short timeout slice, so
+    // EXIT_PROCESS / ACTIVE_PROCESS_ZERO / memory-limit notifications wake it immediately,
+    // while CPU / wall / output / cancellation limits are still re-checked at least every
+    // `MONITOR_SLICE_MS`. Job notifications are not guaranteed to be delivered, so process
+    // and job state is always re-queried after each wake-up; the slice timeout bounds the
+    // detection latency in that case. The loop never busy-spins (fixes the 100% CPU spin
+    // when the main process exited while descendants were still alive).
     let mut killed_by: Option<KillReason> = None;
+    let mut main_exited = false;
 
     loop {
         // 1. Cancellation check
@@ -293,16 +386,20 @@ pub fn execute_in_job(
             break;
         }
 
-        // 5. Check if process terminated
-        let wait_res = unsafe { WaitForSingleObject(pi.hProcess, 5) };
-        if wait_res == WAIT_OBJECT_0 {
-            let active = job.query_active_processes().unwrap_or(0);
-            if spec.limits.max_processes <= 1 || active == 0 {
-                break;
-            }
+        // 5. Check if process terminated (and, if descendants are allowed, whether the
+        //    whole job drained).
+        if !main_exited && unsafe { WaitForSingleObject(pi.hProcess, 0) } == WAIT_OBJECT_0 {
+            main_exited = true;
+        }
+        if main_exited
+            && (spec.limits.max_processes <= 1
+                || job.active_process_zero_seen()
+                || job.query_active_processes().unwrap_or(0) == 0)
+        {
+            break;
         }
 
-        // 6. Memory check
+        // 6. Memory check (memory_bytes == 0 means unlimited)
         if job.check_memory_limit_violation() {
             killed_by = Some(KillReason::MemoryLimit);
             let _ = job.terminate(3);
@@ -310,12 +407,16 @@ pub fn execute_in_job(
         }
 
         if let Ok(peak_mem) = job.query_peak_memory_bytes()
-            && peak_mem > spec.limits.memory_bytes
+            && exceeds_memory_limit(peak_mem, spec.limits.memory_bytes)
         {
             killed_by = Some(KillReason::MemoryLimit);
             let _ = job.terminate(3);
             break;
         }
+
+        // 7. Block until the next job notification or the slice elapses.
+        let remaining_wall = spec.limits.wall_time_ms.saturating_sub(wall_ms);
+        let _ = job.wait_message(monitor_slice_ms(remaining_wall));
     }
 
     let wall_time_us = start_time.elapsed().as_micros() as u64;
@@ -370,7 +471,7 @@ pub fn execute_in_job(
 
     let oom_killed = killed_by == Some(KillReason::MemoryLimit)
         || mem_violated
-        || memory_peak_bytes > spec.limits.memory_bytes;
+        || exceeds_memory_limit(memory_peak_bytes, spec.limits.memory_bytes);
 
     Ok(RunResult {
         status,
@@ -674,8 +775,10 @@ pub fn execute_group_in_jobs(
         .map(|s| s.limits.wall_time_ms)
         .max()
         .unwrap_or(10000);
-    let poll_interval = Duration::from_millis(5);
-
+    // Event-driven group monitoring: block in `WaitForMultipleObjects` on the handles of all
+    // still-running processes with a short timeout slice (for CPU / wall / output / cancel
+    // checks). A process exit wakes the loop immediately so `final_wall_us` and `exit_order`
+    // are recorded at the actual exit time instead of being rounded to a 5 ms poll.
     loop {
         if finished.iter().all(|&f| f) {
             break;
@@ -704,7 +807,9 @@ pub fn execute_group_in_jobs(
             break;
         }
 
-        // 3. Check each process
+        // 3. Check each process. Events detected in the same pass are ordered by the time
+        //    they actually happened (process exit time / kill decision time).
+        let mut pass_events: Vec<(u64, usize)> = Vec::new();
         for i in 0..n {
             if finished[i] {
                 continue;
@@ -715,8 +820,8 @@ pub fn execute_group_in_jobs(
                 killed_by[i] = Some(KillReason::OutputLimit);
                 let _ = jobs[i].terminate(3);
                 finished[i] = true;
-                exit_order[i] = Some(order_counter);
-                order_counter += 1;
+                final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+                pass_events.push((precise_now_filetime(), i));
                 continue;
             }
 
@@ -727,8 +832,8 @@ pub fn execute_group_in_jobs(
                 killed_by[i] = Some(KillReason::CpuLimit);
                 let _ = jobs[i].terminate(3);
                 finished[i] = true;
-                exit_order[i] = Some(order_counter);
-                order_counter += 1;
+                final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+                pass_events.push((precise_now_filetime(), i));
                 continue;
             }
 
@@ -736,8 +841,7 @@ pub fn execute_group_in_jobs(
             let wait_res = unsafe { WaitForSingleObject(proc_infos[i].hProcess, 0) };
             if wait_res == WAIT_OBJECT_0 {
                 finished[i] = true;
-                exit_order[i] = Some(order_counter);
-                order_counter += 1;
+                final_wall_us[i] = start_time.elapsed().as_micros() as u64;
 
                 let mut exit_code: u32 = 0;
                 unsafe {
@@ -750,34 +854,60 @@ pub fn execute_group_in_jobs(
                 };
                 final_cpu_us[i] = jobs[i].query_cpu_time_us().unwrap_or(0);
                 final_peak_mem[i] = jobs[i].query_peak_memory_bytes().unwrap_or(0);
-                final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+                let exit_ft = process_exit_filetime(proc_infos[i].hProcess)
+                    .unwrap_or_else(precise_now_filetime);
+                pass_events.push((exit_ft, i));
                 continue;
             }
 
-            // Memory check
+            // Memory check (memory_bytes == 0 means unlimited)
             if jobs[i].check_memory_limit_violation() {
                 killed_by[i] = Some(KillReason::MemoryLimit);
                 let _ = jobs[i].terminate(3);
                 finished[i] = true;
-                exit_order[i] = Some(order_counter);
-                order_counter += 1;
+                final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+                pass_events.push((precise_now_filetime(), i));
                 continue;
             }
 
             if let Ok(mem) = jobs[i].query_peak_memory_bytes()
-                && mem > specs[i].limits.memory_bytes
+                && exceeds_memory_limit(mem, specs[i].limits.memory_bytes)
             {
                 killed_by[i] = Some(KillReason::MemoryLimit);
                 let _ = jobs[i].terminate(3);
                 finished[i] = true;
-                exit_order[i] = Some(order_counter);
-                order_counter += 1;
+                final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+                pass_events.push((precise_now_filetime(), i));
                 continue;
             }
         }
 
-        thread::sleep(poll_interval);
+        // Stable sort keeps index order for events with identical timestamps.
+        pass_events.sort_by_key(|&(t, _)| t);
+        for (_, i) in pass_events {
+            exit_order[i] = Some(order_counter);
+            order_counter += 1;
+        }
+
+        // 4. Block until any running process exits or the slice elapses.
+        let waitable: Vec<HANDLE> = (0..n)
+            .filter(|&i| !finished[i])
+            .map(|i| proc_infos[i].hProcess)
+            .take(MAX_WAIT_OBJECTS)
+            .collect();
+        if waitable.is_empty() {
+            continue;
+        }
+        let remaining_wall =
+            group_wall_limit.saturating_sub(start_time.elapsed().as_millis() as u64);
+        unsafe {
+            let _ = WaitForMultipleObjects(&waitable, false, monitor_slice_ms(remaining_wall));
+        }
     }
+
+    // Wall time for processes still running when the loop ended (cancel / group wall limit),
+    // captured before the per-process termination waits below can skew it.
+    let loop_end_wall_us = start_time.elapsed().as_micros() as u64;
 
     // 8. Collect results for all processes
     let mut results = Vec::with_capacity(n);
@@ -789,6 +919,13 @@ pub fn execute_group_in_jobs(
         let mem_violated = jobs[i].check_memory_limit_violation();
         if mem_violated && killed_by[i].is_none() {
             killed_by[i] = Some(KillReason::MemoryLimit);
+        }
+
+        if finished[i] && killed_by[i].is_some() && final_cpu_us[i] == 0 {
+            // Killed inside the loop (OLE / CPU / memory): report the real accounting
+            // instead of zeros.
+            final_cpu_us[i] = jobs[i].query_cpu_time_us().unwrap_or(0);
+            final_peak_mem[i] = jobs[i].query_peak_memory_bytes().unwrap_or(0);
         }
 
         if !finished[i] {
@@ -803,7 +940,7 @@ pub fn execute_group_in_jobs(
             };
             final_cpu_us[i] = jobs[i].query_cpu_time_us().unwrap_or(0);
             final_peak_mem[i] = jobs[i].query_peak_memory_bytes().unwrap_or(0);
-            final_wall_us[i] = start_time.elapsed().as_micros() as u64;
+            final_wall_us[i] = loop_end_wall_us;
             exit_order[i] = Some(order_counter);
             order_counter += 1;
         }
@@ -828,7 +965,7 @@ pub fn execute_group_in_jobs(
 
         let oom_killed = killed_by[i] == Some(KillReason::MemoryLimit)
             || mem_violated
-            || final_peak_mem[i] > specs[i].limits.memory_bytes;
+            || exceeds_memory_limit(final_peak_mem[i], specs[i].limits.memory_bytes);
 
         results.push(RunResult {
             status: exit_statuses[i],
@@ -1088,36 +1225,46 @@ pub(crate) fn build_windows_cmd_line(argv: &[std::ffi::OsString]) -> String {
     line
 }
 
+/// System essentials of the parent environment preserved for Windows runtime and DLL
+/// initialization. Snapshotted once per process (the judge never mutates these variables
+/// at runtime), so each spawn no longer walks and upper-cases the full parent environment.
+fn base_environment() -> &'static std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    static BASE_ENV: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    BASE_ENV.get_or_init(|| {
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in std::env::vars() {
+            let upper = k.to_uppercase();
+            if upper == "SYSTEMROOT"
+                || upper == "WINDIR"
+                || upper == "PATH"
+                || upper == "PATHEXT"
+                || upper == "SYSTEMDRIVE"
+                || upper == "COMSPEC"
+                || upper == "ALLUSERSPROFILE"
+                || upper == "PROGRAMDATA"
+                || upper == "PROGRAMFILES"
+                || upper == "PROGRAMFILES(X86)"
+                || upper == "COMMONPROGRAMFILES"
+                || upper == "APPDATA"
+                || upper == "LOCALAPPDATA"
+                || upper == "USERPROFILE"
+                || upper == "HOMEDRIVE"
+                || upper == "HOMEPATH"
+            {
+                map.insert(k, v);
+            }
+        }
+        map
+    })
+}
+
 fn build_environment_block(
     env: &[(std::ffi::OsString, std::ffi::OsString)],
     work_dir: &Path,
 ) -> Vec<u16> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<String, String> = BTreeMap::new();
-
     // Preserve system essentials for Windows runtime and DLL initialization
-    for (k, v) in std::env::vars() {
-        let upper = k.to_uppercase();
-        if upper == "SYSTEMROOT"
-            || upper == "WINDIR"
-            || upper == "PATH"
-            || upper == "PATHEXT"
-            || upper == "SYSTEMDRIVE"
-            || upper == "COMSPEC"
-            || upper == "ALLUSERSPROFILE"
-            || upper == "PROGRAMDATA"
-            || upper == "PROGRAMFILES"
-            || upper == "PROGRAMFILES(X86)"
-            || upper == "COMMONPROGRAMFILES"
-            || upper == "APPDATA"
-            || upper == "LOCALAPPDATA"
-            || upper == "USERPROFILE"
-            || upper == "HOMEDRIVE"
-            || upper == "HOMEPATH"
-        {
-            map.insert(k, v);
-        }
-    }
+    let mut map = base_environment().clone();
 
     map.insert("TEMP".to_string(), work_dir.to_string_lossy().to_string());
     map.insert("TMP".to_string(), work_dir.to_string_lossy().to_string());
