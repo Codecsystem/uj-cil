@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio as StdProcessStdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use uj_core::run::{CapturedOutput, ExitStatus, KillReason, RunResult, RunSpec, Stdio, Tier};
 
@@ -22,6 +22,90 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 
 pub struct NoneSandbox;
+
+/// Upper bound of one monitor wait slice (limits are re-checked at least this often).
+const NONE_MONITOR_SLICE_MS: u64 = 5;
+
+/// Blocks until the child exits or a timeout slice elapses, without busy polling.
+///
+/// - Windows: `WaitForSingleObject` on the child process handle.
+/// - Linux: `poll()` on a `pidfd_open(2)` descriptor (Linux ≥ 5.3); if pidfds are not
+///   supported, or the pidfd reports readiness while the child cannot be reaped yet,
+///   it degrades to plain sleep-polling (the previous behaviour).
+struct ChildWaiter {
+    #[cfg(target_os = "linux")]
+    pidfd: Option<OwnedFd>,
+    /// The previous wait returned early because of an event.
+    #[cfg(target_os = "linux")]
+    last_ready: bool,
+}
+
+impl ChildWaiter {
+    #[allow(unused_variables)]
+    fn new(child: &Child) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+            let pidfd = if fd >= 0 {
+                // SAFETY: pidfd_open returned a fresh descriptor we exclusively own.
+                Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+            } else {
+                None
+            };
+            Self {
+                pidfd,
+                last_ready: false,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self {}
+        }
+    }
+
+    #[allow(unused_variables)]
+    fn wait(&mut self, child: &Child, slice_ms: u64) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::System::Threading::WaitForSingleObject;
+            unsafe {
+                let _ = WaitForSingleObject(HANDLE(child.as_raw_handle()), slice_ms as u32);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if self.last_ready {
+                // The pidfd signalled readiness but the child was not reapable on the
+                // following check (e.g. old kernels signalling on leader exit while other
+                // threads still run): never spin on a permanently-readable fd.
+                self.pidfd = None;
+                self.last_ready = false;
+            }
+            if let Some(fd) = &self.pidfd {
+                let mut pfd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let r = unsafe { libc::poll(&mut pfd, 1, slice_ms as libc::c_int) };
+                if r > 0 {
+                    self.last_ready = true;
+                }
+                if r >= 0 {
+                    return;
+                }
+                // poll error (EINTR, ...): fall back to sleeping for this slice.
+            }
+            thread::sleep(std::time::Duration::from_millis(slice_ms));
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            thread::sleep(std::time::Duration::from_millis(slice_ms));
+        }
+    }
+}
 
 impl NoneSandbox {
     pub fn new() -> Self {
@@ -223,9 +307,19 @@ impl NoneSandbox {
             buf
         });
 
-        // Monitoring loop
+        // Monitoring loop: block on the child (pidfd on Linux, process handle on Windows)
+        // for at most one slice, so exit is detected immediately while limits are still
+        // re-checked every slice. Falls back to sleep-polling if no waitable is available.
         let mut killed_by: Option<KillReason> = None;
-        let poll_interval = Duration::from_millis(5);
+        let mut waiter = ChildWaiter::new(&child);
+        let slice_for = |start: Instant| -> u64 {
+            let elapsed = start.elapsed().as_millis() as u64;
+            spec.limits
+                .wall_time_ms
+                .saturating_sub(elapsed)
+                .saturating_add(1)
+                .clamp(1, NONE_MONITOR_SLICE_MS)
+        };
 
         #[cfg(unix)]
         let (status, cpu_time_us, memory_peak_bytes) = {
@@ -260,7 +354,7 @@ impl NoneSandbox {
                     break res;
                 }
 
-                thread::sleep(poll_interval);
+                waiter.wait(&child, slice_for(start_time));
             };
 
             let exit_status = if libc::WIFSIGNALED(raw_status) {
@@ -315,7 +409,7 @@ impl NoneSandbox {
                     break status;
                 }
 
-                thread::sleep(poll_interval);
+                waiter.wait(&child, slice_for(start_time));
             };
 
             let wall_us_now = start_time.elapsed().as_micros() as u64;
