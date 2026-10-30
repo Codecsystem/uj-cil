@@ -125,33 +125,73 @@ fn main() -> ExitCode {
                 };
 
             if !in_delegated_scope {
-                let bus_available = std::process::Command::new("systemd-run")
-                    .args(["--user", "--scope", "--quiet", "true"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
+                let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.is_dir());
+                let has_user_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+                    || xdg_runtime_dir
+                        .as_ref()
+                        .is_some_and(|dir| dir.join("bus").exists());
 
-                if bus_available && let Ok(exe) = std::env::current_exe() {
-                    let mut cmd = std::process::Command::new("systemd-run");
-                    cmd.arg("--user")
-                        .arg("--scope")
-                        .arg("--quiet")
-                        .arg("-p")
-                        .arg("Delegate=yes")
-                        .arg("-E")
-                        .arg("UJ_IN_SYSTEMD_SCOPE=1")
-                        .arg("--")
-                        .arg(&exe)
-                        .args(std::env::args_os().skip(1));
-                    if let Ok(mut child) = cmd.spawn() {
-                        let status = child.wait().unwrap_or_default();
-                        let exit_code = status
-                            .code()
-                            .or_else(|| status.signal().map(|sig| 128 + sig))
-                            .unwrap_or(1);
-                        std::process::exit(exit_code);
+                if has_user_bus {
+                    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let marker_path = xdg_runtime_dir
+                        .as_ref()
+                        .map(|dir| dir.join("uj-systemd-scope-ok"));
+
+                    let cached_ok = match (&marker_path, &boot_id) {
+                        (Some(mp), Some(bid)) => std::fs::read_to_string(mp)
+                            .ok()
+                            .is_some_and(|s| s.trim() == bid),
+                        _ => false,
+                    };
+
+                    let bus_available = if cached_ok {
+                        true
+                    } else {
+                        let ok = std::process::Command::new("systemd-run")
+                            .args(["--user", "--scope", "--quiet", "true"])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        if ok && let (Some(mp), Some(bid)) = (&marker_path, &boot_id) {
+                            let _ = std::fs::write(mp, format!("{bid}\n"));
+                        }
+                        ok
+                    };
+
+                    if bus_available && let Ok(exe) = std::env::current_exe() {
+                        let mut cmd = std::process::Command::new("systemd-run");
+                        cmd.arg("--user")
+                            .arg("--scope")
+                            .arg("--quiet")
+                            .arg("-p")
+                            .arg("Delegate=yes")
+                            .arg("-E")
+                            .arg("UJ_IN_SYSTEMD_SCOPE=1")
+                            .arg("--")
+                            .arg(&exe)
+                            .args(std::env::args_os().skip(1));
+                        match cmd.spawn() {
+                            Ok(mut child) => {
+                                let status = child.wait().unwrap_or_default();
+                                let exit_code = status
+                                    .code()
+                                    .or_else(|| status.signal().map(|sig| 128 + sig))
+                                    .unwrap_or(1);
+                                std::process::exit(exit_code);
+                            }
+                            Err(_) => {
+                                if let Some(ref mp) = marker_path {
+                                    let _ = std::fs::remove_file(mp);
+                                }
+                            }
+                        }
                     }
                 }
             }

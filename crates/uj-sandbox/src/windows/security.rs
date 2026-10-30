@@ -317,13 +317,19 @@ impl AppContainerProfile {
     /// Create an isolated profile unique to this sandbox instance / worker slot.
     pub fn create_isolated() -> Result<Self, std::io::Error> {
         let count = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!("uj.sandbox.{}.{}", std::process::id(), count);
+        let name = format!("uj.sandbox.{}.iso.{}", std::process::id(), count);
         Self::create_internal(&name, true)
     }
 
     /// Create an isolated profile unique to this specific worker slot.
     pub fn create_isolated_for_slot(slot_id: usize) -> Result<Self, std::io::Error> {
-        let name = format!("uj.sandbox.{}.{}", std::process::id(), slot_id);
+        let count = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "uj.sandbox.{}.slot.{}.{}",
+            std::process::id(),
+            slot_id,
+            count
+        );
         Self::create_internal(&name, true)
     }
 

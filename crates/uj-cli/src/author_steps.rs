@@ -329,7 +329,13 @@ pub fn exec_ans(
             ans_path.display()
         )));
     }
-    crate::author_cache::write_ans_marker(problem_dir, main_hash, &in_hash, ans_path, &stdout_bytes);
+    crate::author_cache::write_ans_marker(
+        problem_dir,
+        main_hash,
+        &in_hash,
+        ans_path,
+        &stdout_bytes,
+    );
     Ok(AnsOutcome {
         elapsed_ms: start.elapsed().as_millis() as u64,
         cached: false,

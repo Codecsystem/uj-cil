@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,6 +59,13 @@ pub(crate) fn resolve_base_dir(test: &TestCase) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// Tracks reused slot box directories that were already wiped clean on the previous `BoxLease`
+/// drop, avoiding a redundant `read_dir` on the next `acquire` while still guaranteeing every
+/// test starts in and leaves behind an empty box.
+static CLEAN_SLOT_BOXES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
 /// RAII lease over a sandbox box directory.
 /// Automatically cleans up the box directory (or its contents if reused) on drop.
 pub(crate) struct BoxLease {
@@ -74,7 +81,10 @@ impl BoxLease {
         custom_box: Option<&Path>,
     ) -> Result<Self, String> {
         if let Some(cb) = custom_box {
-            let _ = uj_sandbox::clean_box_dir_contents(cb);
+            let already_clean = CLEAN_SLOT_BOXES.lock().remove(cb);
+            if !already_clean {
+                let _ = uj_sandbox::clean_box_dir_contents(cb);
+            }
             Ok(Self {
                 box_dir: cb.to_path_buf(),
                 run_dir: None,
@@ -106,13 +116,47 @@ impl BoxLease {
 impl Drop for BoxLease {
     fn drop(&mut self) {
         if self.is_reused {
-            let _ = uj_sandbox::clean_box_dir_contents(&self.box_dir);
+            if uj_sandbox::clean_box_dir_contents(&self.box_dir).is_ok() {
+                CLEAN_SLOT_BOXES.lock().insert(self.box_dir.clone());
+            }
         } else if let Some(ref rd) = self.run_dir {
             let _ = fs::remove_dir_all(rd);
         } else {
             let _ = fs::remove_dir_all(&self.box_dir);
         }
     }
+}
+
+type ScriptPayloadKey = (PathBuf, SystemTime, u64);
+type ScriptPayloadMap = HashMap<ScriptPayloadKey, Arc<[u8]>>;
+
+/// Process-wide in-memory cache of interpreted script / `.class` payloads keyed by
+/// `(path, mtime, size)` so `build_argv` does not re-read unchanged script files from disk on
+/// every test case while still restoring a fresh copy into the wiped `box_dir`.
+static SCRIPT_PAYLOAD_CACHE: std::sync::LazyLock<parking_lot::Mutex<ScriptPayloadMap>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn copy_cached_file_to_box(src: &Path, meta: &fs::Metadata, dst: &Path) {
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let size = meta.len();
+    if size <= 4 * 1024 * 1024 {
+        let key = (src.to_path_buf(), mtime, size);
+        if let Some(bytes) = SCRIPT_PAYLOAD_CACHE.lock().get(&key).cloned() {
+            let _ = fs::write(dst, &bytes);
+            return;
+        }
+        if let Ok(vec) = fs::read(src) {
+            let arc: Arc<[u8]> = Arc::from(vec);
+            let _ = fs::write(dst, &arc);
+            let mut guard = SCRIPT_PAYLOAD_CACHE.lock();
+            if guard.len() >= 512 {
+                guard.clear();
+            }
+            guard.insert(key, arc);
+            return;
+        }
+    }
+    let _ = fs::copy(src, dst);
 }
 
 /// Build the execution `argv` for a contestant binary or interpreted script inside `box_dir`.
@@ -126,18 +170,43 @@ pub(crate) fn build_argv(
     if let Some(cmd) = interpreter_cmd {
         let mut modified_cmd = Vec::with_capacity(cmd.len());
         for (i, part) in cmd.iter().enumerate() {
-            if i == 0 {
+            if i == 0 || part.starts_with('-') {
                 modified_cmd.push(std::ffi::OsString::from(part));
-            } else if Path::new(part).exists() {
-                let script_name = Path::new(part)
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
-                let box_script = box_dir.join(script_name);
-                let _ = fs::copy(part, &box_script);
-                modified_cmd.push(box_script.into_os_string());
-            } else {
-                modified_cmd.push(std::ffi::OsString::from(part));
+                continue;
             }
+            let part_path = Path::new(part);
+            // Only probe paths that look like file/directory paths (contain a separator or '.'),
+            // avoiding per-test `stat` calls on bare identifiers like Java's `Main` class name.
+            let looks_like_path = part.contains(['/', '\\', '.']) || part_path.is_absolute();
+            if looks_like_path && let Ok(meta) = fs::metadata(part_path) {
+                if meta.is_file() {
+                    let script_name = part_path
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("prog.py"));
+                    let box_script = box_dir.join(script_name);
+                    copy_cached_file_to_box(part_path, &meta, &box_script);
+                    modified_cmd.push(box_script.into_os_string());
+                    continue;
+                } else if meta.is_dir() {
+                    // Directory classpath (e.g. Java `-cp {dir}`): stage regular `.class` files
+                    // into `box_dir` and point `-cp` at `box_dir` so sandboxed processes inside
+                    // Linux `pivot_root` (`/box`) or Windows AppContainer can load all classes.
+                    if let Ok(entries) = fs::read_dir(part_path) {
+                        for entry in entries.flatten() {
+                            let ep = entry.path();
+                            if let Ok(emeta) = entry.metadata()
+                                && emeta.is_file()
+                                && let Some(fname) = ep.file_name()
+                            {
+                                copy_cached_file_to_box(&ep, &emeta, &box_dir.join(fname));
+                            }
+                        }
+                    }
+                    modified_cmd.push(box_dir.as_os_str().to_os_string());
+                    continue;
+                }
+            }
+            modified_cmd.push(std::ffi::OsString::from(part));
         }
         modified_cmd
     } else if let Some(p) = prepared_exe {
@@ -200,6 +269,49 @@ pub(crate) fn create_trusted_tempdir(prefix: &str) -> Result<tempfile::TempDir, 
         .prefix(prefix)
         .tempdir()
         .map_err(|e| format!("Failed to create trusted temporary directory: {e}"))
+}
+
+thread_local! {
+    static WORKER_TRUSTED_TEMPDIR: std::cell::RefCell<Option<tempfile::TempDir>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Per-worker reusable trusted directory lease in the OS temp tree (strictly outside any
+/// AppContainer-granted `.uj/tmp/runs/` tree). Wiped clean between tests on drop and deleted
+/// automatically when the worker thread exits, eliminating per-test `mkdir`/`remove_dir_all`
+/// churn on NTFS.
+pub(crate) struct TrustedDirLease {
+    dir: Option<tempfile::TempDir>,
+}
+
+impl TrustedDirLease {
+    pub fn acquire(prefix: &str) -> Result<Self, String> {
+        let existing = WORKER_TRUSTED_TEMPDIR.with(|slot| slot.borrow_mut().take());
+        let td = match existing {
+            Some(td) if td.path().is_dir() => td,
+            _ => create_trusted_tempdir(prefix)?,
+        };
+        Ok(Self { dir: Some(td) })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.as_ref().expect("TrustedDirLease active").path()
+    }
+}
+
+impl Drop for TrustedDirLease {
+    fn drop(&mut self) {
+        if let Some(td) = self.dir.take()
+            && uj_sandbox::clean_box_dir_contents(td.path()).is_ok()
+        {
+            WORKER_TRUSTED_TEMPDIR.with(|slot| {
+                let mut borrow = slot.borrow_mut();
+                if borrow.is_none() {
+                    *borrow = Some(td);
+                }
+            });
+        }
+    }
 }
 
 /// Classify resource and security limit violations on a sandbox `RunResult`, excluding ordinary
@@ -382,7 +494,7 @@ pub fn judge_single_test(
         }
     }
 
-    let res = match run_res {
+    let mut res = match run_res {
         Ok(r) => r,
         Err(e) => {
             return fail_test(
@@ -413,6 +525,7 @@ pub fn judge_single_test(
     } else {
         // Program exited cleanly (Exit code 0) within limits, run checker
         // 1. Resolve contestant output bytes (enforcing file_io vs stdout and bounds)
+        let killed_by_ole = res.killed_by == Some(KillReason::OutputLimit);
         let output_bytes_res = if is_file_io {
             let out_path = box_dir.join(out_name);
             if !out_path.exists() {
@@ -444,8 +557,8 @@ pub fn judge_single_test(
                     )),
                 }
             }
-        } else if let Some(ref out) = res.stdout {
-            if out.truncated || res.killed_by == Some(KillReason::OutputLimit) {
+        } else if let Some(out) = res.stdout.take() {
+            if out.truncated || killed_by_ole {
                 Err((
                     Verdict::OutputLimitExceeded,
                     0.0,
@@ -454,7 +567,7 @@ pub fn judge_single_test(
                     None,
                 ))
             } else {
-                Ok(out.bytes.clone())
+                Ok(out.bytes)
             }
         } else {
             Ok(Vec::new())
@@ -475,14 +588,12 @@ pub fn judge_single_test(
                         spec.limits.output_bytes.saturating_mul(2),
                         Limits::DEFAULT_OUTPUT_BYTES,
                     );
-                    match read_answer_cached(ans_path, ans_limit) {
-                        Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg), None, None),
-                        Ok(ans_artifact) => {
-                            let ans_slice = &ans_artifact[..];
-
-                            match checker {
-                                ResolvedChecker::Builtin(b) => {
-                                    let check_res = b.check(&stdout_bytes, ans_slice);
+                    match checker {
+                        ResolvedChecker::Builtin(b) => {
+                            match read_answer_cached(ans_path, ans_limit) {
+                                Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg), None, None),
+                                Ok(ans_artifact) => {
+                                    let check_res = b.check(&stdout_bytes, &ans_artifact[..]);
                                     let diff = check_res.diff.map(to_report_diff);
                                     (
                                         check_res.verdict,
@@ -492,7 +603,12 @@ pub fn judge_single_test(
                                         diff,
                                     )
                                 }
-                                ResolvedChecker::Testlib(chk_exe) => {
+                            }
+                        }
+                        ResolvedChecker::Testlib(chk_exe) => {
+                            match validate_answer_metadata(ans_path, ans_limit) {
+                                Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg), None, None),
+                                Ok(_) => {
                                     let out_file = box_dir.join("uj_out.txt");
                                     let _ = fs::write(&out_file, &stdout_bytes);
 
@@ -514,33 +630,36 @@ pub fn judge_single_test(
                                         None,
                                     )
                                 }
-                                ResolvedChecker::Lemon {
-                                    path: chk_exe,
-                                    full_score,
-                                } => {
-                                    let out_file = box_dir.join("uj_out.txt");
-                                    let _ = fs::write(&out_file, &stdout_bytes);
-
-                                    let check_res = uj_checker::lemon::run_lemon_checker(
-                                        sandbox,
-                                        chk_exe,
-                                        &test.input_path,
-                                        &out_file,
-                                        ans_path,
-                                        *full_score,
-                                        cancel,
-                                    );
-                                    let _ = fs::remove_file(&out_file);
-                                    (
-                                        check_res.verdict,
-                                        check_res.score_ratio,
-                                        None,
-                                        check_res.message,
-                                        None,
-                                    )
-                                }
                             }
                         }
+                        ResolvedChecker::Lemon {
+                            path: chk_exe,
+                            full_score,
+                        } => match validate_answer_metadata(ans_path, ans_limit) {
+                            Err(msg) => (Verdict::JudgeFailed, 0.0, Some(msg), None, None),
+                            Ok(_) => {
+                                let out_file = box_dir.join("uj_out.txt");
+                                let _ = fs::write(&out_file, &stdout_bytes);
+
+                                let check_res = uj_checker::lemon::run_lemon_checker(
+                                    sandbox,
+                                    chk_exe,
+                                    &test.input_path,
+                                    &out_file,
+                                    ans_path,
+                                    *full_score,
+                                    cancel,
+                                );
+                                let _ = fs::remove_file(&out_file);
+                                (
+                                    check_res.verdict,
+                                    check_res.score_ratio,
+                                    None,
+                                    check_res.message,
+                                    None,
+                                )
+                            }
+                        },
                     }
                 }
             },
@@ -579,15 +698,22 @@ pub fn judge_single_test(
 }
 
 // ----------------------------------------------------------------------------
-// Bounded answer file cache
+// Byte-bounded LRU answer file cache
 // ----------------------------------------------------------------------------
 
-const MAX_ANSWER_CACHE_ENTRIES: usize = 256;
 const MAX_ANSWER_CACHE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
+struct AnswerCacheEntry {
+    mtime: SystemTime,
+    len: u64,
+    tick: u64,
+    bytes: Arc<uj_checker::FileBytes>,
+}
+
 struct AnswerCacheState {
-    entries: HashMap<PathBuf, (SystemTime, u64, Arc<uj_checker::FileBytes>)>,
-    order: VecDeque<PathBuf>,
+    entries: HashMap<PathBuf, AnswerCacheEntry>,
+    lru: BTreeMap<u64, PathBuf>,
+    next_tick: u64,
     total_bytes: u64,
 }
 
@@ -595,9 +721,16 @@ impl AnswerCacheState {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            order: VecDeque::new(),
+            lru: BTreeMap::new(),
+            next_tick: 1,
             total_bytes: 0,
         }
+    }
+
+    fn alloc_tick(&mut self) -> u64 {
+        let t = self.next_tick;
+        self.next_tick = self.next_tick.wrapping_add(1);
+        t
     }
 
     fn get(
@@ -606,17 +739,28 @@ impl AnswerCacheState {
         mtime: SystemTime,
         len: u64,
     ) -> Option<Arc<uj_checker::FileBytes>> {
-        if let Some((c_mtime, c_len, c_bytes)) = self.entries.get(path) {
-            if *c_mtime == mtime && *c_len == len {
-                return Some(c_bytes.clone());
+        let matched = self
+            .entries
+            .get(path)
+            .map(|e| (e.mtime == mtime && e.len == len, e.tick));
+        match matched {
+            Some((true, old_tick)) => {
+                let new_tick = self.alloc_tick();
+                self.lru.remove(&old_tick);
+                self.lru.insert(new_tick, path.to_path_buf());
+                let entry = self.entries.get_mut(path).expect("checked entry exists");
+                entry.tick = new_tick;
+                Some(entry.bytes.clone())
             }
-            // Stale entry: remove it immediately
-            let old_len = *c_len;
-            self.entries.remove(path);
-            self.order.retain(|p| p != path);
-            self.total_bytes = self.total_bytes.saturating_sub(old_len);
+            Some((false, old_tick)) => {
+                if let Some(removed) = self.entries.remove(path) {
+                    self.lru.remove(&old_tick);
+                    self.total_bytes = self.total_bytes.saturating_sub(removed.len);
+                }
+                None
+            }
+            None => None,
         }
-        None
     }
 
     fn insert(
@@ -629,26 +773,35 @@ impl AnswerCacheState {
         if len > MAX_ANSWER_CACHE_BYTES {
             return;
         }
-        if let Some((_, old_len, _)) = self.entries.remove(&path) {
-            self.order.retain(|p| p != &path);
-            self.total_bytes = self.total_bytes.saturating_sub(old_len);
+        if let Some(old) = self.entries.remove(&path) {
+            self.lru.remove(&old.tick);
+            self.total_bytes = self.total_bytes.saturating_sub(old.len);
         }
-        while (self.entries.len() >= MAX_ANSWER_CACHE_ENTRIES
-            || self.total_bytes.saturating_add(len) > MAX_ANSWER_CACHE_BYTES)
-            && let Some(oldest) = self.order.pop_front()
+        while self.total_bytes.saturating_add(len) > MAX_ANSWER_CACHE_BYTES
+            && let Some((_, oldest_path)) = self.lru.pop_first()
         {
-            if let Some((_, evicted_len, _)) = self.entries.remove(&oldest) {
-                self.total_bytes = self.total_bytes.saturating_sub(evicted_len);
+            if let Some(evicted) = self.entries.remove(&oldest_path) {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.len);
             }
         }
+        let tick = self.alloc_tick();
         self.total_bytes = self.total_bytes.saturating_add(len);
-        self.order.push_back(path.clone());
-        self.entries.insert(path, (mtime, len, bytes));
+        self.lru.insert(tick, path.clone());
+        self.entries.insert(
+            path,
+            AnswerCacheEntry {
+                mtime,
+                len,
+                tick,
+                bytes,
+            },
+        );
     }
 
     fn clear(&mut self) {
         self.entries.clear();
-        self.order.clear();
+        self.lru.clear();
+        self.next_tick = 1;
         self.total_bytes = 0;
     }
 }
@@ -661,12 +814,7 @@ pub fn clear_answer_cache() {
     ANSWER_FILE_CACHE.lock().clear();
 }
 
-/// Read and cache an answer file using zero-copy mmap (or buffered fallback) without holding the
-/// global cache lock across disk I/O.
-pub fn read_answer_cached(
-    ans_path: &Path,
-    ans_limit: u64,
-) -> Result<Arc<uj_checker::FileBytes>, String> {
+fn validate_answer_metadata(ans_path: &Path, ans_limit: u64) -> Result<(SystemTime, u64), String> {
     let meta = match fs::metadata(ans_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -689,6 +837,16 @@ pub fn read_answer_cached(
         ));
     }
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    Ok((mtime, len))
+}
+
+/// Read and cache an answer file using zero-copy mmap (or buffered fallback) without holding the
+/// global cache lock across disk I/O.
+pub fn read_answer_cached(
+    ans_path: &Path,
+    ans_limit: u64,
+) -> Result<Arc<uj_checker::FileBytes>, String> {
+    let (mtime, len) = validate_answer_metadata(ans_path, ans_limit)?;
     {
         let mut cache = ANSWER_FILE_CACHE.lock();
         if let Some(cached) = cache.get(ans_path, mtime, len) {
@@ -1021,10 +1179,10 @@ pub fn judge_interactive_test(
 
     let argv_sol = build_argv(exe_path, interpreter_cmd, prepared_exe, base_dir, box_dir);
 
-    // CRITICAL (P0-03): Create a dedicated trusted directory in the OS temp tree OUTSIDE
-    // the slot directory (`box_dir.parent()`), because Windows AppContainer grants
+    // CRITICAL (P0-03): Acquire a reusable per-worker trusted directory in the OS temp tree
+    // OUTSIDE the slot directory (`box_dir.parent()`), because Windows AppContainer grants
     // `FILE_ALL_ACCESS` with inheritance to the entire `.uj/tmp/runs/slot-N/` directory!
-    let trusted_tempdir = match create_trusted_tempdir("uj_trusted_int_") {
+    let trusted_tempdir = match TrustedDirLease::acquire("uj_trusted_int_") {
         Ok(td) => td,
         Err(msg) => {
             return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(sandbox.tier()));
@@ -1549,7 +1707,7 @@ pub fn judge_communication_test(
     };
     let box_dir = box_lease.path();
 
-    let trusted_tempdir = match create_trusted_tempdir("uj_trusted_comm_") {
+    let trusted_tempdir = match TrustedDirLease::acquire("uj_trusted_comm_") {
         Ok(td) => td,
         Err(msg) => {
             return fail_test(test, Verdict::JudgeFailed, 0, msg, Some(sandbox.tier()));
@@ -2080,5 +2238,79 @@ memory = "256MiB"
 
         clear_answer_cache();
         assert_eq!(ANSWER_FILE_CACHE.lock().entries.len(), 0);
+    }
+
+    #[test]
+    fn test_trusted_dir_lease_reuses_and_wipes_between_acquires() {
+        let p1 = {
+            let lease = TrustedDirLease::acquire("uj_trusted_test_").unwrap();
+            let p = lease.path().to_path_buf();
+            fs::write(p.join("leftover.txt"), b"secret").unwrap();
+            assert!(p.join("leftover.txt").exists());
+            p
+        };
+        let lease2 = TrustedDirLease::acquire("uj_trusted_test_").unwrap();
+        assert_eq!(lease2.path(), p1.as_path());
+        assert!(!lease2.path().join("leftover.txt").exists());
+    }
+
+    #[test]
+    fn test_build_argv_java_classpath_dir_stages_classes_into_box() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let box_dir = tempfile::tempdir().unwrap();
+        fs::write(cache_dir.path().join("Main.class"), b"\xCA\xFE\xBA\xBEmain").unwrap();
+        fs::write(
+            cache_dir.path().join("Main$Helper.class"),
+            b"\xCA\xFE\xBA\xBEhelper",
+        )
+        .unwrap();
+
+        let cmd = vec![
+            "java".to_string(),
+            "-Xmx256m".to_string(),
+            "-cp".to_string(),
+            cache_dir.path().to_string_lossy().to_string(),
+            "Main".to_string(),
+        ];
+        let argv = build_argv(
+            &cache_dir.path().join("Main.class"),
+            Some(&cmd),
+            None,
+            cache_dir.path(),
+            box_dir.path(),
+        );
+        assert_eq!(argv[0], std::ffi::OsStr::new("java"));
+        assert_eq!(argv[1], std::ffi::OsStr::new("-Xmx256m"));
+        assert_eq!(argv[2], std::ffi::OsStr::new("-cp"));
+        assert_eq!(argv[3], box_dir.path().as_os_str());
+        assert_eq!(argv[4], std::ffi::OsStr::new("Main"));
+        assert_eq!(
+            fs::read(box_dir.path().join("Main.class")).unwrap(),
+            b"\xCA\xFE\xBA\xBEmain"
+        );
+        assert_eq!(
+            fs::read(box_dir.path().join("Main$Helper.class")).unwrap(),
+            b"\xCA\xFE\xBA\xBEhelper"
+        );
+    }
+
+    #[test]
+    fn test_answer_cache_lru_refreshes_on_hit() {
+        let mut state = AnswerCacheState::new();
+        let t0 = SystemTime::UNIX_EPOCH;
+        let half = MAX_ANSWER_CACHE_BYTES / 2 + 16;
+        let empty = Arc::new(uj_checker::FileBytes::Owned(Vec::new()));
+
+        state.insert(PathBuf::from("a.ans"), t0, half, empty.clone());
+        state.insert(PathBuf::from("b.ans"), t0, 16, empty.clone());
+        // Touch "a.ans" so "b.ans" becomes least-recently-used.
+        assert!(state.get(Path::new("a.ans"), t0, half).is_some());
+        // Inserting another `half` entry forces eviction; "b.ans" should be evicted first, and if
+        // still over cap, then "a.ans". Use size `MAX_ANSWER_CACHE_BYTES - half` so "a.ans" fits!
+        let fit_with_a = MAX_ANSWER_CACHE_BYTES - half;
+        state.insert(PathBuf::from("c.ans"), t0, fit_with_a, empty);
+        assert!(state.entries.contains_key(Path::new("a.ans")));
+        assert!(!state.entries.contains_key(Path::new("b.ans")));
+        assert!(state.entries.contains_key(Path::new("c.ans")));
     }
 }

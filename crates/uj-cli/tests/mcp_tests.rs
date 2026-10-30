@@ -130,8 +130,43 @@ fn test_mcp_initialize_and_tools_list() {
 
     assert_eq!(judge_resp["id"], 4);
     assert_eq!(judge_resp["result"]["isError"], false);
+    assert_eq!(judge_resp["result"]["structuredContent"]["verdict"], "AC");
     let judge_text = judge_resp["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(judge_text.contains("\"verdict\": \"AC\""));
+    let judge_json: serde_json::Value =
+        serde_json::from_str(judge_text).expect("Invalid judge JSON");
+    assert_eq!(judge_json["verdict"], "AC");
+
+    // 5. tools/call: multi-source judge on aplusb
+    let multi_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "judge",
+            "arguments": {
+                "problem": "tests/problems/aplusb",
+                "sources": [
+                    "tests/problems/aplusb/solutions/ac.cpp",
+                    "tests/problems/aplusb/solutions/wa.cpp"
+                ]
+            }
+        }
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&multi_req).unwrap()).unwrap();
+    stdin.flush().unwrap();
+
+    resp_line.clear();
+    reader.read_line(&mut resp_line).unwrap();
+    let multi_resp: serde_json::Value = serde_json::from_str(&resp_line).expect("Invalid JSON");
+    assert_eq!(multi_resp["id"], 5);
+    assert_eq!(multi_resp["result"]["isError"], false);
+    let multi_text = multi_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let multi_json: serde_json::Value =
+        serde_json::from_str(multi_text).expect("Invalid multi-judge JSON");
+    let arr = multi_json.as_array().expect("Expected array of reports");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["verdict"], "AC");
+    assert_eq!(arr[1]["verdict"], "WA");
 
     drop(stdin);
     let _ = child.wait();

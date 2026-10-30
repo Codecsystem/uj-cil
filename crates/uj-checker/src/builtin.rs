@@ -245,6 +245,12 @@ pub fn check_exact(output: &[u8], answer: &[u8]) -> CheckResult {
 
 /// Token-by-token comparison (wcmp). Default in competitive programming.
 pub fn check_wcmp(output: &[u8], answer: &[u8]) -> CheckResult {
+    let output = strip_utf8_bom(output);
+    let answer = strip_utf8_bom(answer);
+    if output == answer {
+        return CheckResult::accepted();
+    }
+
     let mut out_iter = TokenIterator::new(output);
     let mut ans_iter = TokenIterator::new(answer);
 
@@ -299,6 +305,44 @@ pub fn check_wcmp(output: &[u8], answer: &[u8]) -> CheckResult {
     }
 }
 
+/// SIMD-accelerated `\n` line splitter yielding identical slices to `slice.split(|&b| b == b'\n')`.
+struct SimdLines<'a> {
+    rem: &'a [u8],
+    finished: bool,
+}
+
+impl<'a> SimdLines<'a> {
+    #[inline]
+    fn new(slice: &'a [u8]) -> Self {
+        Self {
+            rem: slice,
+            finished: false,
+        }
+    }
+}
+
+impl<'a> Iterator for SimdLines<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        match memchr::memchr(b'\n', self.rem) {
+            Some(idx) => {
+                let line = &self.rem[..idx];
+                self.rem = &self.rem[idx + 1..];
+                Some(line)
+            }
+            None => {
+                self.finished = true;
+                Some(self.rem)
+            }
+        }
+    }
+}
+
 /// Line-by-line comparison ignoring trailing horizontal whitespace (`' '`, `'\t'`, `'\r'`) and
 /// trailing blank lines at EOF (`fcmp`).
 ///
@@ -308,8 +352,11 @@ pub fn check_wcmp(output: &[u8], answer: &[u8]) -> CheckResult {
 pub fn check_fcmp(output: &[u8], answer: &[u8]) -> CheckResult {
     let output = strip_utf8_bom(output);
     let answer = strip_utf8_bom(answer);
-    let mut out_iter = output.split(|&b| b == b'\n').map(strip_line_trailing);
-    let mut ans_iter = answer.split(|&b| b == b'\n').map(strip_line_trailing);
+    if output == answer {
+        return CheckResult::accepted();
+    }
+    let mut out_iter = SimdLines::new(output).map(strip_line_trailing);
+    let mut ans_iter = SimdLines::new(answer).map(strip_line_trailing);
     let mut line_num = 1;
 
     loop {
@@ -353,8 +400,11 @@ pub fn check_fcmp(output: &[u8], answer: &[u8]) -> CheckResult {
 pub fn check_lcmp(output: &[u8], answer: &[u8]) -> CheckResult {
     let output = strip_utf8_bom(output);
     let answer = strip_utf8_bom(answer);
-    let mut out_iter = output.split(|&b| b == b'\n').map(strip_raw_line);
-    let mut ans_iter = answer.split(|&b| b == b'\n').map(strip_raw_line);
+    if output == answer {
+        return CheckResult::accepted();
+    }
+    let mut out_iter = SimdLines::new(output).map(strip_raw_line);
+    let mut ans_iter = SimdLines::new(answer).map(strip_raw_line);
     let mut line_num = 1;
 
     loop {
@@ -1235,5 +1285,58 @@ mod tests {
         let res_ncmp = check_ncmp(&huge_line, b"42");
         assert!(res_ncmp.message.unwrap().len() <= MAX_SNIPPET_CHARS + 80);
         assert!(res_ncmp.diff.unwrap().truncated);
+    }
+
+    #[test]
+    fn test_simd_lines_and_byte_equal_fast_paths_preserve_semantics() {
+        for sample in [
+            &b""[..],
+            &b"\n"[..],
+            &b"\n\n"[..],
+            &b"alpha"[..],
+            &b"alpha\n"[..],
+            &b"alpha\nbeta\r\ngamma"[..],
+            &b"alpha\nbeta\n"[..],
+        ] {
+            let expected: Vec<&[u8]> = sample.split(|&b| b == b'\n').collect();
+            let actual: Vec<&[u8]> = SimdLines::new(sample).collect();
+            assert_eq!(actual, expected, "SimdLines mismatch for {sample:?}");
+        }
+
+        // Byte-identical inputs hit fast path in wcmp / fcmp / lcmp
+        let out_buf = b"token1 token2\nline2  \n".to_vec();
+        let ans_buf = out_buf.clone();
+        assert_eq!(
+            check_wcmp(&out_buf, &ans_buf).verdict,
+            uj_core::verdict::Verdict::Accepted
+        );
+        assert_eq!(
+            check_fcmp(&out_buf, &ans_buf).verdict,
+            uj_core::verdict::Verdict::Accepted
+        );
+        assert_eq!(
+            check_lcmp(&out_buf, &ans_buf).verdict,
+            uj_core::verdict::Verdict::Accepted
+        );
+
+        // Identical malformed buffers MUST still return JudgeFailed in typed checkers!
+        let bad_out = b"not_a_valid_number_or_yesno".to_vec();
+        let bad_ans = bad_out.clone();
+        assert_eq!(
+            check_ncmp(&bad_out, &bad_ans).verdict,
+            uj_core::verdict::Verdict::JudgeFailed
+        );
+        assert_eq!(
+            check_hcmp(&bad_out, &bad_ans).verdict,
+            uj_core::verdict::Verdict::JudgeFailed
+        );
+        assert_eq!(
+            check_rcmp(&bad_out, &bad_ans, 1e-6).verdict,
+            uj_core::verdict::Verdict::JudgeFailed
+        );
+        assert_eq!(
+            check_yesno(&bad_out, &bad_ans).verdict,
+            uj_core::verdict::Verdict::JudgeFailed
+        );
     }
 }

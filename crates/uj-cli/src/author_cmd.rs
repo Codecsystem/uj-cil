@@ -1458,12 +1458,18 @@ pub fn run_ans_with_session(
                 }
             }
             AnsResult::Failed { idx, name, reason } => {
-                if first_failure.as_ref().is_none_or(|(f_idx, _, _)| idx < *f_idx) {
+                if first_failure
+                    .as_ref()
+                    .is_none_or(|(f_idx, _, _)| idx < *f_idx)
+                {
                     first_failure = Some((idx, name, reason));
                 }
             }
             AnsResult::Io { idx, err } => {
-                if first_io_error.as_ref().is_none_or(|(f_idx, _)| idx < *f_idx) {
+                if first_io_error
+                    .as_ref()
+                    .is_none_or(|(f_idx, _)| idx < *f_idx)
+                {
                     first_io_error = Some((idx, err));
                 }
             }
@@ -3053,7 +3059,7 @@ pub fn stress_core_with_session(
             }
         };
         let pe = cfg.checker.pe_as_wa;
-        let chk = match ProblemContext::prepare(0, problem_dir, cfg, &compile_session) {
+        let chk = match ProblemContext::prepare(0, problem_dir, cfg, compile_session) {
             Ok(p_ctx) => p_ctx.resolved_checker.clone(),
             Err(e) => {
                 let msg = e.to_string();
@@ -3419,7 +3425,7 @@ pub fn stress_core_with_session(
                             });
                             break;
                         }
-                        let cr = uj_checker::testlib::run_testlib_checker(
+                        uj_checker::testlib::run_testlib_checker(
                             sandbox.as_ref(),
                             chk_exe,
                             &in_tmp,
@@ -3427,8 +3433,7 @@ pub fn stress_core_with_session(
                             ans_tmp,
                             pe_as_wa,
                             &cancel,
-                        );
-                        cr
+                        )
                     }
                     uj_engine::judge::ResolvedChecker::Lemon {
                         path: chk_exe,
@@ -3445,7 +3450,7 @@ pub fn stress_core_with_session(
                             });
                             break;
                         }
-                        let cr = uj_checker::lemon::run_lemon_checker(
+                        uj_checker::lemon::run_lemon_checker(
                             sandbox.as_ref(),
                             chk_exe,
                             &in_tmp,
@@ -3453,8 +3458,7 @@ pub fn stress_core_with_session(
                             ans_tmp,
                             *full_score,
                             &cancel,
-                        );
-                        cr
+                        )
                     }
                 };
 

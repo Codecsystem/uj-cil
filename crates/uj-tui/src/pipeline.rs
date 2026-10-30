@@ -84,6 +84,7 @@ pub struct PipelineApp {
     pub cancel: CancelToken,
 
     // Counts
+    pub gen_target: usize,
     pub gen_done: usize,
     pub val_done: usize,
     pub ans_done: usize,
@@ -99,11 +100,15 @@ impl PipelineApp {
         workers: usize,
         cancel: CancelToken,
     ) -> Self {
+        let mut gen_target = 0usize;
         let cases = case_names
             .iter()
             .enumerate()
             .map(|(i, name)| {
                 let hg = has_gen.get(i).copied().unwrap_or(true);
+                if hg {
+                    gen_target += 1;
+                }
                 CaseState {
                     name: name.clone(),
                     has_gen: hg,
@@ -128,6 +133,7 @@ impl PipelineApp {
             is_completed: false,
             scroll_row: 0,
             cancel,
+            gen_target: gen_target.max(1),
             gen_done: 0,
             val_done: 0,
             ans_done: 0,
@@ -241,21 +247,28 @@ pub fn run_pipeline_tui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = TerminalGuard::enter()?;
 
-    let backend = CrosstermBackend::new(io::stderr());
+    let backend = CrosstermBackend::new(io::BufWriter::with_capacity(64 * 1024, io::stderr()));
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = PipelineApp::new(problem, case_names, has_gen, workers, cancel);
     let mut exit_time: Option<Instant> = None;
+    let mut dirty = true;
+    let mut last_draw = Instant::now();
 
     loop {
         // Refresh system monitor periodically
-        app.sys_monitor.tick();
+        if app.sys_monitor.tick() {
+            dirty = true;
+        }
 
         // Drain events
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
-                Ok(ev) => app.handle_event(ev),
+                Ok(ev) => {
+                    app.handle_event(ev);
+                    dirty = true;
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -266,74 +279,93 @@ pub fn run_pipeline_tui(
 
         if app.is_completed && app.failed.is_none() && exit_time.is_none() {
             exit_time = Some(Instant::now() + Duration::from_millis(600));
+            dirty = true;
         }
 
         if disconnected && exit_time.is_none() && app.failed.is_none() {
             exit_time = Some(Instant::now() + Duration::from_millis(600));
+            dirty = true;
         }
 
         if exit_time.is_some_and(|t| Instant::now() >= t) {
             break;
         }
 
-        terminal.draw(|f| {
-            draw_pipeline_ui(f, &mut app);
-        })?;
+        if last_draw.elapsed() >= Duration::from_millis(250) {
+            dirty = true;
+        }
 
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind == crossterm::event::KeyEventKind::Release {
-                continue;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                app.cancel.cancel();
-                break;
-            }
-            // When failed, user can inspect error and press any key / Esc / Enter / q to exit
-            if app.failed.is_some() {
-                match key.code {
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if app.scroll_row > 0 {
-                            app.scroll_row -= 1;
-                        }
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        let total_rows = app.cases.len().div_ceil(10);
-                        if app.scroll_row + 1 < total_rows {
-                            app.scroll_row += 1;
-                        }
-                    }
-                    _ => break,
-                }
-                continue;
-            }
+        if dirty {
+            terminal.draw(|f| {
+                draw_pipeline_ui(f, &mut app);
+            })?;
+            last_draw = Instant::now();
+            dirty = false;
+        }
 
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => {
-                    app.cancel.cancel();
-                    break;
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Resize(_, _) => {
+                    dirty = true;
                 }
-                KeyCode::Esc => {
-                    break;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if app.scroll_row > 0 {
-                        app.scroll_row -= 1;
+                Event::Key(key) => {
+                    if key.kind == crossterm::event::KeyEventKind::Release {
+                        continue;
                     }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let total_rows = app.cases.len().div_ceil(10);
-                    if app.scroll_row + 1 < total_rows {
-                        app.scroll_row += 1;
+                    dirty = true;
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        app.cancel.cancel();
+                        break;
                     }
-                }
-                KeyCode::PageUp => {
-                    app.scroll_row = app.scroll_row.saturating_sub(5);
-                }
-                KeyCode::PageDown => {
-                    let total_rows = app.cases.len().div_ceil(10);
-                    app.scroll_row = (app.scroll_row + 5).min(total_rows.saturating_sub(1));
+                    // When failed, user can inspect error and press any key / Esc / Enter / q to exit
+                    if app.failed.is_some() {
+                        match key.code {
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                if app.scroll_row > 0 {
+                                    app.scroll_row -= 1;
+                                }
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                let total_rows = app.cases.len().div_ceil(10);
+                                if app.scroll_row + 1 < total_rows {
+                                    app.scroll_row += 1;
+                                }
+                            }
+                            _ => break,
+                        }
+                        continue;
+                    }
+
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            app.cancel.cancel();
+                            break;
+                        }
+                        KeyCode::Esc => {
+                            break;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.scroll_row > 0 {
+                                app.scroll_row -= 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let total_rows = app.cases.len().div_ceil(10);
+                            if app.scroll_row + 1 < total_rows {
+                                app.scroll_row += 1;
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            app.scroll_row = app.scroll_row.saturating_sub(5);
+                        }
+                        KeyCode::PageDown => {
+                            let total_rows = app.cases.len().div_ceil(10);
+                            app.scroll_row = (app.scroll_row + 5).min(total_rows.saturating_sub(1));
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
@@ -386,7 +418,7 @@ fn draw_pipeline_ui(f: &mut Frame, app: &mut PipelineApp) {
     };
 
     let total = app.cases.len().max(1);
-    let gen_target = app.cases.iter().filter(|c| c.has_gen).count().max(1);
+    let gen_target = app.gen_target;
 
     let gen_pct = ((app.gen_done as f64 / gen_target as f64) * 100.0).clamp(0.0, 100.0);
     let val_pct = ((app.val_done as f64 / total as f64) * 100.0).clamp(0.0, 100.0);

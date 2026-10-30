@@ -624,16 +624,15 @@ pub fn generate_contest_html(
     render_html_impl(reports, true, standings)
 }
 
-fn render_html_impl(
-    reports: &[SubmissionJudgeReport],
-    is_contest: bool,
-    standings: &[ContestStandingRow],
-) -> Result<String, String> {
+static REPORT_ENV: std::sync::LazyLock<Result<Environment<'static>, String>> =
+    std::sync::LazyLock::new(build_report_env);
+
+fn build_report_env() -> Result<Environment<'static>, String> {
     let mut env = Environment::new();
 
     // Helper functions for template
-    env.add_function("badge_class", |verdict: String| -> String {
-        map_verdict_badge(&verdict).to_string()
+    env.add_function("badge_class", |verdict: String| -> &'static str {
+        map_verdict_badge(&verdict)
     });
 
     env.add_function(
@@ -745,13 +744,15 @@ fn render_html_impl(
                     line, col
                 ));
                 details_html.push_str("<div class=\"diff-block\">");
+                let exp_s = exp.to_string();
+                let got_s = got.to_string();
                 details_html.push_str(&format!(
                     "<div class=\"diff-col exp\"><strong>Expected:</strong><pre>{}</pre></div>",
-                    html_escape(&exp.to_string())
+                    html_escape(&exp_s)
                 ));
                 details_html.push_str(&format!(
                     "<div class=\"diff-col got\"><strong>Found:</strong><pre>{}</pre></div>",
-                    html_escape(&got.to_string())
+                    html_escape(&got_s)
                 ));
                 details_html.push_str("</div>");
             }
@@ -779,9 +780,9 @@ fn render_html_impl(
             }
 
             let summary_note = if let Some(ref chk) = checker_val {
-                chk.lines().next().unwrap_or("").to_string()
+                chk.lines().next().unwrap_or("")
             } else {
-                String::new()
+                ""
             };
 
             let row_html = format!(
@@ -807,19 +808,27 @@ fn render_html_impl(
                         </div>
                     </td>
                 </tr>"#,
-                summary_note = html_escape(&summary_note)
+                summary_note = html_escape(summary_note)
             );
 
             minijinja::Value::from_safe_string(row_html)
         },
     );
 
-    let template_name = "report.html";
-    env.add_template(template_name, REPORT_TEMPLATE)
+    env.add_template("report.html", REPORT_TEMPLATE)
         .map_err(|e| format!("Failed to register report template: {e}"))?;
 
+    Ok(env)
+}
+
+fn render_html_impl(
+    reports: &[SubmissionJudgeReport],
+    is_contest: bool,
+    standings: &[ContestStandingRow],
+) -> Result<String, String> {
+    let env = REPORT_ENV.as_ref().map_err(|e| e.clone())?;
     let tmpl = env
-        .get_template(template_name)
+        .get_template("report.html")
         .map_err(|e| format!("Failed to get report template: {e}"))?;
 
     let title = if reports.len() == 1 && !is_contest {
@@ -848,12 +857,25 @@ fn render_html_impl(
     .map_err(|e| format!("Failed to render HTML report: {e}"))
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+fn html_escape(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+    {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn format_system_time_utc(st: std::time::SystemTime) -> String {

@@ -26,9 +26,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// Stamps whose mtime is closer than this to the verification time are not trusted unless the
-/// mtime carries sub-second precision.
+/// Stamps with whole-second mtimes (FAT/HFS+/coarse FS) require a 2-second margin.
 pub const RACY_WINDOW_NS: u64 = 2_000_000_000;
+
+/// Sub-second mtime tick margin (50 ms covers Linux `ktime_get_coarse_real_ts64` HZ=100/250
+/// jiffy updates as well as Windows coarse clock ticks).
+pub const SUBSEC_RACY_WINDOW_NS: u64 = 50_000_000;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -91,13 +94,18 @@ impl FileStamp {
         Ok(Self::from_metadata(&fs::metadata(path)?))
     }
 
-    /// Whether a stamp recorded at `verified_ns` may be trusted for change detection.
+    /// Whether a stamp recorded at `verified_ns` may be trusted for change detection without
+    /// content re-hashing ("racy-git" rule).
     pub fn is_trustworthy(&self, verified_ns: u64) -> bool {
         if self.mtime_ns == 0 {
             return false;
         }
-        let has_subsec = !self.mtime_ns.is_multiple_of(1_000_000_000);
-        has_subsec || verified_ns.saturating_sub(self.mtime_ns) >= RACY_WINDOW_NS
+        let window = if self.mtime_ns.is_multiple_of(1_000_000_000) {
+            RACY_WINDOW_NS
+        } else {
+            SUBSEC_RACY_WINDOW_NS
+        };
+        verified_ns.saturating_sub(self.mtime_ns) >= window
     }
 }
 
@@ -310,6 +318,7 @@ struct AnsMarker {
     ans_hash: String,
     len: u64,
     ans_mtime_ns: u64,
+    verified_ns: u64,
 }
 
 fn parse_marker(s: &str) -> Option<AnsMarker> {
@@ -317,6 +326,7 @@ fn parse_marker(s: &str) -> Option<AnsMarker> {
     let ans_hash = it.next()?.to_string();
     let len = it.next()?.parse().ok()?;
     let ans_mtime_ns = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let verified_ns = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     if ans_hash.len() != 64 || !ans_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -324,12 +334,14 @@ fn parse_marker(s: &str) -> Option<AnsMarker> {
         ans_hash,
         len,
         ans_mtime_ns,
+        verified_ns,
     })
 }
 
 /// Returns `true` when `ans_path` is known to hold the main solution's output for the input with
 /// hash `in_hash` (cache hit). A size mismatch is always a miss; when the `.ans` file was touched
-/// since the marker was written, its content hash is verified against the marker.
+/// since the marker was written (or the marker was recorded inside the filesystem's racy timestamp
+/// window), its content hash is verified against the marker.
 pub fn ans_marker_hit(problem_dir: &Path, main_hash: &str, in_hash: &str, ans_path: &Path) -> bool {
     let marker_path = ans_marker_path(problem_dir, main_hash, in_hash);
     let Some(marker) = fs::read_to_string(&marker_path)
@@ -344,13 +356,25 @@ pub fn ans_marker_hit(problem_dir: &Path, main_hash: &str, in_hash: &str, ans_pa
     if stamp.size != marker.len {
         return false;
     }
-    if marker.ans_mtime_ns != 0 && stamp.mtime_ns == marker.ans_mtime_ns {
+    if marker.ans_mtime_ns != 0
+        && stamp.mtime_ns == marker.ans_mtime_ns
+        && stamp.is_trustworthy(marker.verified_ns)
+    {
         return true;
     }
-    // The .ans file was touched (or the marker predates mtime tracking): verify content.
+    // Either .ans was touched, or the marker was recorded in the racy window: verify content.
+    let verified_ns = now_ns();
     match hash_file_streaming(ans_path) {
         Ok(h) if h == marker.ans_hash => {
-            let _ = write_ans_marker_raw(&marker_path, &marker.ans_hash, stamp.size, ans_path);
+            if stamp.is_trustworthy(verified_ns) {
+                let _ = write_ans_marker_raw(
+                    &marker_path,
+                    &marker.ans_hash,
+                    stamp.size,
+                    stamp.mtime_ns,
+                    verified_ns,
+                );
+            }
             true
         }
         _ => false,
@@ -361,12 +385,12 @@ fn write_ans_marker_raw(
     marker_path: &Path,
     ans_hash: &str,
     len: u64,
-    ans_path: &Path,
+    mtime_ns: u64,
+    verified_ns: u64,
 ) -> io::Result<()> {
-    let mtime_ns = FileStamp::of(ans_path).map(|s| s.mtime_ns).unwrap_or(0);
     crate::error::atomic_write_bytes(
         marker_path,
-        format!("{ans_hash} {len} {mtime_ns}\n").as_bytes(),
+        format!("{ans_hash} {len} {mtime_ns} {verified_ns}\n").as_bytes(),
     )
 }
 
@@ -381,7 +405,15 @@ pub fn write_ans_marker(
 ) {
     let marker_path = ans_marker_path(problem_dir, main_hash, in_hash);
     let ans_hash = blake3::hash(ans_bytes).to_hex().to_string();
-    let _ = write_ans_marker_raw(&marker_path, &ans_hash, ans_bytes.len() as u64, ans_path);
+    let verified_ns = now_ns();
+    let mtime_ns = FileStamp::of(ans_path).map(|s| s.mtime_ns).unwrap_or(0);
+    let _ = write_ans_marker_raw(
+        &marker_path,
+        &ans_hash,
+        ans_bytes.len() as u64,
+        mtime_ns,
+        verified_ns,
+    );
     let legacy = ans_cache_dir(problem_dir, main_hash).join(format!("{in_hash}.ans"));
     if legacy.exists() {
         let _ = fs::remove_file(legacy);
@@ -427,10 +459,7 @@ pub fn record_validator_ok(problem_dir: &Path, val_hash: &str, in_hash: &str, gr
 // ----------------------------------------------------------------------------
 
 pub fn ans_state_path(problem_dir: &Path) -> PathBuf {
-    problem_dir
-        .join(".uj")
-        .join("cache")
-        .join("ans_state.json")
+    problem_dir.join(".uj").join("cache").join("ans_state.json")
 }
 
 pub fn load_ans_state(problem_dir: &Path) -> Option<BTreeMap<String, String>> {
@@ -473,7 +502,8 @@ mod tests {
             ino: 0,
             ctime_ns: 0,
         };
-        assert!(subsec.is_trustworthy(1_000_000_124));
+        assert!(!subsec.is_trustworthy(1_000_000_124));
+        assert!(subsec.is_trustworthy(1_000_000_123 + SUBSEC_RACY_WINDOW_NS));
         let coarse = FileStamp {
             mtime_ns: 5_000_000_000,
             ..subsec

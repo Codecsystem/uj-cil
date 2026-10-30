@@ -1,21 +1,36 @@
 //! CSV report generation for judge results.
 
 use crate::result::SubmissionJudgeReport;
+use std::borrow::Cow;
+use std::fmt::Write;
 
 /// Escapes a CSV cell if it contains delimiters, quotes, or newlines, and neutralizes
 /// spreadsheet formula injection (CWE-1236) by prefixing `'` when the cell starts with
 /// `=`, `+`, `-`, `@`, `\t`, or `\r`.
-fn escape_csv(val: &str) -> String {
-    let safe = if val.starts_with(['=', '+', '-', '@', '\t', '\r']) {
-        format!("'{val}")
-    } else {
-        val.to_string()
-    };
-    if safe.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", safe.replace('"', "\"\""))
-    } else {
-        safe
+fn escape_csv(val: &str) -> Cow<'_, str> {
+    let needs_prefix = val.starts_with(['=', '+', '-', '@', '\t', '\r']);
+    let needs_quotes = val.contains([',', '"', '\n', '\r']);
+    if !needs_prefix && !needs_quotes {
+        return Cow::Borrowed(val);
     }
+    let mut out = String::with_capacity(val.len() + 4);
+    if needs_quotes {
+        out.push('"');
+    }
+    if needs_prefix {
+        out.push('\'');
+    }
+    for ch in val.chars() {
+        if ch == '"' {
+            out.push_str("\"\"");
+        } else {
+            out.push(ch);
+        }
+    }
+    if needs_quotes {
+        out.push('"');
+    }
+    Cow::Owned(out)
 }
 
 /// Generates a CSV report for a single submission.
@@ -30,7 +45,9 @@ pub fn generate_csv(report: &SubmissionJudgeReport) -> String {
 /// Prepends a UTF-8 BOM (`\u{FEFF}`) so Excel on Windows opens non-ASCII participant/problem names
 /// without mojibake.
 pub fn generate_multi_csv(reports: &[SubmissionJudgeReport]) -> String {
-    let mut out = String::from("\u{FEFF}submission,problem,test,verdict,time_ms,memory_kb,score\n");
+    let total_rows: usize = reports.iter().map(|r| r.tests.len()).sum();
+    let mut out = String::with_capacity(64 + total_rows * 48);
+    out.push_str("\u{FEFF}submission,problem,test,verdict,time_ms,memory_kb,score\n");
 
     for report in reports {
         let sub = escape_csv(&report.submission);
@@ -43,9 +60,10 @@ pub fn generate_multi_csv(reports: &[SubmissionJudgeReport]) -> String {
             let memory_kb = test.memory_kb;
             let score = test.score;
 
-            out.push_str(&format!(
-                "{sub},{prob},{test_id},{verdict},{time_ms},{memory_kb},{score:.2}\n"
-            ));
+            let _ = writeln!(
+                out,
+                "{sub},{prob},{test_id},{verdict},{time_ms},{memory_kb},{score:.2}"
+            );
         }
     }
 

@@ -560,6 +560,7 @@ struct Shared {
     worker_count: usize,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CollectorMsg {
     Registered(Arc<SubRun>),
     Result {
@@ -750,6 +751,7 @@ fn worker_main(env: WorkerEnv, slot: Slot, initial_sandbox: Option<Box<dyn Sandb
         let run_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
             if let Some(ref target) = *TEST_PANIC_ON_TEST_NAME.lock()
+                && sub.ctx.submission_name == "panic_sub"
                 && &test.name == target
             {
                 panic!("Injected worker panic on test {}", test.name);

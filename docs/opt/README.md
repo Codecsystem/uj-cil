@@ -16,6 +16,7 @@
 | **Round 9** | 全局评测任务池与多提交 Master-Detail 监控 (JudgePool) | (player, problem, test) 任务级扁平化跨提交窃取、内存动态预算、消灭尾部空置、Master-Detail TUI | **已完成** | [Round 9 报告](ROUND_9_GLOBAL_POOL.md) |
 | **Round 10** | 出题流水线用例级细粒度串联与流式 TUI (Case Streaming) | gen(i)→validate(i)→ans(i) 用例级串联并发，数据异常秒级中断并标 aborted，实时三进度条与用例网格 TUI | **已完成** | [Round 10 报告](ROUND_10_CASE_PIPELINE.md) |
 | **Round 11** | Cgroup v2 FD 预打开复用、check_exact 向量化、输入大小缓存与多解法并行验证 | Cgroup 采样提速 7.9x，TestCase 大小查询从 613ms 降至 1.2µs，File I/O 准备提速 1.7x，verify 并行提速 1.5x | **已完成** | [Round 11 报告](ROUND_11_HARDENING_AND_PERF.md) |
+| **Round 14** | 全栈性能审计落地：双平台沙盒深改、流式评测池、并行复测与出题/MCP/TUI 加速 | Linux `clone3`+`vfork` 单点 3.45ms（`trusted` 0.46ms），Win 原生 ACL 0.34~0.93ms（提速 20x~80x），`fcmp` `SimdLines` 提速 3.2x，40k TUI 事件 4.3ms，并修复 7 项正确性隐患 | **已完成** | [Round 14 报告](ROUND_14_FULL_PERF_AUDIT.md) |
 
 ---
 

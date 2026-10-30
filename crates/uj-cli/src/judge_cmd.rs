@@ -1,20 +1,29 @@
 //! CLI handlers for judge, last, show, and clean commands.
 
+use std::collections::HashMap;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 
 use crossbeam_channel::unbounded;
+use serde::Serialize;
 use uj_core::verdict::Verdict;
 use uj_engine::compiler::CompileError;
+use uj_engine::context::{ProblemContext, SubmissionContext};
 use uj_engine::judge::JudgeOptions;
+use uj_engine::pool::{JudgePool, PoolOptions, PoolSubmission};
 use uj_engine::scheduler::Scheduler;
+use uj_engine::topology::Topology;
 use uj_report::human::{format_human_report, format_test_details};
-use uj_report::result::{JudgeEvent, SubmissionJudgeReport};
+use uj_report::result::{
+    JudgeEvent, PoolEvent, SingleTestResult, SubmissionJudgeReport, SubmissionRef,
+};
 use uj_sandbox::CancelToken;
+use uj_tui::multi::{SubmissionMeta, run_multi_tui};
 
 use crate::cli::{Cli, OutputFormat};
 use crate::error::{
@@ -23,6 +32,73 @@ use crate::error::{
 };
 
 static RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum JudgeJsonItem {
+    Report(SubmissionJudgeReport),
+    CompileError {
+        schema_version: u32,
+        problem: String,
+        submission: String,
+        verdict: &'static str,
+        score: f64,
+        max_time_ms: u64,
+        max_memory_kb: u64,
+        subtasks: Vec<()>,
+        tests: Vec<SingleTestResult>,
+        compile_error: String,
+    },
+    JudgeFailed {
+        schema_version: u32,
+        problem: String,
+        submission: String,
+        verdict: &'static str,
+        score: f64,
+        max_time_ms: u64,
+        max_memory_kb: u64,
+        subtasks: Vec<()>,
+        tests: Vec<()>,
+        judge_failed_error: String,
+    },
+}
+
+fn build_ce_struct(
+    problem_name: &str,
+    submission_name: &str,
+    err_msg: &str,
+) -> SubmissionJudgeReport {
+    let ce_test = SingleTestResult {
+        id: "compile".to_string(),
+        subtask: None,
+        verdict: Verdict::CompileError,
+        time_ms: 0,
+        wall_ms: 0,
+        memory_kb: 0,
+        score: 0.0,
+        exit: uj_report::result::ExitInfo {
+            code: Some(1),
+            signal: None,
+            nt_status: None,
+        },
+        message: Some(err_msg.to_string()),
+        checker: Some(err_msg.to_string()),
+        diff: None,
+        timing: uj_report::result::TimingInfo::default(),
+        sandbox_tier: None,
+    };
+    SubmissionJudgeReport {
+        schema_version: 1,
+        problem: problem_name.to_string(),
+        submission: submission_name.to_string(),
+        verdict: Verdict::CompileError,
+        score: 0.0,
+        max_time_ms: 0,
+        max_memory_kb: 0,
+        subtasks: Vec::new(),
+        tests: vec![ce_test],
+    }
+}
 
 /// Save a report atomically to .uj/runs and update .uj/runs/last.json
 pub(crate) fn save_run_report(
@@ -65,6 +141,26 @@ pub(crate) fn save_run_report(
     }
 
     Ok(())
+}
+
+fn spawn_buffered_ndjson_writer() -> (
+    crossbeam_channel::Sender<JudgeEvent>,
+    thread::JoinHandle<()>,
+) {
+    let (tx, rx) = unbounded::<JudgeEvent>();
+    let handle = thread::spawn(move || {
+        let mut out = BufWriter::with_capacity(64 * 1024, std::io::stdout());
+        while let Ok(ev) = rx.recv() {
+            if serde_json::to_writer(&mut out, &ev).is_ok() {
+                let _ = out.write_all(b"\n");
+            }
+            if rx.is_empty() {
+                let _ = out.flush();
+            }
+        }
+        let _ = out.flush();
+    });
+    (tx, handle)
 }
 
 pub fn run_judge(
@@ -110,24 +206,28 @@ pub fn run_judge(
     if cli.require_tier
         && let Err(e) = uj_sandbox::create_sandbox(sandbox_mode_str, true)
     {
-        let err_obj = serde_json::json!({
-            "schema_version": 1,
-            "problem": problem_config.name,
-            "submission": "",
-            "verdict": "SE",
-            "score": 0.0,
-            "max_time_ms": 0,
-            "max_memory_kb": 0,
-            "subtasks": [],
-            "tests": [],
-            "judge_failed_error": format!("Sandbox tier requirement not met: {e}")
-        });
+        let err_item = JudgeJsonItem::JudgeFailed {
+            schema_version: 1,
+            problem: problem_config.name.clone(),
+            submission: String::new(),
+            verdict: "SE",
+            score: 0.0,
+            max_time_ms: 0,
+            max_memory_kb: 0,
+            subtasks: Vec::new(),
+            tests: Vec::new(),
+            judge_failed_error: format!("Sandbox tier requirement not met: {e}"),
+        };
         match format {
             OutputFormat::Json => {
-                println!("{}", serde_json::to_string_pretty(&err_obj).unwrap());
+                let stdout = std::io::stdout();
+                let mut out = BufWriter::with_capacity(8 * 1024, stdout.lock());
+                let _ = serde_json::to_writer_pretty(&mut out, &err_item);
+                let _ = out.write_all(b"\n");
+                let _ = out.flush();
             }
             OutputFormat::Ndjson => {
-                println!("{}", serde_json::to_string(&err_obj).unwrap());
+                println!("{}", serde_json::to_string(&err_item).unwrap());
             }
             OutputFormat::Human | OutputFormat::Silent => {
                 eprintln!("Failed to satisfy sandbox tier requirement: {e}");
@@ -135,18 +235,6 @@ pub fn run_judge(
         }
         return ExitCode::from(EXIT_JUDGE_FAILED);
     }
-
-    let judge_options = JudgeOptions {
-        sandbox_mode: sandbox_mode_str.to_string(),
-        require_tier: cli.require_tier,
-        fail_fast: cli.fail_fast,
-        precise: cli.effective_precise(),
-    };
-
-    let compile_session = uj_engine::compiler::CompileSession::new();
-    let scheduler = Scheduler::with_session(judge_options, compile_session.clone());
-    let mut overall_exit = ExitCode::from(EXIT_SUCCESS);
-    let mut json_reports: Vec<serde_json::Value> = Vec::new();
 
     let mut expanded_sources = Vec::new();
     for s in sources {
@@ -178,6 +266,33 @@ pub fn run_judge(
     }
 
     let use_tui = cli.tui && format == OutputFormat::Human && std::io::stderr().is_terminal();
+    let compile_session = uj_engine::compiler::CompileSession::new();
+    let mut overall_exit = ExitCode::from(EXIT_SUCCESS);
+    let mut typed_json_reports: Vec<JudgeJsonItem> = Vec::with_capacity(expanded_sources.len());
+
+    // Multi-submission streaming fast path: share `ProblemContext`, compile concurrently on
+    // spare cores, and overlap test execution across submissions via `JudgePool::run_streaming`.
+    if expanded_sources.len() > 1 {
+        return run_multi_judge(
+            &expanded_sources,
+            problem_dir,
+            &problem_config,
+            &tests,
+            cli,
+            format,
+            use_tui,
+            &compile_session,
+            cancel,
+        );
+    }
+
+    let judge_options = JudgeOptions {
+        sandbox_mode: sandbox_mode_str.to_string(),
+        require_tier: cli.require_tier,
+        fail_fast: cli.fail_fast,
+        precise: cli.effective_precise(),
+    };
+    let scheduler = Scheduler::with_session(judge_options, compile_session.clone());
 
     for source in &expanded_sources {
         if cancel.is_cancelled() {
@@ -194,7 +309,7 @@ pub fn run_judge(
             .to_limits()
             .map(|l| l.memory_bytes)
             .unwrap_or(512 * 1024 * 1024);
-        let slot_count = uj_engine::topology::Topology::detect(mem_limit, cli.jobs)
+        let slot_count = Topology::detect(mem_limit, cli.jobs)
             .slots
             .len()
             .min(test_names.len());
@@ -224,14 +339,7 @@ pub fn run_judge(
             });
             (Some(tx), Some(handle))
         } else if format == OutputFormat::Ndjson {
-            let (tx, rx) = unbounded::<JudgeEvent>();
-            let handle = thread::spawn(move || {
-                for ev in rx {
-                    if let Ok(line) = serde_json::to_string(&ev) {
-                        println!("{line}");
-                    }
-                }
-            });
+            let (tx, handle) = spawn_buffered_ndjson_writer();
             (Some(tx), Some(handle))
         } else if format == OutputFormat::Human {
             let (tx, rx) = unbounded::<JudgeEvent>();
@@ -314,57 +422,22 @@ pub fn run_judge(
                     CompileError::Failed(msg) => msg.clone(),
                     other => other.to_string(),
                 };
-                let ce_test = uj_report::result::SingleTestResult {
-                    id: "compile".to_string(),
-                    subtask: None,
-                    verdict: Verdict::CompileError,
-                    time_ms: 0,
-                    wall_ms: 0,
-                    memory_kb: 0,
-                    score: 0.0,
-                    exit: uj_report::result::ExitInfo {
-                        code: Some(1),
-                        signal: None,
-                        nt_status: None,
-                    },
-                    message: Some(err_msg.clone()),
-                    checker: Some(err_msg.clone()),
-                    diff: None,
-                    timing: uj_report::result::TimingInfo::default(),
-                    sandbox_tier: None,
-                };
-                let ce_struct = SubmissionJudgeReport {
-                    schema_version: 1,
-                    problem: problem_config.name.clone(),
-                    submission: source
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                    verdict: Verdict::CompileError,
-                    score: 0.0,
-                    max_time_ms: 0,
-                    max_memory_kb: 0,
-                    subtasks: Vec::new(),
-                    tests: vec![ce_test],
-                };
+                let ce_struct = build_ce_struct(&problem_config.name, &source_name, &err_msg);
                 let _ = save_run_report(problem_dir, &ce_struct);
 
-                let ce_report = serde_json::json!({
-                    "schema_version": 1,
-                    "problem": problem_config.name,
-                    "submission": source.file_name().unwrap_or_default().to_string_lossy(),
-                    "verdict": "CE",
-                    "score": 0.0,
-                    "max_time_ms": 0,
-                    "max_memory_kb": 0,
-                    "subtasks": [],
-                    "tests": ce_struct.tests,
-                    "compile_error": err_msg
-                });
-
                 if format == OutputFormat::Json {
-                    json_reports.push(ce_report);
+                    typed_json_reports.push(JudgeJsonItem::CompileError {
+                        schema_version: 1,
+                        problem: problem_config.name.clone(),
+                        submission: source_name,
+                        verdict: "CE",
+                        score: 0.0,
+                        max_time_ms: 0,
+                        max_memory_kb: 0,
+                        subtasks: Vec::new(),
+                        tests: ce_struct.tests,
+                        compile_error: err_msg,
+                    });
                 } else if format == OutputFormat::Human {
                     eprintln!("=== Compilation Error: {} ===", source.display());
                     eprintln!("{e}");
@@ -401,9 +474,16 @@ pub fn run_judge(
             Ok(report) => {
                 let _ = save_run_report(problem_dir, &report);
 
+                let code = match report.verdict {
+                    Verdict::Accepted => EXIT_SUCCESS,
+                    Verdict::JudgeFailed => EXIT_JUDGE_FAILED,
+                    Verdict::CompileError => EXIT_COMPILE_ERROR,
+                    _ => EXIT_NON_AC,
+                };
+
                 match format {
                     OutputFormat::Json => {
-                        json_reports.push(serde_json::to_value(&report).unwrap());
+                        typed_json_reports.push(JudgeJsonItem::Report(report));
                     }
                     OutputFormat::Human => {
                         println!("{}", format_human_report(&report));
@@ -413,36 +493,29 @@ pub fn run_judge(
                     }
                 }
 
-                let code = match report.verdict {
-                    Verdict::Accepted => EXIT_SUCCESS,
-                    Verdict::JudgeFailed => EXIT_JUDGE_FAILED,
-                    Verdict::CompileError => EXIT_COMPILE_ERROR,
-                    _ => EXIT_NON_AC,
-                };
-
                 if code != EXIT_SUCCESS {
                     overall_exit = ExitCode::from(code);
                 }
             }
             Err(e) => {
-                let err_obj = serde_json::json!({
-                    "schema_version": 1,
-                    "problem": problem_config.name,
-                    "submission": source.file_name().unwrap_or_default().to_string_lossy(),
-                    "verdict": "SE",
-                    "score": 0.0,
-                    "max_time_ms": 0,
-                    "max_memory_kb": 0,
-                    "subtasks": [],
-                    "tests": [],
-                    "judge_failed_error": e.to_string()
-                });
+                let err_item = JudgeJsonItem::JudgeFailed {
+                    schema_version: 1,
+                    problem: problem_config.name.clone(),
+                    submission: source_name,
+                    verdict: "SE",
+                    score: 0.0,
+                    max_time_ms: 0,
+                    max_memory_kb: 0,
+                    subtasks: Vec::new(),
+                    tests: Vec::new(),
+                    judge_failed_error: e.to_string(),
+                };
 
                 if format == OutputFormat::Json {
-                    json_reports.push(err_obj);
+                    typed_json_reports.push(err_item);
                 } else if format == OutputFormat::Ndjson {
-                    println!("{}", serde_json::to_string(&err_obj).unwrap());
-                } else {
+                    println!("{}", serde_json::to_string(&err_item).unwrap());
+                } else if format == OutputFormat::Human {
                     eprintln!("Judging failed: {e}");
                 }
                 overall_exit = ExitCode::from(EXIT_JUDGE_FAILED);
@@ -451,14 +524,580 @@ pub fn run_judge(
     }
 
     if format == OutputFormat::Json {
-        if json_reports.len() == 1 {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json_reports[0]).unwrap()
-            );
-        } else {
-            println!("{}", serde_json::to_string_pretty(&json_reports).unwrap());
+        write_json_reports(&typed_json_reports);
+    }
+
+    overall_exit
+}
+
+fn write_json_reports(items: &[JudgeJsonItem]) {
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::with_capacity(64 * 1024, stdout.lock());
+    if items.len() == 1 {
+        let _ = serde_json::to_writer_pretty(&mut out, &items[0]);
+    } else {
+        let _ = serde_json::to_writer_pretty(&mut out, items);
+    }
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_multi_judge(
+    expanded_sources: &[PathBuf],
+    problem_dir: &Path,
+    problem_config: &uj_core::config::ProblemConfig,
+    tests: &[uj_core::tests::TestCase],
+    cli: &Cli,
+    format: OutputFormat,
+    use_tui: bool,
+    compile_session: &uj_engine::compiler::CompileSession,
+    cancel: &CancelToken,
+) -> ExitCode {
+    let sandbox_mode_str = cli.sandbox_mode_str();
+    let p_ctx = match ProblemContext::prepare(0, problem_dir, problem_config, compile_session) {
+        Ok(ctx) => Arc::new(ctx),
+        Err(e) => {
+            let err_str = e.to_string();
+            let mut items = Vec::with_capacity(expanded_sources.len());
+            for source in expanded_sources {
+                let source_name = source
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let err_item = JudgeJsonItem::JudgeFailed {
+                    schema_version: 1,
+                    problem: problem_config.name.clone(),
+                    submission: source_name,
+                    verdict: "SE",
+                    score: 0.0,
+                    max_time_ms: 0,
+                    max_memory_kb: 0,
+                    subtasks: Vec::new(),
+                    tests: Vec::new(),
+                    judge_failed_error: err_str.clone(),
+                };
+                if format == OutputFormat::Json {
+                    items.push(err_item);
+                } else if format == OutputFormat::Ndjson {
+                    println!("{}", serde_json::to_string(&err_item).unwrap());
+                } else if format == OutputFormat::Human {
+                    eprintln!("Judging failed: {err_str}");
+                }
+            }
+            if format == OutputFormat::Json {
+                write_json_reports(&items);
+            }
+            return ExitCode::from(EXIT_JUDGE_FAILED);
         }
+    };
+
+    let mem_limit = problem_config
+        .to_limits()
+        .map(|l| l.memory_bytes)
+        .unwrap_or(512 * 1024 * 1024);
+    let topology = Topology::detect(mem_limit, cli.jobs);
+    let slots = topology.slots.len().max(1);
+    let slot_cpus: Vec<Option<usize>> = topology.slots.iter().map(|s| s.cpu_core).collect();
+    let spare_cores = topology.logical_cores.saturating_sub(slots);
+    let compile_threads = if spare_cores >= 1 {
+        spare_cores.clamp(1, 8)
+    } else {
+        (topology.logical_cores / 2).clamp(1, 4)
+    }
+    .min(expanded_sources.len());
+
+    let (ndjson_tx, ndjson_handle) = if format == OutputFormat::Ndjson {
+        let (tx, h) = spawn_buffered_ndjson_writer();
+        (Some(tx), Some(h))
+    } else {
+        (None, None)
+    };
+
+    let (pool_event_tx, pool_event_rx) = unbounded::<PoolEvent>();
+    let pool_events_opt = if use_tui || format == OutputFormat::Human {
+        Some(pool_event_tx)
+    } else {
+        None
+    };
+
+    let total_tests = (expanded_sources.len() * tests.len()) as u64;
+    let pb = if format == OutputFormat::Human && !use_tui {
+        let p = indicatif::ProgressBar::new(total_tests);
+        p.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        p.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                .progress_chars("=>-"),
+        );
+        Some(p)
+    } else {
+        None
+    };
+
+    let human_progress_handle = if format == OutputFormat::Human && !use_tui {
+        let pb_clone = pb.clone();
+        let rx = pool_event_rx.clone();
+        Some(thread::spawn(move || {
+            while let Ok(pe) = rx.recv() {
+                if let JudgeEvent::TestDone(ref res) = pe.inner
+                    && let Some(ref p) = pb_clone
+                {
+                    p.inc(1);
+                    p.set_message(format!(
+                        "{} #{}: {}",
+                        pe.submission.name,
+                        res.id,
+                        res.verdict.short_code()
+                    ));
+                }
+            }
+            if let Some(ref p) = pb_clone {
+                p.finish_and_clear();
+            }
+        }))
+    } else {
+        None
+    };
+
+    let tui_handle = if use_tui {
+        let test_names: Vec<String> = tests.iter().map(|t| t.name.clone()).collect();
+        let sub_metas: Vec<SubmissionMeta> = expanded_sources
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| SubmissionMeta {
+                id: idx,
+                problem: problem_config.name.clone(),
+                name: s
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                test_names: test_names.clone(),
+            })
+            .collect();
+        let title = format!("Judge: {}", problem_config.name);
+        let cancel_tui = cancel.clone();
+        let rx = pool_event_rx.clone();
+        Some(thread::spawn(move || {
+            if let Err(e) = run_multi_tui(
+                &title,
+                &sub_metas,
+                slots,
+                slot_cpus,
+                rx.clone(),
+                cancel_tui,
+                true,
+            ) {
+                eprintln!(
+                    "Warning: Multi-judge TUI initialization failed ({e}); falling back to non-TUI execution."
+                );
+                while rx.recv().is_ok() {}
+            }
+        }))
+    } else {
+        None
+    };
+
+    enum EarlyOutcome {
+        CompileError {
+            sub_id: usize,
+            source: PathBuf,
+            source_name: String,
+            err_display: String,
+            err_msg: String,
+            ce_struct: SubmissionJudgeReport,
+        },
+        Failed {
+            sub_id: usize,
+            source_name: String,
+            err_msg: String,
+        },
+    }
+
+    #[allow(clippy::large_enum_variant)]
+    enum PreparedSub {
+        Ready(PoolSubmission),
+        Early(EarlyOutcome),
+    }
+
+    let (work_tx, work_rx) = unbounded::<(usize, PathBuf)>();
+    let (prep_tx, prep_rx) = unbounded::<PreparedSub>();
+    let (stream_tx, stream_rx) = unbounded::<PoolSubmission>();
+
+    let mut compile_workers = Vec::with_capacity(compile_threads);
+    for _ in 0..compile_threads {
+        let rx = work_rx.clone();
+        let tx = prep_tx.clone();
+        let session = compile_session.clone();
+        let p_ctx = Arc::clone(&p_ctx);
+        let tests_vec = tests.to_vec();
+        let no_cache = cli.no_cache;
+        let fail_fast = cli.fail_fast;
+        let precise = cli.effective_precise();
+        let ndjson_tx_worker = ndjson_tx.clone();
+        let cancel_worker = cancel.clone();
+
+        compile_workers.push(thread::spawn(move || {
+            while let Ok((sub_id, source)) = rx.recv() {
+                if cancel_worker.is_cancelled() {
+                    break;
+                }
+                let source_name = source
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let target_str = source.to_string_lossy().to_string();
+
+                if let Some(ref ntx) = ndjson_tx_worker {
+                    let _ = ntx.send(JudgeEvent::CompileStart {
+                        target: target_str.clone(),
+                        compiler: "auto".to_string(),
+                    });
+                }
+
+                match session.compile_problem_solution(
+                    &p_ctx.problem_dir,
+                    &p_ctx.config,
+                    &source,
+                    no_cache,
+                ) {
+                    Ok(compiled) => {
+                        if let Some(ref ntx) = ndjson_tx_worker {
+                            let _ = ntx.send(JudgeEvent::CompileDone {
+                                target: target_str,
+                                success: true,
+                                duration_ms: compiled.duration_ms,
+                                error_output: None,
+                            });
+                        }
+                        match SubmissionContext::prepare(
+                            sub_id,
+                            &source_name,
+                            Arc::clone(&p_ctx),
+                            &compiled,
+                            tests_vec.clone(),
+                            fail_fast,
+                        ) {
+                            Ok(sub_ctx) => {
+                                let _ = tx.send(PreparedSub::Ready(PoolSubmission {
+                                    ctx: Arc::new(sub_ctx),
+                                    events: ndjson_tx_worker.clone(),
+                                    precise,
+                                }));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(PreparedSub::Early(EarlyOutcome::Failed {
+                                    sub_id,
+                                    source_name,
+                                    err_msg: e.to_string(),
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_display = e.to_string();
+                        if let Some(ref ntx) = ndjson_tx_worker {
+                            let _ = ntx.send(JudgeEvent::CompileDone {
+                                target: target_str,
+                                success: false,
+                                duration_ms: 0,
+                                error_output: Some(err_display.clone()),
+                            });
+                            let _ = ntx.send(JudgeEvent::Summary {
+                                total_time_ms: 0,
+                                peak_memory_kb: 0,
+                                final_verdict: Verdict::CompileError,
+                                final_score: 0.0,
+                            });
+                        }
+                        let err_msg = match &e {
+                            CompileError::Failed(msg) => msg.clone(),
+                            other => other.to_string(),
+                        };
+                        let ce_struct = build_ce_struct(&p_ctx.config.name, &source_name, &err_msg);
+                        let _ = tx.send(PreparedSub::Early(EarlyOutcome::CompileError {
+                            sub_id,
+                            source,
+                            source_name,
+                            err_display,
+                            err_msg,
+                            ce_struct,
+                        }));
+                    }
+                }
+            }
+        }));
+    }
+
+    drop(prep_tx);
+    for (idx, src) in expanded_sources.iter().cloned().enumerate() {
+        let _ = work_tx.send((idx, src));
+    }
+    drop(work_tx);
+
+    let router_handle = {
+        let pb_router = pb.clone();
+        let router_pool_events = pool_events_opt.clone();
+        let prob_name = problem_config.name.clone();
+        let tests_per_sub = tests.len() as u64;
+        thread::spawn(move || {
+            let mut early_map: HashMap<usize, EarlyOutcome> = HashMap::new();
+            let mut cur_len = total_tests;
+            while let Ok(item) = prep_rx.recv() {
+                match item {
+                    PreparedSub::Ready(pool_sub) => {
+                        let _ = stream_tx.send(pool_sub);
+                    }
+                    PreparedSub::Early(early) => {
+                        if let Some(ref p) = pb_router {
+                            cur_len = cur_len.saturating_sub(tests_per_sub);
+                            p.set_length(cur_len);
+                        }
+                        match &early {
+                            EarlyOutcome::CompileError {
+                                sub_id,
+                                source_name,
+                                err_display,
+                                ce_struct,
+                                ..
+                            } => {
+                                if use_tui && let Some(ref ptx) = router_pool_events {
+                                    let _ = ptx.send(PoolEvent {
+                                        submission: SubmissionRef {
+                                            id: *sub_id,
+                                            problem: prob_name.clone(),
+                                            name: source_name.clone(),
+                                        },
+                                        inner: JudgeEvent::CompileDone {
+                                            target: source_name.clone(),
+                                            success: false,
+                                            duration_ms: 0,
+                                            error_output: Some(err_display.clone()),
+                                        },
+                                    });
+                                    let _ = ptx.send(PoolEvent {
+                                        submission: SubmissionRef {
+                                            id: *sub_id,
+                                            problem: prob_name.clone(),
+                                            name: source_name.clone(),
+                                        },
+                                        inner: JudgeEvent::SubmissionDone(ce_struct.clone()),
+                                    });
+                                }
+                                early_map.insert(*sub_id, early);
+                            }
+                            EarlyOutcome::Failed {
+                                sub_id,
+                                source_name,
+                                err_msg,
+                            } => {
+                                if use_tui && let Some(ref ptx) = router_pool_events {
+                                    let fail_report = SubmissionJudgeReport {
+                                        schema_version: 1,
+                                        problem: prob_name.clone(),
+                                        submission: source_name.clone(),
+                                        verdict: Verdict::JudgeFailed,
+                                        score: 0.0,
+                                        max_time_ms: 0,
+                                        max_memory_kb: 0,
+                                        subtasks: vec![],
+                                        tests: vec![SingleTestResult {
+                                            id: "setup".to_string(),
+                                            subtask: None,
+                                            verdict: Verdict::JudgeFailed,
+                                            time_ms: 0,
+                                            wall_ms: 0,
+                                            memory_kb: 0,
+                                            score: 0.0,
+                                            exit: uj_report::result::ExitInfo {
+                                                code: None,
+                                                signal: None,
+                                                nt_status: None,
+                                            },
+                                            message: Some(err_msg.clone()),
+                                            checker: None,
+                                            diff: None,
+                                            timing: uj_report::result::TimingInfo::default(),
+                                            sandbox_tier: None,
+                                        }],
+                                    };
+                                    let _ = ptx.send(PoolEvent {
+                                        submission: SubmissionRef {
+                                            id: *sub_id,
+                                            problem: prob_name.clone(),
+                                            name: source_name.clone(),
+                                        },
+                                        inner: JudgeEvent::SubmissionDone(fail_report),
+                                    });
+                                }
+                                early_map.insert(*sub_id, early);
+                            }
+                        }
+                    }
+                }
+            }
+            drop(stream_tx);
+            early_map
+        })
+    };
+
+    let mut pool_opts =
+        PoolOptions::default_for(sandbox_mode_str.to_string(), cli.require_tier, cli.jobs);
+    pool_opts.pool_events = pool_events_opt;
+
+    let pool = JudgePool::new(pool_opts);
+    let pool_results = pool.run_streaming(stream_rx, cancel);
+
+    for h in compile_workers {
+        let _ = h.join();
+    }
+    let mut early_map = router_handle.join().unwrap_or_default();
+
+    drop(ndjson_tx);
+    drop(pool_event_rx);
+
+    if let Some(h) = human_progress_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = ndjson_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = tui_handle {
+        let _ = h.join();
+    }
+
+    if cancel.is_cancelled() {
+        return emit_interrupted(format, "Judging");
+    }
+
+    let mut pool_map: HashMap<usize, Result<SubmissionJudgeReport, _>> =
+        pool_results.into_iter().collect();
+    let mut overall_exit = ExitCode::from(EXIT_SUCCESS);
+    let mut typed_json_reports: Vec<JudgeJsonItem> = Vec::with_capacity(expanded_sources.len());
+
+    for (sub_id, source) in expanded_sources.iter().enumerate() {
+        if let Some(early) = early_map.remove(&sub_id) {
+            match early {
+                EarlyOutcome::CompileError {
+                    source: ce_src,
+                    source_name,
+                    err_display,
+                    err_msg,
+                    ce_struct,
+                    ..
+                } => {
+                    let _ = save_run_report(problem_dir, &ce_struct);
+                    if format == OutputFormat::Json {
+                        typed_json_reports.push(JudgeJsonItem::CompileError {
+                            schema_version: 1,
+                            problem: problem_config.name.clone(),
+                            submission: source_name,
+                            verdict: "CE",
+                            score: 0.0,
+                            max_time_ms: 0,
+                            max_memory_kb: 0,
+                            subtasks: Vec::new(),
+                            tests: ce_struct.tests,
+                            compile_error: err_msg,
+                        });
+                    } else if format == OutputFormat::Human {
+                        eprintln!("=== Compilation Error: {} ===", ce_src.display());
+                        eprintln!("{err_display}");
+                    }
+                    if overall_exit == ExitCode::from(EXIT_SUCCESS) {
+                        overall_exit = ExitCode::from(EXIT_COMPILE_ERROR);
+                    }
+                }
+                EarlyOutcome::Failed {
+                    source_name,
+                    err_msg,
+                    ..
+                } => {
+                    let err_item = JudgeJsonItem::JudgeFailed {
+                        schema_version: 1,
+                        problem: problem_config.name.clone(),
+                        submission: source_name,
+                        verdict: "SE",
+                        score: 0.0,
+                        max_time_ms: 0,
+                        max_memory_kb: 0,
+                        subtasks: Vec::new(),
+                        tests: Vec::new(),
+                        judge_failed_error: err_msg.clone(),
+                    };
+                    if format == OutputFormat::Json {
+                        typed_json_reports.push(err_item);
+                    } else if format == OutputFormat::Ndjson {
+                        println!("{}", serde_json::to_string(&err_item).unwrap());
+                    } else if format == OutputFormat::Human {
+                        eprintln!("Judging failed: {err_msg}");
+                    }
+                    overall_exit = ExitCode::from(EXIT_JUDGE_FAILED);
+                }
+            }
+            continue;
+        }
+
+        if let Some(judge_res) = pool_map.remove(&sub_id) {
+            match judge_res {
+                Ok(report) => {
+                    let _ = save_run_report(problem_dir, &report);
+                    let code = match report.verdict {
+                        Verdict::Accepted => EXIT_SUCCESS,
+                        Verdict::JudgeFailed => EXIT_JUDGE_FAILED,
+                        Verdict::CompileError => EXIT_COMPILE_ERROR,
+                        _ => EXIT_NON_AC,
+                    };
+                    match format {
+                        OutputFormat::Json => {
+                            typed_json_reports.push(JudgeJsonItem::Report(report));
+                        }
+                        OutputFormat::Human => {
+                            println!("{}", format_human_report(&report));
+                        }
+                        OutputFormat::Ndjson | OutputFormat::Silent => {}
+                    }
+                    if code != EXIT_SUCCESS {
+                        overall_exit = ExitCode::from(code);
+                    }
+                }
+                Err(e) => {
+                    let source_name = source
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let err_item = JudgeJsonItem::JudgeFailed {
+                        schema_version: 1,
+                        problem: problem_config.name.clone(),
+                        submission: source_name,
+                        verdict: "SE",
+                        score: 0.0,
+                        max_time_ms: 0,
+                        max_memory_kb: 0,
+                        subtasks: Vec::new(),
+                        tests: Vec::new(),
+                        judge_failed_error: e.to_string(),
+                    };
+                    if format == OutputFormat::Json {
+                        typed_json_reports.push(err_item);
+                    } else if format == OutputFormat::Ndjson {
+                        println!("{}", serde_json::to_string(&err_item).unwrap());
+                    } else if format == OutputFormat::Human {
+                        eprintln!("Judging failed: {e}");
+                    }
+                    overall_exit = ExitCode::from(EXIT_JUDGE_FAILED);
+                }
+            }
+        }
+    }
+
+    if format == OutputFormat::Json {
+        write_json_reports(&typed_json_reports);
     }
 
     overall_exit

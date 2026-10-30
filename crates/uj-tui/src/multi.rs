@@ -1,7 +1,7 @@
 //! Master-Detail Multi-Submission TUI for concurrent contest and verify sessions.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,8 @@ pub struct SubState {
     pub meta: SubmissionMeta,
     pub status: SubStatus,
     pub tests: Vec<(String, TestCaseStatus)>,
+    test_index: HashMap<String, usize>,
+    pub done_tests: usize,
     pub max_time_ms: u64,
     pub max_memory_kb: u64,
     pub score: Option<f64>,
@@ -70,6 +72,8 @@ pub struct SubState {
 pub struct MultiApp {
     pub title: String,
     pub subs: Vec<SubState>,
+    sub_index: HashMap<usize, usize>,
+    pub done_subs: usize,
     pub slots: Vec<Option<(usize, String, Instant)>>,
     pub cpu_cores: Vec<Option<usize>>,
     pub recent_done_times: VecDeque<Instant>,
@@ -95,18 +99,28 @@ impl MultiApp {
         cpu_cores: Vec<Option<usize>>,
         cancel_token: CancelToken,
     ) -> Self {
+        let mut sub_index = HashMap::with_capacity(metas.len());
         let subs: Vec<SubState> = metas
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(s_idx, m)| {
+                sub_index.insert(m.id, s_idx);
+                let mut test_index = HashMap::with_capacity(m.test_names.len());
                 let tests = m
                     .test_names
                     .iter()
-                    .map(|n| (n.clone(), TestCaseStatus::Pending))
+                    .enumerate()
+                    .map(|(t_idx, n)| {
+                        test_index.insert(n.clone(), t_idx);
+                        (n.clone(), TestCaseStatus::Pending)
+                    })
                     .collect();
                 SubState {
                     meta: m.clone(),
                     status: SubStatus::Pending,
                     tests,
+                    test_index,
+                    done_tests: 0,
                     max_time_ms: 0,
                     max_memory_kb: 0,
                     score: None,
@@ -120,6 +134,8 @@ impl MultiApp {
         Self {
             title: title.to_string(),
             subs,
+            sub_index,
+            done_subs: 0,
             slots,
             cpu_cores,
             recent_done_times: VecDeque::with_capacity(200),
@@ -140,8 +156,7 @@ impl MultiApp {
 
     pub fn handle_event(&mut self, event: PoolEvent) {
         let sub_id = event.submission.id;
-        let sub_idx = self.subs.iter().position(|s| s.meta.id == sub_id);
-        let Some(s_idx) = sub_idx else {
+        let Some(&s_idx) = self.sub_index.get(&sub_id) else {
             return;
         };
 
@@ -151,8 +166,11 @@ impl MultiApp {
                 if sub.status == SubStatus::Pending {
                     sub.status = SubStatus::Running;
                 }
-                if let Some(entry) = sub.tests.iter_mut().find(|(name, _)| *name == id) {
-                    entry.1 = TestCaseStatus::Running;
+                if let Some(&t_idx) = sub.test_index.get(&id) {
+                    if matches!(sub.tests[t_idx].1, TestCaseStatus::Done(..)) {
+                        sub.done_tests = sub.done_tests.saturating_sub(1);
+                    }
+                    sub.tests[t_idx].1 = TestCaseStatus::Running;
                 }
                 if let Some(s) = slot.filter(|&s| s < self.slots.len()) {
                     self.slots[s] = Some((sub_id, id, Instant::now()));
@@ -167,34 +185,37 @@ impl MultiApp {
             }
             JudgeEvent::TestDone(res) => {
                 let id = res.id.clone();
-                let sub = &mut self.subs[s_idx];
-                sub.max_time_ms = sub.max_time_ms.max(res.time_ms);
-                sub.max_memory_kb = sub.max_memory_kb.max(res.memory_kb);
-                if let Some(entry) = sub.tests.iter_mut().find(|(name, _)| *name == id) {
-                    entry.1 = TestCaseStatus::Done(Box::new(res));
-                }
-                let all_done = sub
-                    .tests
-                    .iter()
-                    .all(|(_, st)| matches!(st, TestCaseStatus::Done(..)));
-                if all_done && matches!(sub.status, SubStatus::Running | SubStatus::Pending) {
-                    let mut agg_verdict = Verdict::Accepted;
-                    let mut total_score = 0.0;
-                    for (_, st) in &sub.tests {
-                        if let TestCaseStatus::Done(r) = st {
-                            agg_verdict = agg_verdict.merge(r.verdict);
-                            total_score += r.score;
+                let mut newly_done_sub = false;
+                {
+                    let sub = &mut self.subs[s_idx];
+                    sub.max_time_ms = sub.max_time_ms.max(res.time_ms);
+                    sub.max_memory_kb = sub.max_memory_kb.max(res.memory_kb);
+                    if let Some(&t_idx) = sub.test_index.get(&id) {
+                        if !matches!(sub.tests[t_idx].1, TestCaseStatus::Done(..)) {
+                            sub.done_tests += 1;
                         }
+                        sub.tests[t_idx].1 = TestCaseStatus::Done(Box::new(res));
                     }
-                    sub.status = SubStatus::Done(agg_verdict, total_score);
-                    if sub.score.is_none() {
-                        sub.score = Some(total_score);
+                    let all_done = sub.done_tests == sub.tests.len();
+                    if all_done && matches!(sub.status, SubStatus::Running | SubStatus::Pending) {
+                        let mut agg_verdict = Verdict::Accepted;
+                        let mut total_score = 0.0;
+                        for (_, st) in &sub.tests {
+                            if let TestCaseStatus::Done(r) = st {
+                                agg_verdict = agg_verdict.merge(r.verdict);
+                                total_score += r.score;
+                            }
+                        }
+                        sub.status = SubStatus::Done(agg_verdict, total_score);
+                        if sub.score.is_none() {
+                            sub.score = Some(total_score);
+                        }
+                        newly_done_sub = true;
                     }
-                    if self
-                        .subs
-                        .iter()
-                        .all(|s| matches!(s.status, SubStatus::Done(..)))
-                    {
+                }
+                if newly_done_sub {
+                    self.done_subs += 1;
+                    if self.done_subs >= self.subs.len() {
                         self.is_completed = true;
                     }
                 }
@@ -219,16 +240,16 @@ impl MultiApp {
                 }
             }
             JudgeEvent::SubmissionDone(report) => {
+                let was_done = matches!(self.subs[s_idx].status, SubStatus::Done(..));
                 let sub = &mut self.subs[s_idx];
                 sub.status = SubStatus::Done(report.verdict, report.score);
                 sub.max_time_ms = sub.max_time_ms.max(report.max_time_ms);
                 sub.max_memory_kb = sub.max_memory_kb.max(report.max_memory_kb);
                 sub.score = Some(report.score);
-                if self
-                    .subs
-                    .iter()
-                    .all(|s| matches!(s.status, SubStatus::Done(..)))
-                {
+                if !was_done {
+                    self.done_subs += 1;
+                }
+                if self.done_subs >= self.subs.len() {
                     self.is_completed = true;
                 }
             }
@@ -238,17 +259,15 @@ impl MultiApp {
                 peak_memory_kb,
                 ..
             } => {
+                let was_done = matches!(self.subs[s_idx].status, SubStatus::Done(..));
                 let sub = &mut self.subs[s_idx];
                 sub.max_memory_kb = sub.max_memory_kb.max(peak_memory_kb);
                 sub.score = Some(final_score);
-                if !matches!(sub.status, SubStatus::Done(..)) {
+                if !was_done {
                     sub.status = SubStatus::Done(final_verdict, final_score);
+                    self.done_subs += 1;
                 }
-                if self
-                    .subs
-                    .iter()
-                    .all(|s| matches!(s.status, SubStatus::Done(..)))
-                {
+                if self.done_subs >= self.subs.len() {
                     self.is_completed = true;
                 }
             }
@@ -278,21 +297,28 @@ pub fn run_multi_tui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = TerminalGuard::enter()?;
 
-    let backend = CrosstermBackend::new(io::stderr());
+    let backend = CrosstermBackend::new(io::BufWriter::with_capacity(64 * 1024, io::stderr()));
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = MultiApp::new(title, subs, slot_count, cpu_cores, cancel);
     let mut exit_time: Option<Instant> = None;
+    let mut dirty = true;
+    let mut last_draw = Instant::now();
 
     loop {
         // Refresh system monitor periodically
-        app.sys_monitor.tick();
+        if app.sys_monitor.tick() {
+            dirty = true;
+        }
 
         // Drain events
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
-                Ok(ev) => app.handle_event(ev),
+                Ok(ev) => {
+                    app.handle_event(ev);
+                    dirty = true;
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -303,88 +329,106 @@ pub fn run_multi_tui(
 
         if (app.is_completed || disconnected) && auto_exit_on_done && exit_time.is_none() {
             exit_time = Some(Instant::now() + Duration::from_millis(600));
+            dirty = true;
         }
 
         if exit_time.is_some_and(|t| Instant::now() >= t) {
             break;
         }
 
-        terminal.draw(|f| {
-            draw_multi_ui(f, &mut app);
-        })?;
+        if last_draw.elapsed() >= Duration::from_millis(250) {
+            dirty = true;
+        }
 
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind == crossterm::event::KeyEventKind::Release {
-                continue;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                app.cancel_token.cancel();
-                break;
-            }
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => {
-                    app.cancel_token.cancel();
-                    break;
+        if dirty {
+            terminal.draw(|f| {
+                draw_multi_ui(f, &mut app);
+            })?;
+            last_draw = Instant::now();
+            dirty = false;
+        }
+
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Resize(_, _) => {
+                    dirty = true;
                 }
-                KeyCode::Esc | KeyCode::Backspace => {
-                    if app.fullscreen_sub_idx.is_some() {
-                        app.fullscreen_sub_idx = None;
-                    } else {
+                Event::Key(key) => {
+                    if key.kind == crossterm::event::KeyEventKind::Release {
+                        continue;
+                    }
+                    dirty = true;
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        app.cancel_token.cancel();
                         break;
                     }
-                }
-                KeyCode::Enter => {
-                    if app.fullscreen_sub_idx.is_some() {
-                        if app
-                            .entered_fullscreen_at
-                            .is_some_and(|t| t.elapsed() > Duration::from_millis(250))
-                        {
-                            app.fullscreen_sub_idx = None;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            app.cancel_token.cancel();
+                            break;
                         }
-                    } else if !app.subs.is_empty() {
-                        app.fullscreen_sub_idx = Some(app.selected_sub_idx);
-                        app.entered_fullscreen_at = Some(Instant::now());
-                        app.selected_test_idx = 0;
-                        app.test_scroll_offset.set(0);
-                    }
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if app.fullscreen_sub_idx.is_some() {
-                        if app.selected_test_idx > 0 {
-                            app.selected_test_idx -= 1;
+                        KeyCode::Esc | KeyCode::Backspace => {
+                            if app.fullscreen_sub_idx.is_some() {
+                                app.fullscreen_sub_idx = None;
+                            } else {
+                                break;
+                            }
                         }
-                    } else if app.selected_sub_idx > 0 {
-                        app.selected_sub_idx -= 1;
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(fs_idx) = app.fullscreen_sub_idx {
-                        let total_t = app.subs[fs_idx].tests.len();
-                        if app.selected_test_idx + 1 < total_t {
-                            app.selected_test_idx += 1;
+                        KeyCode::Enter => {
+                            if app.fullscreen_sub_idx.is_some() {
+                                if app
+                                    .entered_fullscreen_at
+                                    .is_some_and(|t| t.elapsed() > Duration::from_millis(250))
+                                {
+                                    app.fullscreen_sub_idx = None;
+                                }
+                            } else if !app.subs.is_empty() {
+                                app.fullscreen_sub_idx = Some(app.selected_sub_idx);
+                                app.entered_fullscreen_at = Some(Instant::now());
+                                app.selected_test_idx = 0;
+                                app.test_scroll_offset.set(0);
+                            }
                         }
-                    } else if app.selected_sub_idx + 1 < app.subs.len() {
-                        app.selected_sub_idx += 1;
-                    }
-                }
-                KeyCode::PageUp => {
-                    if app.fullscreen_sub_idx.is_some() {
-                        app.selected_test_idx = app.selected_test_idx.saturating_sub(10);
-                    } else {
-                        app.selected_sub_idx = app.selected_sub_idx.saturating_sub(10);
-                    }
-                }
-                KeyCode::PageDown => {
-                    if let Some(fs_idx) = app.fullscreen_sub_idx {
-                        let total_t = app.subs[fs_idx].tests.len();
-                        app.selected_test_idx =
-                            (app.selected_test_idx + 10).min(total_t.saturating_sub(1));
-                    } else {
-                        let total_s = app.subs.len();
-                        app.selected_sub_idx =
-                            (app.selected_sub_idx + 10).min(total_s.saturating_sub(1));
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.fullscreen_sub_idx.is_some() {
+                                if app.selected_test_idx > 0 {
+                                    app.selected_test_idx -= 1;
+                                }
+                            } else if app.selected_sub_idx > 0 {
+                                app.selected_sub_idx -= 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(fs_idx) = app.fullscreen_sub_idx {
+                                let total_t = app.subs[fs_idx].tests.len();
+                                if app.selected_test_idx + 1 < total_t {
+                                    app.selected_test_idx += 1;
+                                }
+                            } else if app.selected_sub_idx + 1 < app.subs.len() {
+                                app.selected_sub_idx += 1;
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            if app.fullscreen_sub_idx.is_some() {
+                                app.selected_test_idx = app.selected_test_idx.saturating_sub(10);
+                            } else {
+                                app.selected_sub_idx = app.selected_sub_idx.saturating_sub(10);
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            if let Some(fs_idx) = app.fullscreen_sub_idx {
+                                let total_t = app.subs[fs_idx].tests.len();
+                                app.selected_test_idx =
+                                    (app.selected_test_idx + 10).min(total_t.saturating_sub(1));
+                            } else {
+                                let total_s = app.subs.len();
+                                app.selected_sub_idx =
+                                    (app.selected_sub_idx + 10).min(total_s.saturating_sub(1));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -465,17 +509,7 @@ fn draw_header(f: &mut Frame, app: &MultiApp, area: Rect) {
     let mins = elapsed / 60;
     let secs = elapsed % 60;
 
-    let done_subs = app
-        .subs
-        .iter()
-        .filter(|s| {
-            matches!(s.status, SubStatus::Done(..))
-                || (!s.tests.is_empty()
-                    && s.tests
-                        .iter()
-                        .all(|(_, st)| matches!(st, TestCaseStatus::Done(..))))
-        })
-        .count();
+    let done_subs = app.done_subs;
     let total_subs = app.subs.len();
 
     let busy_slots = app.slots.iter().filter(|s| s.is_some()).count();
@@ -548,11 +582,7 @@ fn draw_submissions_list(f: &mut Frame, app: &MultiApp, area: Rect) {
         .take(visible_count)
         .map(|(idx, sub)| {
             let total_t = sub.tests.len();
-            let done_t = sub
-                .tests
-                .iter()
-                .filter(|(_, st)| matches!(st, TestCaseStatus::Done(..)))
-                .count();
+            let done_t = sub.done_tests;
 
             let (status_cell, verd_color) = match sub.status {
                 SubStatus::Pending => (
@@ -715,9 +745,9 @@ fn draw_slots_list(f: &mut Frame, app: &MultiApp, area: Rect) {
             let (desc, time_str, color) = match slot_info {
                 Some((sub_id, test_id, start)) => {
                     let sub_name = app
-                        .subs
-                        .iter()
-                        .find(|s| s.meta.id == *sub_id)
+                        .sub_index
+                        .get(sub_id)
+                        .and_then(|&idx| app.subs.get(idx))
                         .map(|s| format!("{}/{}", s.meta.name, s.meta.problem))
                         .unwrap_or_else(|| format!("sub #{sub_id}"));
                     let elapsed = now.duration_since(*start).as_secs_f64();
@@ -762,11 +792,7 @@ fn draw_detail_preview(f: &mut Frame, app: &MultiApp, area: Rect) {
 
     let sub = &app.subs[app.selected_sub_idx];
     let total_t = sub.tests.len();
-    let done_t = sub
-        .tests
-        .iter()
-        .filter(|(_, st)| matches!(st, TestCaseStatus::Done(..)))
-        .count();
+    let done_t = sub.done_tests;
 
     let time_str = format_time_ms(sub.max_time_ms);
     let mem_str = format_memory_kb(sub.max_memory_kb);
@@ -835,11 +861,7 @@ fn draw_fullscreen_header(f: &mut Frame, sub: &SubState, area: Rect) {
         ),
     };
 
-    let done_t = sub
-        .tests
-        .iter()
-        .filter(|(_, st)| matches!(st, TestCaseStatus::Done(..)))
-        .count();
+    let done_t = sub.done_tests;
     let total_t = sub.tests.len();
 
     let mut spans = vec![

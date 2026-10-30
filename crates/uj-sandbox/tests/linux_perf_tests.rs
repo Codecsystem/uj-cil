@@ -296,3 +296,25 @@ fn test_linux_stdout_stderr_capture() {
         assert!(res.killed_by.is_none());
     }
 }
+
+#[test]
+fn test_work_dir_exact_argument_maps_to_box_without_trailing_slash() {
+    let sb = create_sandbox("auto", false).unwrap();
+    if sb.tier() == Tier::None {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancelToken::new();
+    let spec = spec_for(
+        vec![
+            "/bin/echo".into(),
+            "-n".into(),
+            dir.path().as_os_str().to_os_string(),
+        ],
+        dir.path(),
+        false,
+    );
+    let res = sb.run(&spec, &cancel).unwrap();
+    assert!(res.status.is_success());
+    assert_eq!(res.stdout.unwrap().bytes, b"/box");
+}

@@ -86,9 +86,22 @@ pub struct CompileSession {
 }
 
 type FastCompileKey = String;
-type FastCompileValue = CompileResult;
 type PrecheckKey = (PathBuf, Vec<PathBuf>, Vec<PathBuf>);
-type PrecheckValue = (std::time::SystemTime, u64, CompileResult);
+
+#[derive(Clone)]
+enum CachedOutcome {
+    Success(CompileResult),
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct PrecheckEntry {
+    /// `(path, mtime, size)` stamps of the main source, all `extra_sources`, all discovered
+    /// transitive headers/module dependencies, plus optional `problem.toml` / `languages.toml`.
+    stamps: Vec<(PathBuf, std::time::SystemTime, u64)>,
+    recorded_at: std::time::SystemTime,
+    outcome: CachedOutcome,
+}
 
 #[derive(Default)]
 struct CompileSessionInner {
@@ -98,29 +111,29 @@ struct CompileSessionInner {
         std::collections::HashMap<Option<PathBuf>, uj_core::config::LanguagesConfig>,
     >,
     problem_limits: parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, u64, u64)>>,
-    fast_results: parking_lot::Mutex<std::collections::HashMap<FastCompileKey, FastCompileValue>>,
-    mtime_precheck: parking_lot::Mutex<std::collections::HashMap<PrecheckKey, PrecheckValue>>,
+    fast_results: parking_lot::Mutex<std::collections::HashMap<FastCompileKey, CachedOutcome>>,
+    mtime_precheck: parking_lot::Mutex<std::collections::HashMap<PrecheckKey, PrecheckEntry>>,
     inflight: parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>,
 }
 
-fn kill_process_tree(child: &mut std::process::Child) {
+fn kill_process_tree_by_pid(pid: u32) {
     #[cfg(unix)]
     {
         unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
-        let pid = child.id() as i32;
-        if pid > 0 {
+        let p = pid as i32;
+        if p > 0 {
             // Child was spawned with process_group(0), so its pgid equals its pid.
             // Signal -pgid with SIGKILL (9) to terminate all descendants.
             unsafe {
-                let _ = kill(-pid, 9);
+                let _ = kill(-p, 9);
             }
         }
     }
     #[cfg(windows)]
     {
-        let pid_str = child.id().to_string();
+        let pid_str = pid.to_string();
         let _ = Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid_str])
             .stdin(Stdio::null())
@@ -128,8 +141,6 @@ fn kill_process_tree(child: &mut std::process::Child) {
             .stderr(Stdio::null())
             .status();
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn run_command_with_timeout(
@@ -146,13 +157,14 @@ fn run_command_with_timeout(
     }
 
     let mut child = cmd.spawn()?;
-    let start = Instant::now();
+    let pid = child.id();
 
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
 
     let (stdout_tx, stdout_rx) = crossbeam_channel::bounded(1);
     let (stderr_tx, stderr_rx) = crossbeam_channel::bounded(1);
+    let (wait_tx, wait_rx) = crossbeam_channel::bounded(1);
 
     std::thread::spawn(move || {
         use std::io::Read;
@@ -184,25 +196,26 @@ fn run_command_with_timeout(
         let _ = stderr_tx.send(buf);
     });
 
-    let mut timed_out = false;
-    let mut exit_status = None;
+    // Wait directly on the child in a dedicated waiter thread instead of 20ms sleep-polling,
+    // waking up immediately upon compiler exit.
+    std::thread::spawn(move || {
+        let _ = wait_tx.send(child.wait());
+    });
 
-    loop {
-        match child.try_wait()? {
-            Some(st) => {
-                exit_status = Some(st);
-                break;
-            }
-            None => {
-                if start.elapsed() > timeout {
-                    timed_out = true;
-                    kill_process_tree(&mut child);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+    let (timed_out, exit_status) = match wait_rx.recv_timeout(timeout) {
+        Ok(res) => (false, Some(res?)),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            kill_process_tree_by_pid(pid);
+            let _ = wait_rx.recv_timeout(Duration::from_secs(2));
+            (true, None)
         }
-    }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => (
+            false,
+            Err(std::io::Error::other(
+                "Compiler waiter channel disconnected unexpectedly",
+            ))?,
+        ),
+    };
 
     let drain_wait = if timed_out {
         Duration::from_millis(200)
@@ -219,8 +232,11 @@ fn run_command_with_timeout(
         )));
     }
 
-    let status = exit_status.unwrap_or_else(|| child.wait().unwrap());
-    Ok((status, stdout_bytes, stderr_bytes))
+    Ok((
+        exit_status.expect("status present"),
+        stdout_bytes,
+        stderr_bytes,
+    ))
 }
 
 fn scan_directory_recursive(
@@ -263,6 +279,7 @@ fn scan_includes_transitive(
     source_dir: Option<&Path>,
     include_dirs: &[PathBuf],
     out: &mut std::collections::BTreeSet<PathBuf>,
+    saw_macro_include: &mut bool,
     max_depth: usize,
 ) {
     if max_depth == 0 {
@@ -271,15 +288,34 @@ fn scan_includes_transitive(
     let text = String::from_utf8_lossy(initial_bytes);
     for line in text.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with("#include") {
+        let Some(after_hash) = trimmed.strip_prefix('#') else {
             continue;
-        }
-        let rest = trimmed.strip_prefix("#include").unwrap().trim();
-        let target = if rest.starts_with('"') && rest.contains('"') {
+        };
+        let after_hash = after_hash.trim_start();
+        let Some(rest) = after_hash.strip_prefix("include") else {
+            continue;
+        };
+        // Ensure `#include_next` or identifiers starting with `include` aren't misread unless valid
+        let rest = if let Some(r) = rest.strip_prefix("_next") {
+            r.trim_start()
+        } else if rest.is_empty()
+            || rest.starts_with(char::is_whitespace)
+            || rest.starts_with('"')
+            || rest.starts_with('<')
+        {
+            rest.trim_start()
+        } else {
+            continue;
+        };
+
+        let target = if rest.starts_with('"') && rest[1..].contains('"') {
             rest.split('"').nth(1)
         } else if rest.starts_with('<') && rest.contains('>') {
             rest.split(['<', '>']).nth(1)
         } else {
+            if !rest.is_empty() && !rest.starts_with("//") && !rest.starts_with("/*") {
+                *saw_macro_include = true;
+            }
             None
         };
 
@@ -306,9 +342,156 @@ fn scan_includes_transitive(
                 && out.insert(p.clone())
                 && let Ok(content) = fs::read(&p)
             {
-                scan_includes_transitive(&content, p.parent(), include_dirs, out, max_depth - 1);
+                scan_includes_transitive(
+                    &content,
+                    p.parent(),
+                    include_dirs,
+                    out,
+                    saw_macro_include,
+                    max_depth - 1,
+                );
             }
         }
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some((mtime, meta.len()))
+}
+
+fn collect_dependency_stamps(
+    source_path: &Path,
+    extra_sources: &[PathBuf],
+    dep_files: &std::collections::BTreeSet<PathBuf>,
+    problem_dir: Option<&Path>,
+) -> Option<Vec<(PathBuf, std::time::SystemTime, u64)>> {
+    let mut stamps = Vec::with_capacity(2 + extra_sources.len() + dep_files.len());
+    let (src_mtime, src_len) = file_stamp(source_path)?;
+    stamps.push((source_path.to_path_buf(), src_mtime, src_len));
+    for extra in extra_sources {
+        let (m, l) = file_stamp(extra)?;
+        stamps.push((extra.clone(), m, l));
+    }
+    for dep in dep_files {
+        let (m, l) = file_stamp(dep)?;
+        stamps.push((dep.clone(), m, l));
+    }
+    if let Some(pdir) = problem_dir {
+        for cfg_name in ["problem.toml", "languages.toml"] {
+            let cfg_path = pdir.join(cfg_name);
+            if let Some((m, l)) = file_stamp(&cfg_path) {
+                stamps.push((cfg_path, m, l));
+            }
+        }
+    }
+    Some(stamps)
+}
+
+fn stamp_is_racy_safe(exp_m: std::time::SystemTime, recorded_at: std::time::SystemTime) -> bool {
+    let Ok(since_epoch) = exp_m.duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    let margin = if since_epoch.subsec_nanos() == 0 {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(50)
+    };
+    recorded_at.duration_since(exp_m).is_ok_and(|d| d >= margin)
+}
+
+fn stamps_still_valid(
+    stamps: &[(PathBuf, std::time::SystemTime, u64)],
+    recorded_at: std::time::SystemTime,
+) -> bool {
+    stamps.iter().all(|(p, exp_m, exp_l)| {
+        stamp_is_racy_safe(*exp_m, recorded_at)
+            && file_stamp(p).is_some_and(|(m, l)| m == *exp_m && l == *exp_l)
+    })
+}
+
+fn artifact_still_exists(res: &CompileResult) -> bool {
+    if res.is_interpreted
+        && res
+            .binary_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("py"))
+    {
+        return res.binary_path.is_file();
+    }
+    fs::metadata(&res.binary_path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+fn compiler_version_disk_key(bin: &Path) -> Option<String> {
+    let meta = fs::metadata(bin).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("{}|{}|{}", bin.display(), mtime_ns, meta.len()))
+}
+
+fn load_persisted_compiler_version(cache_root: &Path, key: &str) -> Option<String> {
+    let path = cache_root.join("compiler_versions.tsv");
+    let raw = fs::read_to_string(path).ok()?;
+    for line in raw.lines() {
+        if let Some((k, v)) = line.split_once('\t')
+            && k == key
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn save_persisted_compiler_version(cache_root: &Path, key: String, ver: &str) {
+    if key.contains(['\t', '\r', '\n']) || ver.contains(['\r', '\n']) {
+        return;
+    }
+    if fs::create_dir_all(cache_root).is_err() {
+        return;
+    }
+    let path = cache_root.join("compiler_versions.tsv");
+    let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if let Ok(raw) = fs::read_to_string(&path) {
+        for line in raw.lines() {
+            if let Some((k, v)) = line.split_once('\t') {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    if map.get(&key).is_some_and(|v| v == ver) {
+        return;
+    }
+    map.insert(key, ver.to_string());
+    let mut out = String::new();
+    for (k, v) in &map {
+        out.push_str(k);
+        out.push('\t');
+        out.push_str(v);
+        out.push('\n');
+    }
+    let tmp = cache_root.join(format!("compiler_versions.tmp.{}", std::process::id()));
+    if fs::write(&tmp, out.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+fn write_atomic_cache_file(dir: &Path, name: &str, content: &[u8], nonce: u64) {
+    let pid = std::process::id();
+    let tmp = dir.join(format!("{name}.tmp.{pid}.{nonce}"));
+    let dst = dir.join(name);
+    if fs::write(&tmp, content).is_ok() {
+        if fs::rename(&tmp, &dst).is_err() {
+            let _ = fs::copy(&tmp, &dst);
+        }
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -423,20 +606,49 @@ impl CompileSession {
     }
 
     fn resolve_compiler_bin(&self, cmd_name: &str) -> Result<PathBuf, CompileError> {
-        let mut cache = self.inner.compiler_bins.lock();
-        if let Some(res) = cache.get(cmd_name) {
-            return res.clone().map_err(CompileError::CompilerNotFound);
+        {
+            let cache = self.inner.compiler_bins.lock();
+            if let Some(res) = cache.get(cmd_name) {
+                return res.clone().map_err(CompileError::CompilerNotFound);
+            }
         }
-        let res = which::which(cmd_name).map_err(|_| cmd_name.to_string());
-        cache.insert(cmd_name.to_string(), res.clone());
+        // Probe PATH outside the session mutex so parallel compiles do not serialize on `which`.
+        let probed = which::which(cmd_name).map_err(|_| cmd_name.to_string());
+        let mut cache = self.inner.compiler_bins.lock();
+        let res = cache
+            .entry(cmd_name.to_string())
+            .or_insert_with(|| probed)
+            .clone();
         res.map_err(CompileError::CompilerNotFound)
     }
 
-    fn resolve_compiler_version(&self, bin: &Path) -> String {
-        let mut cache = self.inner.compiler_versions.lock();
-        if let Some(ver) = cache.get(bin) {
-            return ver.clone();
+    fn resolve_compiler_version(
+        &self,
+        bin: &Path,
+        cache_root: Option<&Path>,
+        no_cache: bool,
+    ) -> String {
+        {
+            let cache = self.inner.compiler_versions.lock();
+            if let Some(ver) = cache.get(bin) {
+                return ver.clone();
+            }
         }
+
+        let disk_key = if !no_cache {
+            compiler_version_disk_key(bin)
+        } else {
+            None
+        };
+        if let (Some(root), Some(key)) = (cache_root, disk_key.as_deref())
+            && let Some(ver) = load_persisted_compiler_version(root, key)
+        {
+            let mut cache = self.inner.compiler_versions.lock();
+            cache.insert(bin.to_path_buf(), ver.clone());
+            return ver;
+        }
+
+        // Spawn `<compiler> --version` outside the session mutex so parallel compiles don't block.
         let mut cmd = Command::new(bin);
         cmd.arg("--version");
         let version_line = match run_command_with_timeout(cmd, Duration::from_secs(5)) {
@@ -446,17 +658,29 @@ impl CompileSession {
             }
             Err(_) => "unknown".to_string(),
         };
-        cache.insert(bin.to_path_buf(), version_line.clone());
-        version_line
+
+        if let (Some(root), Some(key)) = (cache_root, disk_key)
+            && version_line != "unknown"
+        {
+            save_persisted_compiler_version(root, key, &version_line);
+        }
+
+        let mut cache = self.inner.compiler_versions.lock();
+        cache
+            .entry(bin.to_path_buf())
+            .or_insert(version_line)
+            .clone()
     }
 
     fn resolve_problem_limits(&self, problem_dir: Option<&Path>) -> (u64, u64, u64) {
         let Some(pdir) = problem_dir else {
             return (256, 256, 268435456);
         };
-        let mut cache = self.inner.problem_limits.lock();
-        if let Some(&limits) = cache.get(pdir) {
-            return limits;
+        {
+            let cache = self.inner.problem_limits.lock();
+            if let Some(&limits) = cache.get(pdir) {
+                return limits;
+            }
         }
 
         let mut mem_mb: u64 = 256;
@@ -486,8 +710,32 @@ impl CompileSession {
         }
 
         let res = (mem_mb, stack_mb, stack_bytes);
+        let mut cache = self.inner.problem_limits.lock();
         cache.insert(pdir.to_path_buf(), res);
         res
+    }
+
+    fn record_session_outcome(
+        &self,
+        cache_hash: String,
+        precheck_key: PrecheckKey,
+        stamps: Option<Vec<(PathBuf, std::time::SystemTime, u64)>>,
+        outcome: CachedOutcome,
+    ) {
+        self.inner
+            .fast_results
+            .lock()
+            .insert(cache_hash, outcome.clone());
+        if let Some(stamps) = stamps {
+            self.inner.mtime_precheck.lock().insert(
+                precheck_key,
+                PrecheckEntry {
+                    stamps,
+                    recorded_at: std::time::SystemTime::now(),
+                    outcome,
+                },
+            );
+        }
     }
 
     /// Compile source file with extra source files and include directories using this session's cache.
@@ -499,31 +747,30 @@ impl CompileSession {
         no_cache: bool,
     ) -> Result<CompileResult, CompileError> {
         let start = Instant::now();
+        static COMPILE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-        // Cheap mtime/size precheck before reading source or scanning dependencies
+        let precheck_key = (
+            source_path.to_path_buf(),
+            extra_sources.to_vec(),
+            include_dirs.to_vec(),
+        );
+
+        // Cheap mtime/size precheck across source + extra_sources + headers + config files
         if !no_cache {
-            let key = (
-                source_path.to_path_buf(),
-                extra_sources.to_vec(),
-                include_dirs.to_vec(),
-            );
-            if let Ok(meta) = fs::metadata(source_path)
-                && let Ok(mtime) = meta.modified()
+            let cached_entry = self.inner.mtime_precheck.lock().get(&precheck_key).cloned();
+            if let Some(entry) = cached_entry
+                && stamps_still_valid(&entry.stamps, entry.recorded_at)
             {
-                let size = meta.len();
-                let precheck = self.inner.mtime_precheck.lock();
-                if let Some((cached_mtime, cached_size, cached_res)) = precheck.get(&key)
-                    && *cached_mtime == mtime
-                    && *cached_size == size
-                    && cached_res.binary_path.exists()
-                    && fs::metadata(&cached_res.binary_path)
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false)
-                {
-                    let mut res = cached_res.clone();
-                    res.cached = true;
-                    res.duration_ms = start.elapsed().as_millis() as u64;
-                    return Ok(res);
+                match entry.outcome {
+                    CachedOutcome::Success(mut res) if artifact_still_exists(&res) => {
+                        res.cached = true;
+                        res.duration_ms = start.elapsed().as_millis() as u64;
+                        return Ok(res);
+                    }
+                    CachedOutcome::Failed(err) => {
+                        return Err(CompileError::Failed(err));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -534,6 +781,11 @@ impl CompileSession {
             .ancestors()
             .chain(include_dirs.iter().map(|p| p.as_path()))
             .find(|p| p.join("problem.toml").exists() || p.join(".uj").exists());
+
+        let cache_root_dir = problem_dir
+            .map(|p| p.join(".uj").join("cache"))
+            .unwrap_or_else(|| PathBuf::from(".uj/cache"));
+        let base_cache_dir = cache_root_dir.join("bin");
 
         // 1. Load and merge languages.toml using session cache
         let lang_configs = self.resolve_languages_config(problem_dir);
@@ -546,25 +798,24 @@ impl CompileSession {
             .find_by_extension(ext)
             .ok_or_else(|| CompileError::UnsupportedExtension(ext.to_string()))?;
 
-        // 2. Handle interpreted languages (e.g. Python)
+        // 2. Handle interpreted languages (e.g. Python) with session + disk syntax-check caching
         if ext.eq_ignore_ascii_case("py") {
             let python_bin = self
                 .resolve_compiler_bin("python3")
                 .or_else(|_| self.resolve_compiler_bin("python"))
                 .map_err(|_| CompileError::CompilerNotFound("python3/python".to_string()))?;
 
-            let mut py_cmd = Command::new(&python_bin);
-            py_cmd.arg("-m").arg("py_compile").arg(source_path);
+            let mut py_hasher = blake3::Hasher::new();
+            py_hasher.update(b"python-py-compile-v1:");
+            py_hasher.update(python_bin.to_string_lossy().as_bytes());
+            py_hasher.update(b":");
+            py_hasher.update(&source_bytes);
+            let py_hash = py_hasher.finalize().to_hex().to_string();
+            let empty_deps = std::collections::BTreeSet::new();
+            let stamps =
+                collect_dependency_stamps(source_path, extra_sources, &empty_deps, problem_dir);
 
-            let (status, _stdout, stderr) =
-                run_command_with_timeout(py_cmd, Duration::from_secs(10))?;
-
-            if !status.success() {
-                let err_msg = truncate_10k(&String::from_utf8_lossy(&stderr));
-                return Err(CompileError::Failed(err_msg));
-            }
-
-            return Ok(CompileResult {
+            let build_py_res = |cached: bool, dur: u64| CompileResult {
                 binary_path: source_path.to_path_buf(),
                 is_interpreted: true,
                 interpreter_cmd: Some(vec![
@@ -572,9 +823,83 @@ impl CompileSession {
                     source_path.to_string_lossy().to_string(),
                 ]),
                 compiler_output: String::new(),
-                duration_ms: start.elapsed().as_millis() as u64,
-                cached: false,
-            });
+                duration_ms: dur,
+                cached,
+            };
+
+            if !no_cache {
+                if let Some(outcome) = self.inner.fast_results.lock().get(&py_hash).cloned() {
+                    match outcome {
+                        CachedOutcome::Success(_) => {
+                            let res = build_py_res(true, start.elapsed().as_millis() as u64);
+                            self.record_session_outcome(
+                                py_hash,
+                                precheck_key,
+                                stamps,
+                                CachedOutcome::Success(res.clone()),
+                            );
+                            return Ok(res);
+                        }
+                        CachedOutcome::Failed(err) => {
+                            return Err(CompileError::Failed(err));
+                        }
+                    }
+                }
+                let py_cache_dir = base_cache_dir.join(&py_hash);
+                if py_cache_dir.join("py.ok").is_file() {
+                    let res = build_py_res(true, start.elapsed().as_millis() as u64);
+                    self.record_session_outcome(
+                        py_hash,
+                        precheck_key,
+                        stamps,
+                        CachedOutcome::Success(res.clone()),
+                    );
+                    return Ok(res);
+                }
+                if let Ok(err) = fs::read_to_string(py_cache_dir.join("ce.txt")) {
+                    self.record_session_outcome(
+                        py_hash,
+                        precheck_key,
+                        stamps,
+                        CachedOutcome::Failed(err.clone()),
+                    );
+                    return Err(CompileError::Failed(err));
+                }
+            }
+
+            let mut py_cmd = Command::new(&python_bin);
+            py_cmd.arg("-m").arg("py_compile").arg(source_path);
+
+            let (status, _stdout, stderr) =
+                run_command_with_timeout(py_cmd, Duration::from_secs(10))?;
+
+            let nonce = COMPILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let py_cache_dir = base_cache_dir.join(&py_hash);
+            if !status.success() {
+                let err_msg = truncate_10k(&String::from_utf8_lossy(&stderr));
+                if !no_cache && fs::create_dir_all(&py_cache_dir).is_ok() {
+                    write_atomic_cache_file(&py_cache_dir, "ce.txt", err_msg.as_bytes(), nonce);
+                    self.record_session_outcome(
+                        py_hash,
+                        precheck_key,
+                        stamps,
+                        CachedOutcome::Failed(err_msg.clone()),
+                    );
+                }
+                return Err(CompileError::Failed(err_msg));
+            }
+
+            let res = build_py_res(false, start.elapsed().as_millis() as u64);
+            if !no_cache && fs::create_dir_all(&py_cache_dir).is_ok() {
+                write_atomic_cache_file(&py_cache_dir, "py.ok", b"ok", nonce);
+                self.record_session_outcome(
+                    py_hash,
+                    precheck_key,
+                    stamps,
+                    CachedOutcome::Success(res.clone()),
+                );
+            }
+            return Ok(res);
         }
 
         // 3. Resolve compile command template from lang_cfg
@@ -587,17 +912,46 @@ impl CompileSession {
         let compiler_cmd_name = &compile_template[0];
         let compiler_bin = self.resolve_compiler_bin(compiler_cmd_name)?;
 
-        // Query compiler version using session cache
-        let version_line = self.resolve_compiler_version(&compiler_bin);
+        // Query compiler version using session + persisted cache
+        let version_line = self.resolve_compiler_version(
+            &compiler_bin,
+            if problem_dir.is_some() {
+                Some(cache_root_dir.as_path())
+            } else {
+                None
+            },
+            no_cache,
+        );
 
         // Dynamically resolve memory_mb, stack_mb, and stack_bytes from problem.toml using session cache
         let (mem_mb, stack_mb, stack_bytes) = self.resolve_problem_limits(problem_dir);
 
-        // 4. Compute Blake3 cache key (including source, flags, version, and headers)
+        let uses_placeholder = |needle: &str| -> bool {
+            compile_template.iter().any(|s| s.contains(needle))
+                || lang_cfg.run.iter().any(|s| s.contains(needle))
+                || (cfg!(windows)
+                    && lang_cfg
+                        .compile_windows_extra
+                        .as_ref()
+                        .is_some_and(|v| v.iter().any(|s| s.contains(needle))))
+        };
+
+        // 4. Compute Blake3 cache key (including source, flags, version, and actual dependencies)
         let mut hasher = blake3::Hasher::new();
         hasher.update(lang_id.as_bytes());
         hasher.update(version_line.as_bytes());
-        hasher.update(format!("{mem_mb}:{stack_mb}:{stack_bytes}").as_bytes());
+        if uses_placeholder("{memory_mb}") {
+            hasher.update(b"mem:");
+            hasher.update(mem_mb.to_string().as_bytes());
+        }
+        if uses_placeholder("{stack_mb}") {
+            hasher.update(b"stk_mb:");
+            hasher.update(stack_mb.to_string().as_bytes());
+        }
+        if uses_placeholder("{stack_bytes}") {
+            hasher.update(b"stk_b:");
+            hasher.update(stack_bytes.to_string().as_bytes());
+        }
         for t in compile_template {
             hasher.update(t.as_bytes());
         }
@@ -609,14 +963,17 @@ impl CompileSession {
             }
         }
         hasher.update(&source_bytes);
+        let mut extra_contents: Vec<(&Path, Vec<u8>)> = Vec::with_capacity(extra_sources.len());
         for extra in extra_sources {
             if let Ok(b) = fs::read(extra) {
                 hasher.update(extra.to_string_lossy().as_bytes());
                 hasher.update(&b);
+                extra_contents.push((extra.as_path(), b));
             }
         }
 
-        // Include all dependencies (headers, nested includes, Rust mod, Go imports)
+        // Include dependencies: transitive #include scan for C/C++ (falling back to directory scan
+        // only if a computed macro `#include MACRO` was seen), module tree scan for Rust/Go.
         let mut dep_files = std::collections::BTreeSet::new();
         let header_exts = &["h", "hpp", "hh", "hxx", "h++", "inc", "cuh", "inl", "tpp"];
         let is_cpp_or_c = lang_id.starts_with("cpp") || lang_id.starts_with("c");
@@ -624,20 +981,32 @@ impl CompileSession {
         let is_go = lang_id.starts_with("go");
 
         if is_cpp_or_c {
-            // 1. Transitive #include parsing
+            let mut saw_macro_include = false;
             scan_includes_transitive(
                 &source_bytes,
                 source_path.parent(),
                 include_dirs,
                 &mut dep_files,
-                10,
+                &mut saw_macro_include,
+                12,
             );
-            // 2. Recursive scan of include dirs & source dir for headers
-            if let Some(p) = source_path.parent() {
-                scan_directory_recursive(p, header_exts, 2, &mut dep_files);
+            for (extra_path, extra_bytes) in &extra_contents {
+                scan_includes_transitive(
+                    extra_bytes,
+                    extra_path.parent(),
+                    include_dirs,
+                    &mut dep_files,
+                    &mut saw_macro_include,
+                    12,
+                );
             }
-            for inc in include_dirs {
-                scan_directory_recursive(inc, header_exts, 2, &mut dep_files);
+            if saw_macro_include {
+                if let Some(p) = source_path.parent() {
+                    scan_directory_recursive(p, header_exts, 2, &mut dep_files);
+                }
+                for inc in include_dirs {
+                    scan_directory_recursive(inc, header_exts, 2, &mut dep_files);
+                }
             }
         } else if is_rust {
             if let Some(p) = source_path.parent() {
@@ -652,46 +1021,72 @@ impl CompileSession {
             scan_directory_recursive(p, &["go"], 5, &mut dep_files);
         }
 
-        for dep in dep_files {
-            if let Ok(bytes) = fs::read(&dep) {
+        for dep in &dep_files {
+            if let Ok(bytes) = fs::read(dep) {
                 hasher.update(dep.to_string_lossy().as_bytes());
                 hasher.update(&bytes);
             }
         }
 
+        let stamps = collect_dependency_stamps(source_path, extra_sources, &dep_files, problem_dir);
         let cache_hash = hasher.finalize().to_hex().to_string();
 
+        let is_java = lang_id == "java";
+        let java_class_name = source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Main");
+
         if !no_cache {
-            let fast_cache = self.inner.fast_results.lock();
-            if let Some(cached_res) = fast_cache.get(&cache_hash)
-                && cached_res.binary_path.exists()
-                && fs::metadata(&cached_res.binary_path)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-            {
-                let mut res = cached_res.clone();
-                res.cached = true;
-                res.duration_ms = start.elapsed().as_millis() as u64;
-
-                let key = (
-                    source_path.to_path_buf(),
-                    extra_sources.to_vec(),
-                    include_dirs.to_vec(),
-                );
-                if let Ok(meta) = fs::metadata(source_path)
-                    && let Ok(mtime) = meta.modified()
-                {
-                    let mut precheck = self.inner.mtime_precheck.lock();
-                    precheck.insert(key, (mtime, meta.len(), res.clone()));
+            let fast_hit = self.inner.fast_results.lock().get(&cache_hash).cloned();
+            match fast_hit {
+                Some(CachedOutcome::Success(mut res)) if artifact_still_exists(&res) => {
+                    res.cached = true;
+                    res.duration_ms = start.elapsed().as_millis() as u64;
+                    if is_java {
+                        let cache_dir = base_cache_dir.join(&cache_hash);
+                        res.interpreter_cmd = Some(
+                            lang_cfg
+                                .run
+                                .iter()
+                                .map(|part| {
+                                    part.replace("{dir}", &cache_dir.to_string_lossy())
+                                        .replace("{stack_mb}", &stack_mb.to_string())
+                                        .replace("{memory_mb}", &mem_mb.to_string())
+                                        .replace("{stack_bytes}", &stack_bytes.to_string())
+                                        .replace("Main", java_class_name)
+                                })
+                                .collect(),
+                        );
+                    }
+                    if let Some(stamps) = stamps {
+                        self.inner.mtime_precheck.lock().insert(
+                            precheck_key,
+                            PrecheckEntry {
+                                stamps,
+                                recorded_at: std::time::SystemTime::now(),
+                                outcome: CachedOutcome::Success(res.clone()),
+                            },
+                        );
+                    }
+                    return Ok(res);
                 }
-
-                return Ok(res);
+                Some(CachedOutcome::Failed(err)) => {
+                    if let Some(stamps) = stamps {
+                        self.inner.mtime_precheck.lock().insert(
+                            precheck_key,
+                            PrecheckEntry {
+                                stamps,
+                                recorded_at: std::time::SystemTime::now(),
+                                outcome: CachedOutcome::Failed(err.clone()),
+                            },
+                        );
+                    }
+                    return Err(CompileError::Failed(err));
+                }
+                _ => {}
             }
         }
-
-        let base_cache_dir = problem_dir
-            .map(|p| p.join(".uj").join("cache").join("bin"))
-            .unwrap_or_else(|| PathBuf::from(".uj/cache/bin"));
 
         let hash_lock = if !no_cache {
             let mut inflight = self.inner.inflight.lock();
@@ -705,29 +1100,24 @@ impl CompileSession {
         let _compile_guard = hash_lock.lock();
 
         if !no_cache {
-            let fast_cache = self.inner.fast_results.lock();
-            if let Some(cached_res) = fast_cache.get(&cache_hash)
-                && cached_res.binary_path.exists()
-                && fs::metadata(&cached_res.binary_path)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-            {
-                let mut res = cached_res.clone();
-                res.cached = true;
-                res.duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(res);
+            let fast_hit = self.inner.fast_results.lock().get(&cache_hash).cloned();
+            match fast_hit {
+                Some(CachedOutcome::Success(mut res)) if artifact_still_exists(&res) => {
+                    res.cached = true;
+                    res.duration_ms = start.elapsed().as_millis() as u64;
+                    return Ok(res);
+                }
+                Some(CachedOutcome::Failed(err)) => {
+                    return Err(CompileError::Failed(err));
+                }
+                _ => {}
             }
         }
         let cache_dir = base_cache_dir.join(&cache_hash);
         let exe_ext = if cfg!(windows) { ".exe" } else { "" };
         let cached_bin = cache_dir.join(format!("prog{exe_ext}"));
-
-        let is_java = lang_id == "java";
-        let java_class_name = source_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Main");
         let java_class_file = cache_dir.join(format!("{java_class_name}.class"));
+        let ce_file = cache_dir.join("ce.txt");
 
         let target_artifact = if is_java {
             &java_class_file
@@ -735,56 +1125,56 @@ impl CompileSession {
             &cached_bin
         };
 
-        if !no_cache
-            && target_artifact.exists()
-            && fs::metadata(target_artifact)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        {
-            let interpreter_cmd = if is_java {
-                let mut cmd = Vec::new();
-                for part in &lang_cfg.run {
-                    let replaced = part
-                        .replace("{dir}", &cache_dir.to_string_lossy())
-                        .replace("{stack_mb}", &stack_mb.to_string())
-                        .replace("{memory_mb}", &mem_mb.to_string())
-                        .replace("{stack_bytes}", &stack_bytes.to_string())
-                        .replace("Main", java_class_name);
-                    cmd.push(replaced);
-                }
-                Some(cmd)
-            } else {
-                None
-            };
-            let res = CompileResult {
-                binary_path: target_artifact.clone(),
-                is_interpreted: is_java,
-                interpreter_cmd,
-                compiler_output: String::new(),
-                duration_ms: start.elapsed().as_millis() as u64,
-                cached: true,
-            };
-            let mut fast_cache = self.inner.fast_results.lock();
-            fast_cache.insert(cache_hash, res.clone());
-
-            let key = (
-                source_path.to_path_buf(),
-                extra_sources.to_vec(),
-                include_dirs.to_vec(),
-            );
-            if let Ok(meta) = fs::metadata(source_path)
-                && let Ok(mtime) = meta.modified()
+        if !no_cache {
+            if target_artifact.exists()
+                && fs::metadata(target_artifact)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
             {
-                let mut precheck = self.inner.mtime_precheck.lock();
-                precheck.insert(key, (mtime, meta.len(), res.clone()));
+                let interpreter_cmd = if is_java {
+                    let mut cmd = Vec::new();
+                    for part in &lang_cfg.run {
+                        let replaced = part
+                            .replace("{dir}", &cache_dir.to_string_lossy())
+                            .replace("{stack_mb}", &stack_mb.to_string())
+                            .replace("{memory_mb}", &mem_mb.to_string())
+                            .replace("{stack_bytes}", &stack_bytes.to_string())
+                            .replace("Main", java_class_name);
+                        cmd.push(replaced);
+                    }
+                    Some(cmd)
+                } else {
+                    None
+                };
+                let res = CompileResult {
+                    binary_path: target_artifact.clone(),
+                    is_interpreted: is_java,
+                    interpreter_cmd,
+                    compiler_output: String::new(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    cached: true,
+                };
+                self.record_session_outcome(
+                    cache_hash,
+                    precheck_key,
+                    stamps,
+                    CachedOutcome::Success(res.clone()),
+                );
+                return Ok(res);
             }
-
-            return Ok(res);
+            if let Ok(cached_ce) = fs::read_to_string(&ce_file) {
+                self.record_session_outcome(
+                    cache_hash,
+                    precheck_key,
+                    stamps,
+                    CachedOutcome::Failed(cached_ce.clone()),
+                );
+                return Err(CompileError::Failed(cached_ce));
+            }
         }
 
         fs::create_dir_all(&cache_dir)?;
 
-        static COMPILE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = COMPILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         let tmp_bin = cache_dir.join(format!("prog.tmp.{pid}.{nonce}{exe_ext}"));
@@ -862,8 +1252,20 @@ impl CompileSession {
         if !status.success() {
             cleanup_tmp();
             let truncated = truncate_10k(&combined_output);
+            if !no_cache {
+                write_atomic_cache_file(&cache_dir, "ce.txt", truncated.as_bytes(), nonce);
+                self.record_session_outcome(
+                    cache_hash,
+                    precheck_key,
+                    stamps,
+                    CachedOutcome::Failed(truncated.clone()),
+                );
+            }
             return Err(CompileError::Failed(truncated));
         }
+
+        // Remove any stale CE marker if present
+        let _ = fs::remove_file(&ce_file);
 
         // 7. Verify temporary artifact and atomically promote into cache_dir
         if is_java {
@@ -941,20 +1343,12 @@ impl CompileSession {
         };
 
         if !no_cache {
-            let mut fast_cache = self.inner.fast_results.lock();
-            fast_cache.insert(cache_hash, res.clone());
-
-            let key = (
-                source_path.to_path_buf(),
-                extra_sources.to_vec(),
-                include_dirs.to_vec(),
+            self.record_session_outcome(
+                cache_hash,
+                precheck_key,
+                stamps,
+                CachedOutcome::Success(res.clone()),
             );
-            if let Ok(meta) = fs::metadata(source_path)
-                && let Ok(mtime) = meta.modified()
-            {
-                let mut precheck = self.inner.mtime_precheck.lock();
-                precheck.insert(key, (mtime, meta.len(), res.clone()));
-            }
         }
 
         Ok(res)
@@ -1186,6 +1580,69 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "Timeout handler should return promptly without waiting for 10s sleep"
+        );
+    }
+
+    #[test]
+    fn test_compile_session_header_edit_invalidates_precheck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".uj")).unwrap();
+        let hdr = root.join("val.h");
+        let src = root.join("sol.cpp");
+        fs::write(&hdr, b"#define RET_VAL 0\n").unwrap();
+        fs::write(
+            &src,
+            b"#include \"val.h\"\nint main() { return RET_VAL; }\n",
+        )
+        .unwrap();
+
+        let session = CompileSession::new();
+        if let Ok(res1) = session.compile(&src, false) {
+            // Edit only the included header (new size so stamp changes immediately)
+            fs::write(&hdr, b"#define RET_VAL (0 + 0)\n").unwrap();
+            let res2 = session.compile(&src, false).unwrap();
+            assert_ne!(
+                res1.binary_path, res2.binary_path,
+                "Editing an included header must produce a new cache key even in the same session"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_error_is_cached_on_disk_and_in_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".uj")).unwrap();
+        let src = root.join("bad.cpp");
+        fs::write(&src, b"int main() { this_does_not_compile; }\n").unwrap();
+
+        let session1 = CompileSession::new();
+        let err1 = match session1.compile(&src, false) {
+            Err(CompileError::CompilerNotFound(_)) => return,
+            Err(CompileError::Failed(msg)) => msg,
+            other => panic!("expected CompileError::Failed, got {other:?}"),
+        };
+        assert!(!err1.is_empty());
+
+        // In-session negative hit
+        let err_in_session = match session1.compile(&src, false) {
+            Err(CompileError::Failed(msg)) => msg,
+            other => panic!("expected cached in-session CE, got {other:?}"),
+        };
+        assert_eq!(err1, err_in_session);
+
+        // Fresh-session disk `ce.txt` hit
+        let session2 = CompileSession::new();
+        let t0 = Instant::now();
+        let err_disk = match session2.compile(&src, false) {
+            Err(CompileError::Failed(msg)) => msg,
+            other => panic!("expected disk-cached CE, got {other:?}"),
+        };
+        assert_eq!(err1, err_disk);
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "Disk-cached CE should return without re-invoking compiler"
         );
     }
 }

@@ -15,43 +15,60 @@ struct MonitorSnapshot {
 
 /// Collects a lightweight process-tree snapshot querying only CPU and memory (skipping expensive
 /// per-process exe/cmdline/cwd/environ/disk/open-file queries).
-fn collect_snapshot(sys: &mut sysinfo::System, logical_cores: usize) -> MonitorSnapshot {
+///
+/// When `full_scan` is false and `tracked_pids` is non-empty, only the known `uj` process tree PIDs
+/// are refreshed in the OS instead of enumerating every process on the system.
+fn collect_snapshot(
+    sys: &mut sysinfo::System,
+    logical_cores: usize,
+    tracked_pids: &mut Vec<sysinfo::Pid>,
+    full_scan: bool,
+) -> MonitorSnapshot {
     let refresh_kind = sysinfo::ProcessRefreshKind::nothing()
         .with_cpu()
         .with_memory();
-    sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, refresh_kind);
     let my_pid = sysinfo::get_current_pid().ok();
+
+    if full_scan || tracked_pids.is_empty() {
+        sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, refresh_kind);
+        tracked_pids.clear();
+        if let Some(root_pid) = my_pid {
+            let mut pids = HashSet::new();
+            pids.insert(root_pid);
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (pid, proc) in sys.processes() {
+                    if let Some(parent) = proc.parent()
+                        && pids.contains(&parent)
+                        && pids.insert(*pid)
+                    {
+                        changed = true;
+                    }
+                }
+            }
+            tracked_pids.extend(pids);
+        }
+    } else {
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(tracked_pids.as_slice()),
+            true,
+            refresh_kind,
+        );
+        tracked_pids.retain(|pid| sys.process(*pid).is_some());
+    }
 
     let mut total_cpu = 0.0f32;
     let mut total_mem = 0u64;
     let mut main_mem = 0u64;
-    let mut count = 1;
+    let count = tracked_pids.len().max(1);
 
-    if let Some(my_pid) = my_pid {
-        let mut pids = HashSet::new();
-        pids.insert(my_pid);
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for (pid, proc) in sys.processes() {
-                if let Some(parent) = proc.parent()
-                    && pids.contains(&parent)
-                    && pids.insert(*pid)
-                {
-                    changed = true;
-                }
-            }
-        }
-        count = pids.len();
-
-        for pid in &pids {
-            if let Some(proc) = sys.process(*pid) {
-                total_cpu += proc.cpu_usage();
-                total_mem += proc.memory();
-                if *pid == my_pid {
-                    main_mem = proc.memory();
-                }
+    for pid in tracked_pids.iter() {
+        if let Some(proc) = sys.process(*pid) {
+            total_cpu += proc.cpu_usage();
+            total_mem += proc.memory();
+            if Some(*pid) == my_pid {
+                main_mem = proc.memory();
             }
         }
     }
@@ -93,7 +110,8 @@ impl SystemMonitor {
             .map(|n| n.get())
             .unwrap_or(1)
             .max(1);
-        let initial = collect_snapshot(&mut sys, logical_cores);
+        let mut tracked_pids = Vec::new();
+        let initial = collect_snapshot(&mut sys, logical_cores, &mut tracked_pids, true);
 
         let (snap_tx, snap_rx) = unbounded();
         let (stop_tx, stop_rx) = bounded::<()>(1);
@@ -101,11 +119,20 @@ impl SystemMonitor {
         let _ = std::thread::Builder::new()
             .name("uj-tui-sysmon".to_string())
             .spawn(move || {
+                let mut tick_idx: u64 = 0;
                 loop {
                     match stop_rx.recv_timeout(Duration::from_millis(750)) {
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {
-                            let snap = collect_snapshot(&mut sys, logical_cores);
+                            tick_idx = tick_idx.wrapping_add(1);
+                            // Full child-tree discovery every 3rd tick (~2.25s); targeted PID refresh in between.
+                            let full_scan = tick_idx.is_multiple_of(3);
+                            let snap = collect_snapshot(
+                                &mut sys,
+                                logical_cores,
+                                &mut tracked_pids,
+                                full_scan,
+                            );
                             if snap_tx.send(snap).is_err() {
                                 break;
                             }
@@ -127,15 +154,18 @@ impl SystemMonitor {
     }
 
     /// Drains the latest process-tree stats snapshot produced by the background monitor thread
-    /// without blocking the UI thread.
-    pub fn tick(&mut self) {
+    /// without blocking the UI thread. Returns `true` if new stats arrived.
+    pub fn tick(&mut self) -> bool {
+        let mut updated = false;
         while let Ok(snap) = self.snap_rx.try_recv() {
             self.proc_cpu_raw = snap.proc_cpu_raw;
             self.proc_cpu_norm = snap.proc_cpu_norm;
             self.proc_mem_bytes = snap.proc_mem_bytes;
             self.main_mem_bytes = snap.main_mem_bytes;
             self.proc_count = snap.proc_count;
+            updated = true;
         }
+        updated
     }
 
     /// Format CPU and memory stats for single-line footer display.

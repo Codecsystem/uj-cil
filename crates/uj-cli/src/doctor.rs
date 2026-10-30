@@ -464,7 +464,8 @@ fn run_problem_checks(checks: &mut Vec<DoctorCheckItem>, root: &Path) {
                             }
                         }
                     }
-                    let to_hash: Vec<usize> = (0..discovered.len()).filter(|&i| need_hash[i]).collect();
+                    let to_hash: Vec<usize> =
+                        (0..discovered.len()).filter(|&i| need_hash[i]).collect();
                     let hashes = hash_inputs_parallel(&discovered, &to_hash, &input_cache);
                     if root.join(".uj").is_dir() {
                         input_cache.save();

@@ -16,7 +16,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table},
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io,
     time::{Duration, Instant},
 };
@@ -53,7 +53,9 @@ pub struct TuiApp {
     pub problem_name: String,
     pub submission_name: String,
     pub total_tests: usize,
+    pub done_tests: usize,
     pub test_entries: Vec<(String, TestCaseStatus)>,
+    test_index: HashMap<String, usize>,
     pub slots: Vec<SlotInfo>,
     pub subtasks: BTreeMap<u32, SubtaskResult>,
     pub logs: VecDeque<String>,
@@ -74,9 +76,14 @@ impl TuiApp {
         slot_count: usize,
         cancel_token: CancelToken,
     ) -> Self {
+        let mut test_index = HashMap::with_capacity(test_names.len());
         let test_entries = test_names
             .iter()
-            .map(|name| (name.clone(), TestCaseStatus::Pending))
+            .enumerate()
+            .map(|(i, name)| {
+                test_index.insert(name.clone(), i);
+                (name.clone(), TestCaseStatus::Pending)
+            })
             .collect();
 
         let slots = (0..slot_count.max(1))
@@ -93,7 +100,9 @@ impl TuiApp {
             problem_name: problem_name.to_string(),
             submission_name: submission_name.to_string(),
             total_tests: test_names.len(),
+            done_tests: 0,
             test_entries,
+            test_index,
             slots,
             subtasks: BTreeMap::new(),
             logs,
@@ -128,8 +137,11 @@ impl TuiApp {
                 }
             }
             JudgeEvent::TestStart { id, slot, .. } => {
-                if let Some(entry) = self.test_entries.iter_mut().find(|(name, _)| *name == id) {
-                    entry.1 = TestCaseStatus::Running;
+                if let Some(&idx) = self.test_index.get(&id) {
+                    if matches!(self.test_entries[idx].1, TestCaseStatus::Done(_)) {
+                        self.done_tests = self.done_tests.saturating_sub(1);
+                    }
+                    self.test_entries[idx].1 = TestCaseStatus::Running;
                 }
                 if let Some(s) = slot.filter(|&s| s < self.slots.len()) {
                     self.slots[s].active_test = Some(id.clone());
@@ -150,8 +162,11 @@ impl TuiApp {
 
                 let mem_kb = res.memory_kb;
 
-                if let Some(entry) = self.test_entries.iter_mut().find(|(name, _)| *name == id) {
-                    entry.1 = TestCaseStatus::Done(Box::new(res));
+                if let Some(&idx) = self.test_index.get(&id) {
+                    if !matches!(self.test_entries[idx].1, TestCaseStatus::Done(_)) {
+                        self.done_tests += 1;
+                    }
+                    self.test_entries[idx].1 = TestCaseStatus::Done(Box::new(res));
                 }
                 // Free slot
                 for slot in &mut self.slots {
@@ -282,7 +297,7 @@ pub fn run_tui(
     // Setup terminal (returns Err immediately if stderr is not a TTY; guard created right after enable_raw_mode)
     let _guard = TerminalGuard::enter()?;
 
-    let backend = CrosstermBackend::new(io::stderr());
+    let backend = CrosstermBackend::new(io::BufWriter::with_capacity(64 * 1024, io::stderr()));
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = TuiApp::new(
@@ -295,6 +310,8 @@ pub fn run_tui(
 
     let mut completion_time: Option<Instant> = None;
     let mut all_done_time: Option<Instant> = None;
+    let mut dirty = true;
+    let mut last_draw = Instant::now();
 
     loop {
         // Drain pending events
@@ -304,6 +321,7 @@ pub fn run_tui(
                 Ok(ev) => {
                     all_done_time = None;
                     app.handle_event(ev);
+                    dirty = true;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -313,35 +331,44 @@ pub fn run_tui(
             }
         }
 
-        if disconnected {
+        if disconnected && !app.is_completed {
             app.is_completed = true;
             for slot in &mut app.slots {
                 slot.active_test = None;
             }
+            dirty = true;
         }
 
         // If all tests are done and all slots are idle, but SubmissionDone didn't arrive,
         // mark completed after 800ms
         if !app.is_completed
-            && app
-                .test_entries
-                .iter()
-                .all(|(_, st)| matches!(st, TestCaseStatus::Done(_)))
+            && app.done_tests == app.total_tests
             && app.slots.iter().all(|s| s.active_test.is_none())
         {
             let t = all_done_time.get_or_insert_with(Instant::now);
             if t.elapsed() >= Duration::from_millis(800) {
                 app.is_completed = true;
+                dirty = true;
             }
         } else if !app.slots.iter().all(|s| s.active_test.is_none()) {
             all_done_time = None;
         }
 
         // Tick system monitor
-        app.sys_monitor.tick();
+        if app.sys_monitor.tick() {
+            dirty = true;
+        }
 
-        // Draw UI
-        terminal.draw(|f| draw_ui(f, &app))?;
+        if last_draw.elapsed() >= Duration::from_millis(250) {
+            dirty = true;
+        }
+
+        // Draw UI only when state, resize, or 250ms clock tick changed
+        if dirty {
+            terminal.draw(|f| draw_ui(f, &app))?;
+            last_draw = Instant::now();
+            dirty = false;
+        }
 
         if app.is_completed && completion_time.is_none() {
             completion_time = Some(Instant::now());
@@ -355,52 +382,53 @@ pub fn run_tui(
         }
 
         // Handle user input
-        if event::poll(Duration::from_millis(40))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind == crossterm::event::KeyEventKind::Release {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    app.cancel_token.cancel();
-                    break;
+        if event::poll(Duration::from_millis(40))? {
+            match event::read()? {
+                Event::Resize(_, _) => {
+                    dirty = true;
                 }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.cancel_token.cancel();
-                    break;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if app.selected_idx > 0 {
-                        app.selected_idx -= 1;
+                Event::Key(key) => {
+                    if key.kind == crossterm::event::KeyEventKind::Release {
+                        continue;
                     }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if app.selected_idx + 1 < app.test_entries.len() {
-                        app.selected_idx += 1;
+                    dirty = true;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            app.cancel_token.cancel();
+                            break;
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.cancel_token.cancel();
+                            break;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.selected_idx > 0 {
+                                app.selected_idx -= 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if app.selected_idx + 1 < app.test_entries.len() {
+                                app.selected_idx += 1;
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            app.selected_idx = app.selected_idx.saturating_sub(15);
+                        }
+                        KeyCode::PageDown => {
+                            app.selected_idx = (app.selected_idx + 15)
+                                .min(app.test_entries.len().saturating_sub(1));
+                        }
+                        KeyCode::Home | KeyCode::Char('g') => {
+                            app.selected_idx = 0;
+                        }
+                        KeyCode::End | KeyCode::Char('G') => {
+                            app.selected_idx = app.test_entries.len().saturating_sub(1);
+                        }
+                        KeyCode::Enter if app.is_completed || app.done_tests == app.total_tests => {
+                            break;
+                        }
+                        _ => {}
                     }
-                }
-                KeyCode::PageUp => {
-                    app.selected_idx = app.selected_idx.saturating_sub(15);
-                }
-                KeyCode::PageDown => {
-                    app.selected_idx =
-                        (app.selected_idx + 15).min(app.test_entries.len().saturating_sub(1));
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    app.selected_idx = 0;
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    app.selected_idx = app.test_entries.len().saturating_sub(1);
-                }
-                KeyCode::Enter
-                    if app.is_completed
-                        || app
-                            .test_entries
-                            .iter()
-                            .all(|(_, st)| matches!(st, TestCaseStatus::Done(_))) =>
-                {
-                    break;
                 }
                 _ => {}
             }
@@ -489,11 +517,7 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
             )
         }
     } else {
-        let done_count = app
-            .test_entries
-            .iter()
-            .filter(|(_, st)| matches!(st, TestCaseStatus::Done(_)))
-            .count();
+        let done_count = app.done_tests;
         if done_count == app.total_tests && app.slots.iter().any(|s| s.active_test.is_some()) {
             Span::styled(
                 "PRECISE REJUDGING",

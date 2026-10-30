@@ -9,7 +9,8 @@ use uj_sandbox::{CancelToken, create_sandbox};
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     static CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("uj_r14_{tag}_{}_{n}", std::process::id()));
+    let d = uj_sandbox::get_sandbox_scratch_dir()
+        .join(format!("uj_r14_{tag}_{}_{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -56,7 +57,7 @@ fn bench_acl_grant_revoke() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Micro benchmark: average wall overhead of a trivial run under the Full tier.
+/// Micro benchmark: average wall overhead of a trivial native binary under the Full tier.
 #[test]
 #[ignore]
 fn bench_trivial_run_overhead() {
@@ -64,34 +65,56 @@ fn bench_trivial_run_overhead() {
         Ok(s) => s,
         Err(_) => return,
     };
-    let base = unique_dir("bench_run");
+    let base = std::env::current_dir()
+        .unwrap()
+        .join(".uj")
+        .join("tmp")
+        .join(format!("r14_bench_run_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let box_dir = sandbox.create_box_dir(&base).unwrap();
+    let rs_path = base.join("noop.rs");
+    let exe_path = box_dir.join("noop.exe");
+    std::fs::write(&rs_path, b"fn main() {}\n").unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .arg(&rs_path)
+        .arg("-O")
+        .arg("-o")
+        .arg(&exe_path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !compiled {
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+    sandbox.authorize_executable(&exe_path).unwrap();
+    let spec = RunSpec {
+        argv: vec![exe_path.into_os_string()],
+        env: vec![],
+        work_dir: box_dir,
+        ro_binds: vec![],
+        stdin: Stdio::Null,
+        stdout: Stdio::Pipe,
+        stderr: Stdio::Pipe,
+        extra_fds: vec![],
+        limits: Limits::new(5000, 256 * 1024 * 1024),
+        cpu_affinity: None,
+        seccomp_profile: Default::default(),
+        trusted: false,
+    };
+    // Warmup run (absorbs Windows Defender first-launch scan)
+    let warm = sandbox.run(&spec, &CancelToken::new()).unwrap();
+    assert!(warm.status.is_success());
+
     let iters = 30u32;
     let t = std::time::Instant::now();
     for _ in 0..iters {
-        let box_dir = sandbox.create_box_dir(&base).unwrap();
-        let spec = RunSpec {
-            argv: vec![
-                OsString::from("cmd.exe"),
-                OsString::from("/c"),
-                OsString::from("exit 0"),
-            ],
-            env: vec![],
-            work_dir: box_dir,
-            ro_binds: vec![],
-            stdin: Stdio::Null,
-            stdout: Stdio::Pipe,
-            stderr: Stdio::Pipe,
-            extra_fds: vec![],
-            limits: Limits::new(5000, 256 * 1024 * 1024),
-            cpu_affinity: None,
-            seccomp_profile: Default::default(),
-            trusted: false,
-        };
         let res = sandbox.run(&spec, &CancelToken::new()).unwrap();
         assert!(res.status.is_success());
     }
     println!(
-        "create_box_dir + trivial run avg = {:.3} ms",
+        "Windows Full AppContainer trivial run avg ({iters} iters) = {:.3} ms",
         t.elapsed().as_secs_f64() * 1000.0 / iters as f64
     );
     drop(sandbox);

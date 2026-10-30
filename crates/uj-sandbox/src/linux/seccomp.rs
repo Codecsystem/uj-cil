@@ -532,7 +532,11 @@ mod tests {
     fn test_prebuilt_filter_is_cached_and_matches_fresh_build() {
         let a = prebuilt_filter().expect("supported arch");
         let b = prebuilt_filter().expect("supported arch");
-        assert_eq!(a.as_ptr(), b.as_ptr(), "filter must be built once and cached");
+        assert_eq!(
+            a.as_ptr(),
+            b.as_ptr(),
+            "filter must be built once and cached"
+        );
         assert_eq!(a, build_host_filter().as_slice());
     }
 

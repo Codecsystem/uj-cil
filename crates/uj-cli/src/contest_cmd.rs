@@ -180,6 +180,27 @@ pub fn run_contest(
     format: OutputFormat,
     cancel: &CancelToken,
 ) -> ExitCode {
+    let compile_session = uj_engine::compiler::CompileSession::new();
+    run_contest_with_session(
+        contest_dir,
+        problem_filter,
+        contestant_filter,
+        cli,
+        format,
+        cancel,
+        &compile_session,
+    )
+}
+
+pub fn run_contest_with_session(
+    contest_dir: &Path,
+    problem_filter: &[String],
+    contestant_filter: &[String],
+    cli: &Cli,
+    format: OutputFormat,
+    cancel: &CancelToken,
+    compile_session: &uj_engine::compiler::CompileSession,
+) -> ExitCode {
     if !contest_dir.exists() {
         emit_error(
             format,
@@ -236,7 +257,7 @@ pub fn run_contest(
 
     let sandbox_mode_str = cli.sandbox_mode_str();
 
-    let compile_session = uj_engine::compiler::CompileSession::new();
+    let compile_session = compile_session.clone();
     let mut all_reports: Vec<SubmissionJudgeReport> = Vec::new();
     let mut standings_map: HashMap<String, ContestantStanding> = HashMap::new();
 
@@ -317,10 +338,157 @@ pub fn run_contest(
     let trace_phases = std::env::var("UJ_TRACE_PHASES")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let phase_a_start = Instant::now();
-    let compile_threads = (Topology::detect(0, None).logical_cores / 2).clamp(1, 8);
+    let pipeline_start = Instant::now();
+
+    let topology = Topology::detect(0, cli.jobs);
+    let slots = topology.slots.len().max(1);
+    let slot_cpus: Vec<Option<usize>> = topology.slots.iter().map(|s| s.cpu_core).collect();
+    // Prefer non-slot / spare logical cores (E-cores / SMT siblings) for concurrent compilation
+    // while `JudgePool::run_streaming` executes ready submissions on P-core judge slots.
+    let spare_cores = topology.logical_cores.saturating_sub(slots);
+    let compile_threads = if spare_cores >= 1 {
+        spare_cores.clamp(1, 8)
+    } else {
+        (topology.logical_cores / 2).clamp(1, 4)
+    };
+
+    let total_submissions_count = candidates.len();
+    let completed_submissions_count = Arc::new(AtomicUsize::new(0));
+    let estimated_total_tests: usize = candidates
+        .iter()
+        .map(|c| problems.get(c.prob_idx).map(|p| p.tests.len()).unwrap_or(0))
+        .sum();
+
+    let use_tui = cli.tui && format == OutputFormat::Human && std::io::stderr().is_terminal();
+
+    let (pool_event_tx, pool_event_rx) = unbounded::<PoolEvent>();
+    let pool_events_opt =
+        if use_tui || format == OutputFormat::Ndjson || format == OutputFormat::Human {
+            Some(pool_event_tx.clone())
+        } else {
+            None
+        };
+
+    let pb = if format == OutputFormat::Human && !use_tui {
+        let p = indicatif::ProgressBar::new(estimated_total_tests as u64);
+        p.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        p.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tests ({eta})")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        Some(p)
+    } else {
+        None
+    };
+
+    let listener_handle = if format == OutputFormat::Human && !use_tui {
+        let pb = pb.clone();
+        let completed_counter = Arc::clone(&completed_submissions_count);
+        let rx = pool_event_rx.clone();
+        Some(std::thread::spawn(move || {
+            while let Ok(pe) = rx.recv() {
+                match pe.inner {
+                    JudgeEvent::TestDone(_) => {
+                        if let Some(ref p) = pb {
+                            p.inc(1);
+                        }
+                    }
+                    JudgeEvent::SubmissionDone(ref report) => {
+                        let done = completed_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let msg = format!(
+                            "[{done}/{total_submissions_count}] {} -> {} {:.1}",
+                            pe.submission.name, report.verdict, report.score
+                        );
+                        if let Some(ref p) = pb {
+                            p.println(msg);
+                        } else {
+                            println!("{msg}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let ndjson_handle = if format == OutputFormat::Ndjson {
+        let rx = pool_event_rx.clone();
+        Some(std::thread::spawn(move || {
+            use std::io::Write;
+            let mut out = std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout());
+            while let Ok(ev) = rx.recv() {
+                if serde_json::to_writer(&mut out, &ev).is_ok() {
+                    let _ = out.write_all(b"\n");
+                }
+                if rx.is_empty() {
+                    let _ = out.flush();
+                }
+            }
+            let _ = out.flush();
+        }))
+    } else {
+        None
+    };
+
+    let tui_handle = if use_tui {
+        let sub_metas: Vec<SubmissionMeta> = candidates
+            .iter()
+            .map(|cand| {
+                let test_names = if cand.prob_idx < problems.len() {
+                    problems[cand.prob_idx]
+                        .tests
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect()
+                } else {
+                    vec![]
+                };
+                SubmissionMeta {
+                    id: cand.sub_id,
+                    problem: cand.prob_name.clone(),
+                    name: cand.player.clone(),
+                    test_names,
+                }
+            })
+            .collect();
+        let title = format!(
+            "Contest: {}",
+            contest_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        let cancel_tui = cancel.clone();
+        let rx = pool_event_rx.clone();
+        Some(std::thread::spawn(move || {
+            if let Err(e) = run_multi_tui(
+                &title,
+                &sub_metas,
+                slots,
+                slot_cpus,
+                rx.clone(),
+                cancel_tui,
+                true,
+            ) {
+                eprintln!(
+                    "Warning: Contest TUI initialization failed ({e}); falling back to non-TUI execution."
+                );
+                while rx.recv().is_ok() {}
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Stream compilations directly into `JudgePool::run_streaming` so judge slots begin executing
+    // tests as soon as the first submission finishes compiling instead of waiting on a full barrier.
     let (cand_tx, cand_rx) = unbounded::<SubCandidate>();
     let (prep_tx, prep_rx) = unbounded::<PreparedCandidate>();
+    let (stream_tx, stream_rx) = unbounded::<PoolSubmission>();
 
     let mut compile_workers = Vec::with_capacity(compile_threads);
     for _ in 0..compile_threads {
@@ -447,256 +615,125 @@ pub fn run_contest(
     }
     drop(cand_tx);
 
-    let mut prepared_list = Vec::new();
-    while let Ok(prep) = prep_rx.recv() {
-        prepared_list.push(prep);
-    }
-    for h in compile_workers {
-        let _ = h.join();
-    }
-    if trace_phases {
-        eprintln!(
-            "[TRACE] Phase A (Compile): {} ms",
-            phase_a_start.elapsed().as_millis()
-        );
-    }
+    let router_handle = {
+        let pb_router = pb.clone();
+        let completed_router = Arc::clone(&completed_submissions_count);
+        let router_events = pool_events_opt.clone();
+        let prob_test_counts: Vec<usize> = problems.iter().map(|p| p.tests.len()).collect();
+        let cand_prob_idxs: Vec<usize> = candidates.iter().map(|c| c.prob_idx).collect();
+        let is_human_no_tui = format == OutputFormat::Human && !use_tui;
+        let emit_non_ready_events = use_tui || format == OutputFormat::Ndjson;
 
-    if cancel.is_cancelled() {
-        return emit_interrupted(format, "Contest judging");
-    }
-
-    prepared_list.sort_by_key(|p| match p {
-        PreparedCandidate::Ready(id, ..) => *id,
-        PreparedCandidate::CompileError(id, ..) => *id,
-        PreparedCandidate::Failed(id, ..) => *id,
-    });
-
-    let total_submissions_count = prepared_list.len();
-    let completed_submissions_count = Arc::new(AtomicUsize::new(0));
-
-    let total_test_points: usize = prepared_list
-        .iter()
-        .map(|p| match p {
-            PreparedCandidate::Ready(_, _, _, sub) => sub.ctx.tests.len(),
-            _ => 0,
+        std::thread::spawn(move || {
+            let mut early_reports: HashMap<usize, SubmissionJudgeReport> = HashMap::new();
+            let mut current_len = estimated_total_tests as u64;
+            while let Ok(item) = prep_rx.recv() {
+                match item {
+                    PreparedCandidate::Ready(_sub_id, _player, _prob_name, mut pool_sub) => {
+                        pool_sub.events = None;
+                        let _ = stream_tx.send(pool_sub);
+                    }
+                    PreparedCandidate::CompileError(sub_id, player, prob_name, ce_report) => {
+                        let skipped = cand_prob_idxs
+                            .get(sub_id)
+                            .and_then(|&pi| prob_test_counts.get(pi))
+                            .copied()
+                            .unwrap_or(0) as u64;
+                        if skipped > 0
+                            && let Some(ref p) = pb_router
+                        {
+                            current_len = current_len.saturating_sub(skipped);
+                            p.set_length(current_len);
+                        }
+                        if is_human_no_tui {
+                            let done = completed_router.fetch_add(1, Ordering::SeqCst) + 1;
+                            let msg = format!(
+                                "[{done}/{total_submissions_count}] {player} / {prob_name} -> CE 0.0"
+                            );
+                            if let Some(ref p) = pb_router {
+                                p.println(msg);
+                            } else {
+                                println!("{msg}");
+                            }
+                        }
+                        if emit_non_ready_events && let Some(ref ptx) = router_events {
+                            let err_output =
+                                ce_report.tests.first().and_then(|t| t.message.clone());
+                            let _ = ptx.send(PoolEvent {
+                                submission: SubmissionRef {
+                                    id: sub_id,
+                                    problem: prob_name.clone(),
+                                    name: player.clone(),
+                                },
+                                inner: JudgeEvent::CompileDone {
+                                    target: format!("{player}/{prob_name}"),
+                                    success: false,
+                                    duration_ms: 0,
+                                    error_output: err_output,
+                                },
+                            });
+                            let _ = ptx.send(PoolEvent {
+                                submission: SubmissionRef {
+                                    id: sub_id,
+                                    problem: prob_name.clone(),
+                                    name: player.clone(),
+                                },
+                                inner: JudgeEvent::SubmissionDone(ce_report.clone()),
+                            });
+                        }
+                        early_reports.insert(sub_id, ce_report);
+                    }
+                    PreparedCandidate::Failed(sub_id, player, prob_name, err) => {
+                        let skipped = cand_prob_idxs
+                            .get(sub_id)
+                            .and_then(|&pi| prob_test_counts.get(pi))
+                            .copied()
+                            .unwrap_or(0) as u64;
+                        if skipped > 0
+                            && let Some(ref p) = pb_router
+                        {
+                            current_len = current_len.saturating_sub(skipped);
+                            p.set_length(current_len);
+                        }
+                        if is_human_no_tui {
+                            let done = completed_router.fetch_add(1, Ordering::SeqCst) + 1;
+                            let msg = format!(
+                                "[{done}/{total_submissions_count}] {player} / {prob_name} -> JudgeFailed ({err})"
+                            );
+                            if let Some(ref p) = pb_router {
+                                p.println(msg);
+                            } else {
+                                println!("{msg}");
+                            }
+                        }
+                        let fail_report = SubmissionJudgeReport {
+                            schema_version: 1,
+                            problem: prob_name.clone(),
+                            submission: format!("{player} - {prob_name}"),
+                            verdict: Verdict::JudgeFailed,
+                            score: 0.0,
+                            max_time_ms: 0,
+                            max_memory_kb: 0,
+                            subtasks: vec![],
+                            tests: vec![],
+                        };
+                        if emit_non_ready_events && let Some(ref ptx) = router_events {
+                            let _ = ptx.send(PoolEvent {
+                                submission: SubmissionRef {
+                                    id: sub_id,
+                                    problem: prob_name.clone(),
+                                    name: player.clone(),
+                                },
+                                inner: JudgeEvent::SubmissionDone(fail_report.clone()),
+                            });
+                        }
+                        early_reports.insert(sub_id, fail_report);
+                    }
+                }
+            }
+            drop(stream_tx);
+            early_reports
         })
-        .sum();
-
-    let use_tui = cli.tui && format == OutputFormat::Human && std::io::stderr().is_terminal();
-
-    let (pool_event_tx, pool_event_rx) = unbounded::<PoolEvent>();
-    let pool_events_opt =
-        if use_tui || format == OutputFormat::Ndjson || format == OutputFormat::Human {
-            Some(pool_event_tx.clone())
-        } else {
-            None
-        };
-
-    let pb = if format == OutputFormat::Human && !use_tui {
-        let p = indicatif::ProgressBar::new(total_test_points as u64);
-        p.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-        p.set_style(
-            indicatif::ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tests ({eta})")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        Some(p)
-    } else {
-        None
-    };
-
-    let listener_handle = if format == OutputFormat::Human && !use_tui {
-        let pb = pb.clone();
-        let completed_counter = Arc::clone(&completed_submissions_count);
-        let rx = pool_event_rx.clone();
-        Some(std::thread::spawn(move || {
-            while let Ok(pe) = rx.recv() {
-                match pe.inner {
-                    JudgeEvent::TestDone(_) => {
-                        if let Some(ref p) = pb {
-                            p.inc(1);
-                        }
-                    }
-                    JudgeEvent::SubmissionDone(ref report) => {
-                        let done = completed_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        let msg = format!(
-                            "[{done}/{total_submissions_count}] {} -> {} {:.1}",
-                            pe.submission.name, report.verdict, report.score
-                        );
-                        if let Some(ref p) = pb {
-                            p.println(msg);
-                        } else {
-                            println!("{msg}");
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }))
-    } else {
-        None
-    };
-
-    let ndjson_handle = if format == OutputFormat::Ndjson {
-        let rx = pool_event_rx.clone();
-        Some(std::thread::spawn(move || {
-            for ev in rx {
-                if let Ok(line) = serde_json::to_string(&ev) {
-                    println!("{line}");
-                }
-            }
-        }))
-    } else {
-        None
-    };
-
-    let mut final_reports: HashMap<usize, SubmissionJudgeReport> = HashMap::new();
-    let mut pool_submissions = Vec::new();
-    let mut pool_sub_meta = Vec::new();
-
-    for item in prepared_list {
-        match item {
-            PreparedCandidate::CompileError(sub_id, player, prob_name, ce_report) => {
-                let done = completed_submissions_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if format == OutputFormat::Human && !use_tui {
-                    let msg = format!(
-                        "[{done}/{total_submissions_count}] {player} / {prob_name} -> CE 0.0"
-                    );
-                    if let Some(ref p) = pb {
-                        p.println(msg);
-                    } else {
-                        println!("{msg}");
-                    }
-                }
-                if (use_tui || format == OutputFormat::Ndjson)
-                    && let Some(ref ptx) = pool_events_opt
-                {
-                    let err_output = ce_report.tests.first().and_then(|t| t.message.clone());
-                    let _ = ptx.send(PoolEvent {
-                        submission: SubmissionRef {
-                            id: sub_id,
-                            problem: prob_name.clone(),
-                            name: player.clone(),
-                        },
-                        inner: JudgeEvent::CompileDone {
-                            target: format!("{player}/{prob_name}"),
-                            success: false,
-                            duration_ms: 0,
-                            error_output: err_output,
-                        },
-                    });
-                    let _ = ptx.send(PoolEvent {
-                        submission: SubmissionRef {
-                            id: sub_id,
-                            problem: prob_name.clone(),
-                            name: player.clone(),
-                        },
-                        inner: JudgeEvent::SubmissionDone(ce_report.clone()),
-                    });
-                }
-                final_reports.insert(sub_id, ce_report);
-            }
-            PreparedCandidate::Failed(sub_id, player, prob_name, err) => {
-                let done = completed_submissions_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if format == OutputFormat::Human && !use_tui {
-                    let msg = format!(
-                        "[{done}/{total_submissions_count}] {player} / {prob_name} -> JudgeFailed ({err})"
-                    );
-                    if let Some(ref p) = pb {
-                        p.println(msg);
-                    } else {
-                        println!("{msg}");
-                    }
-                }
-                let fail_report = SubmissionJudgeReport {
-                    schema_version: 1,
-                    problem: prob_name.clone(),
-                    submission: format!("{player} - {prob_name}"),
-                    verdict: Verdict::JudgeFailed,
-                    score: 0.0,
-                    max_time_ms: 0,
-                    max_memory_kb: 0,
-                    subtasks: vec![],
-                    tests: vec![],
-                };
-                if (use_tui || format == OutputFormat::Ndjson)
-                    && let Some(ref ptx) = pool_events_opt
-                {
-                    let _ = ptx.send(PoolEvent {
-                        submission: SubmissionRef {
-                            id: sub_id,
-                            problem: prob_name.clone(),
-                            name: player.clone(),
-                        },
-                        inner: JudgeEvent::SubmissionDone(fail_report.clone()),
-                    });
-                }
-                final_reports.insert(sub_id, fail_report);
-            }
-            PreparedCandidate::Ready(sub_id, player, prob_name, mut pool_sub) => {
-                pool_sub.events = None;
-                pool_submissions.push(pool_sub);
-                pool_sub_meta.push((sub_id, player, prob_name));
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Phase B / C: JudgePool Evaluation and Precise Rejudging
-    // -------------------------------------------------------------------------
-    let topology = Topology::detect(0, cli.jobs);
-    let slots = topology.slots.len().max(1);
-    let slot_cpus: Vec<Option<usize>> = topology.slots.iter().map(|s| s.cpu_core).collect();
-
-    let tui_handle = if use_tui {
-        let sub_metas: Vec<SubmissionMeta> = candidates
-            .iter()
-            .map(|cand| {
-                let test_names = if cand.prob_idx < problems.len() {
-                    problems[cand.prob_idx]
-                        .tests
-                        .iter()
-                        .map(|t| t.name.clone())
-                        .collect()
-                } else {
-                    vec![]
-                };
-                SubmissionMeta {
-                    id: cand.sub_id,
-                    problem: cand.prob_name.clone(),
-                    name: cand.player.clone(),
-                    test_names,
-                }
-            })
-            .collect();
-        let title = format!(
-            "Contest: {}",
-            contest_dir
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
-        let cancel_tui = cancel.clone();
-        let rx = pool_event_rx.clone();
-        Some(std::thread::spawn(move || {
-            if let Err(e) = run_multi_tui(
-                &title,
-                &sub_metas,
-                slots,
-                slot_cpus,
-                rx.clone(),
-                cancel_tui,
-                true,
-            ) {
-                eprintln!(
-                    "Warning: Contest TUI initialization failed ({e}); falling back to non-TUI execution."
-                );
-                while rx.recv().is_ok() {}
-            }
-        }))
-    } else {
-        None
     };
 
     let pool = JudgePool::new(PoolOptions {
@@ -708,8 +745,11 @@ pub fn run_contest(
         pool_events: pool_events_opt,
     });
 
-    let phase_bc_start = Instant::now();
-    let reports = pool.run(pool_submissions, cancel);
+    let streamed_reports = pool.run_streaming(stream_rx, cancel);
+    for h in compile_workers {
+        let _ = h.join();
+    }
+    let mut final_reports = router_handle.join().unwrap_or_default();
     drop(pool);
     drop(pool_event_tx);
 
@@ -724,8 +764,8 @@ pub fn run_contest(
     }
     if trace_phases {
         eprintln!(
-            "[TRACE] Phase B/C (Judge/Precise): {} ms",
-            phase_bc_start.elapsed().as_millis()
+            "[TRACE] Streaming Compile + Judge/Precise: {} ms",
+            pipeline_start.elapsed().as_millis()
         );
     }
 
@@ -737,16 +777,20 @@ pub fn run_contest(
         return emit_interrupted(format, "Contest judging");
     }
 
-    for ((sub_id, player, prob_name), rep_res) in pool_sub_meta.into_iter().zip(reports) {
+    for (sub_id, rep_res) in streamed_reports {
         match rep_res {
             Ok(report) => {
                 final_reports.insert(sub_id, report);
             }
             Err(e) => {
+                let (player, prob_name) = candidates
+                    .get(sub_id)
+                    .map(|c| (c.player.as_str(), c.prob_name.as_str()))
+                    .unwrap_or(("unknown", "unknown"));
                 eprintln!("  -> Judging failed for {player} / {prob_name}: {e}");
                 let fail_report = SubmissionJudgeReport {
                     schema_version: 1,
-                    problem: prob_name.clone(),
+                    problem: prob_name.to_string(),
                     submission: format!("{player} - {prob_name}"),
                     verdict: Verdict::JudgeFailed,
                     score: 0.0,
@@ -844,29 +888,56 @@ pub fn run_contest(
 
     // Output results
     if format == OutputFormat::Ndjson {
-        let standings_json = standings_to_json(&standings);
-        let out = serde_json::json!({
-            "schema_version": 1,
-            "event": "contest_finished",
-            "ok": true,
-            "standings": standings_json,
-        });
-        println!("{}", serde_json::to_string(&out).unwrap());
+        use std::io::Write;
+        #[derive(serde::Serialize)]
+        struct ContestFinishedEvent<'a> {
+            schema_version: u32,
+            event: &'static str,
+            ok: bool,
+            standings: Vec<StandingJson<'a>>,
+        }
+        let out = ContestFinishedEvent {
+            schema_version: 1,
+            event: "contest_finished",
+            ok: true,
+            standings: standings_to_typed(&standings),
+        };
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+        let _ = serde_json::to_writer(&mut writer, &out);
+        let _ = writer.write_all(b"\n");
+        let _ = writer.flush();
         return ExitCode::from(EXIT_SUCCESS);
     } else if format == OutputFormat::Json {
-        let standings_json = standings_to_json(&standings);
-        let out = serde_json::json!({
-            "schema_version": 1,
-            "ok": true,
-            "contest_dir": contest_dir.to_string_lossy().to_string(),
-            "problems_count": problems.len(),
-            "contestants_count": standings.len(),
-            "standings": standings_json,
-            "html_report": html_path.to_string_lossy().to_string(),
-            "csv_report": csv_path.to_string_lossy().to_string(),
-            "reports": all_reports,
-        });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        use std::io::Write;
+        #[derive(serde::Serialize)]
+        struct ContestJsonOutput<'a> {
+            schema_version: u32,
+            ok: bool,
+            contest_dir: String,
+            problems_count: usize,
+            contestants_count: usize,
+            standings: Vec<StandingJson<'a>>,
+            html_report: String,
+            csv_report: String,
+            reports: &'a [SubmissionJudgeReport],
+        }
+        let out = ContestJsonOutput {
+            schema_version: 1,
+            ok: true,
+            contest_dir: contest_dir.to_string_lossy().to_string(),
+            problems_count: problems.len(),
+            contestants_count: standings.len(),
+            standings: standings_to_typed(&standings),
+            html_report: html_path.to_string_lossy().to_string(),
+            csv_report: csv_path.to_string_lossy().to_string(),
+            reports: &all_reports,
+        };
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+        let _ = serde_json::to_writer_pretty(&mut writer, &out);
+        let _ = writer.write_all(b"\n");
+        let _ = writer.flush();
     } else if format == OutputFormat::Human {
         println!("\n=== Contest Leaderboard ===");
         print!(
@@ -905,32 +976,48 @@ pub fn run_contest(
     ExitCode::from(EXIT_SUCCESS)
 }
 
-fn standings_to_json(standings: &[ContestantStanding]) -> Vec<serde_json::Value> {
+#[derive(serde::Serialize)]
+struct StandingProblemJson {
+    verdict: Verdict,
+    score: f64,
+    time_ms: u64,
+}
+
+#[derive(serde::Serialize)]
+struct StandingJson<'a> {
+    rank: usize,
+    name: &'a str,
+    total_score: f64,
+    total_time_ms: u64,
+    problems: BTreeMap<&'a str, StandingProblemJson>,
+}
+
+fn standings_to_typed(standings: &[ContestantStanding]) -> Vec<StandingJson<'_>> {
     standings
         .iter()
         .map(|st| {
-            let prob_map: serde_json::Map<String, serde_json::Value> = st
+            let problems: BTreeMap<&str, StandingProblemJson> = st
                 .problem_results
                 .iter()
                 .map(|(p, (v, s, t))| {
                     (
-                        p.clone(),
-                        serde_json::json!({
-                            "verdict": v,
-                            "score": s,
-                            "time_ms": t,
-                        }),
+                        p.as_str(),
+                        StandingProblemJson {
+                            verdict: *v,
+                            score: *s,
+                            time_ms: *t,
+                        },
                     )
                 })
                 .collect();
 
-            serde_json::json!({
-                "rank": st.rank,
-                "name": st.name,
-                "total_score": st.total_score,
-                "total_time_ms": st.total_time_ms,
-                "problems": prob_map,
-            })
+            StandingJson {
+                rank: st.rank,
+                name: &st.name,
+                total_score: st.total_score,
+                total_time_ms: st.total_time_ms,
+                problems,
+            }
         })
         .collect()
 }

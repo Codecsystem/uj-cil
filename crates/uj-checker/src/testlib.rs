@@ -342,7 +342,7 @@ pub fn run_testlib_checker(
         work_dir: scratch_dir,
         ro_binds: vec![],
         stdin: Stdio::Null,
-        stdout: Stdio::Pipe,
+        stdout: Stdio::Null,
         stderr: Stdio::Pipe,
         extra_fds: vec![],
         limits: Limits::new(10000, 1024 * 1024 * 1024),

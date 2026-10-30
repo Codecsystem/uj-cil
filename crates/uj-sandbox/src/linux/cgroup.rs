@@ -17,6 +17,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(1);
 /// contestant's own `max_processes` budget on the legacy spawn path
 /// (intermediate `unshare` process + PID 1 init + PID 2 contestant).
 pub const LEGACY_HELPER_PROCS: u64 = 3;
+pub const DIRECT_HELPER_PROCS: u64 = 2;
 
 #[derive(Debug)]
 pub struct CgroupV2 {
@@ -465,7 +466,7 @@ impl CgroupV2 {
 
         // 2. pids.max
         if limits.max_processes > 0 {
-            self.set_pids_max(limits.max_processes.saturating_add(helper_procs))?;
+            self.set_pids_max((limits.max_processes as u64).saturating_add(helper_procs))?;
         }
 
         // 3. cpuset.cpus (affinity)
@@ -740,6 +741,9 @@ mod tests {
         assert_eq!(parse_usage_usec(b"user_usec 1\n"), None);
         assert_eq!(parse_usage_usec(b""), None);
         assert_eq!(parse_usage_usec(b"usage_usec \n"), None);
-        assert_eq!(parse_usage_usec(b"usage_usec 99999999999999999999999\n"), None);
+        assert_eq!(
+            parse_usage_usec(b"usage_usec 99999999999999999999999\n"),
+            None
+        );
     }
 }
