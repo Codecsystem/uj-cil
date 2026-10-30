@@ -202,17 +202,77 @@ pub fn create_isolated_box_dir(
     Ok(box_dir)
 }
 
-/// Forcibly removes a file, clearing readonly attributes if needed (e.g. on Windows).
+/// Clear the read-only flag of `path` itself, never following symlinks / junctions.
+///
+/// `std::fs::set_permissions` resolves symlinks, so for a contestant-planted link it would
+/// change the permissions of the (possibly outside-the-box) target. Links are therefore
+/// handled through a handle opened on the reparse point itself (Windows) or skipped
+/// (Unix: symlink permission bits are meaningless and never block unlinking).
 #[allow(clippy::permissions_set_readonly_false)]
+fn clear_readonly_nofollow(path: &std::path::Path, meta: &std::fs::Metadata) {
+    let mut perms = meta.permissions();
+    if !perms.readonly() {
+        return;
+    }
+    perms.set_readonly(false);
+    if meta.file_type().is_symlink() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+            {
+                let _ = f.set_permissions(perms);
+            }
+        }
+        return;
+    }
+    let _ = std::fs::set_permissions(path, perms);
+}
+
+/// Remove a symlink / junction itself (never its target).
+fn remove_link_nofollow(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Windows directory symlinks and junctions must be removed with RemoveDirectory
+            // (which deletes the reparse point, not the target directory).
+            #[cfg(windows)]
+            if std::fs::remove_dir(path).is_ok() {
+                return Ok(());
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(path)
+                && meta.permissions().readonly()
+            {
+                clear_readonly_nofollow(path, &meta);
+                #[cfg(windows)]
+                if std::fs::remove_dir(path).is_ok() {
+                    return Ok(());
+                }
+                return std::fs::remove_file(path);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Forcibly removes a file, clearing readonly attributes if needed (e.g. on Windows).
+/// Symlinks are removed themselves; their targets are never touched.
 pub fn force_remove_file(path: &std::path::Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) => {
             if let Ok(metadata) = std::fs::symlink_metadata(path) {
-                let mut perms = metadata.permissions();
-                if perms.readonly() {
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(path, perms);
+                if metadata.file_type().is_symlink() {
+                    return remove_link_nofollow(path);
+                }
+                if metadata.permissions().readonly() {
+                    clear_readonly_nofollow(path, &metadata);
                     return std::fs::remove_file(path);
                 }
             }
@@ -222,7 +282,7 @@ pub fn force_remove_file(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Forcibly removes a directory and all its contents, clearing readonly attributes if needed (e.g. on Windows).
-#[allow(clippy::permissions_set_readonly_false)]
+/// Never follows symlinks / junctions: links inside the tree are removed, not traversed.
 pub fn force_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -231,13 +291,11 @@ pub fn force_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let p = entry.path();
+                        // `symlink_metadata` / `file_type` never follow links, so a planted
+                        // link cannot redirect the chmod (or the recursion) outside the box.
                         if let Ok(meta) = p.symlink_metadata() {
-                            let mut perms = meta.permissions();
-                            if perms.readonly() {
-                                perms.set_readonly(false);
-                                let _ = std::fs::set_permissions(&p, perms);
-                            }
-                            if meta.is_dir() {
+                            clear_readonly_nofollow(&p, &meta);
+                            if meta.file_type().is_dir() {
                                 make_writable_recursive(&p);
                             }
                         }
@@ -245,11 +303,10 @@ pub fn force_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
                 }
             }
             if let Ok(meta) = path.symlink_metadata() {
-                let mut perms = meta.permissions();
-                if perms.readonly() {
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(path, perms);
+                if meta.file_type().is_symlink() {
+                    return remove_link_nofollow(path).or(Err(e));
                 }
+                clear_readonly_nofollow(path, &meta);
             }
             make_writable_recursive(path);
             std::fs::remove_dir_all(path).or(Err(e))
@@ -259,16 +316,23 @@ pub fn force_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
 
 /// Recursively removes all files and subdirectories within a box directory without deleting the box directory itself.
 /// Returns Ok(true) if clean succeeded, or Err if any entry failed to delete.
+///
+/// Uses `DirEntry::file_type()` (no extra `stat`, does not follow symlinks): symlinks and
+/// junctions planted by the contestant are unlinked, never traversed.
 pub fn clean_box_dir_contents(box_dir: &std::path::Path) -> Result<bool, std::io::Error> {
     let entries = std::fs::read_dir(box_dir)?;
     let mut any_err = None;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let res = if path.is_dir() {
-            force_remove_dir_all(&path)
-        } else {
-            force_remove_file(&path)
+        let file_type = match entry.file_type() {
+            Ok(ft) => Some(ft),
+            Err(_) => std::fs::symlink_metadata(&path).ok().map(|m| m.file_type()),
+        };
+        let res = match file_type {
+            Some(ft) if ft.is_symlink() => remove_link_nofollow(&path),
+            Some(ft) if ft.is_dir() => force_remove_dir_all(&path),
+            _ => force_remove_file(&path),
         };
         if let Err(e) = res {
             any_err = Some(e);
@@ -339,12 +403,83 @@ static AUTHORIZED_BINARIES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
+/// Identity of a file version used to memoize content hashes: path, mtime, size plus
+/// platform identity (`dev`/`ino`/`ctime` on Unix, creation/last-write FILETIME on Windows).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileVersion {
+    path: std::path::PathBuf,
+    mtime: std::time::SystemTime,
+    size: u64,
+    extra: (u64, u64, i64, i64),
+}
+
+impl FileVersion {
+    fn of(path: &std::path::Path, meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let extra = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        #[cfg(windows)]
+        let extra = {
+            use std::os::windows::fs::MetadataExt;
+            (meta.creation_time(), meta.last_write_time(), 0, 0)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let extra = (0, 0, 0, 0);
+        Self {
+            path: path.to_path_buf(),
+            mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            size: meta.len(),
+            extra,
+        }
+    }
+}
+
+/// Process-wide memo of blake3 content hashes keyed by `FileVersion`, so repeated
+/// `prepare_binary_content` calls for a freshly compiled binary (< 2 s old, which bypasses
+/// `PREPARED_BINARIES_CACHE`) do not re-read and re-hash the whole file on every test.
+static CONTENT_HASH_MEMO: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<FileVersion, String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Minimum distance between a file's mtime and the moment its metadata was sampled before
+/// a memoized hash is trusted ("racy-git" rule): any later rewrite must then carry a newer
+/// mtime, so a same-size rewrite within one timestamp tick cannot alias the memo entry.
+const HASH_MEMO_RACY_MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn hash_memo_is_safe(mtime: std::time::SystemTime, sampled_at: std::time::SystemTime) -> bool {
+    let Ok(since_epoch) = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    // A zero sub-second part indicates a coarse-timestamp filesystem (FAT: 2 s, HFS+: 1 s);
+    // there the 2-second guard of `PREPARED_BINARIES_CACHE` is the only safe rule.
+    if since_epoch.subsec_nanos() == 0 {
+        return false;
+    }
+    sampled_at
+        .duration_since(mtime)
+        .is_ok_and(|d| d >= HASH_MEMO_RACY_MARGIN)
+}
+
+fn authorized_binary_path(bin_dir: &std::path::Path, hash_hex: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        bin_dir.join(format!("{}.exe", &hash_hex[..16]))
+    }
+    #[cfg(not(windows))]
+    {
+        bin_dir.join(&hash_hex[..16])
+    }
+}
+
 /// Prepares a shared copy of an executable in `<base_dir>/.uj/tmp/bin/<hash>.exe`.
 /// The file is read, hashed, and written once per submission.
 pub fn prepare_binary_content(
     exe_path: &std::path::Path,
     base_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf, std::io::Error> {
+    let sampled_at = std::time::SystemTime::now();
     let meta_opt = std::fs::metadata(exe_path).ok();
     if let Some(ref meta) = meta_opt {
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -366,15 +501,39 @@ pub fn prepare_binary_content(
         }
     }
 
+    let bin_dir = base_dir.join(".uj").join("tmp").join("bin");
+    let version = meta_opt.as_ref().map(|m| FileVersion::of(exe_path, m));
+
+    // Memoized content hash (see `hash_memo_is_safe`): reuse the shared copy if it is intact.
+    if let Some(ref v) = version
+        && let Some(hash) = CONTENT_HASH_MEMO.lock().get(v).cloned()
+    {
+        let authorized_exe = authorized_binary_path(&bin_dir, &hash);
+        if std::fs::metadata(&authorized_exe)
+            .map(|m| m.len() == v.size)
+            .unwrap_or(false)
+        {
+            return Ok(authorized_exe);
+        }
+    }
+
     let bytes = std::fs::read(exe_path)?;
     let hash = blake3::hash(&bytes).to_hex();
-    let bin_dir = base_dir.join(".uj").join("tmp").join("bin");
     std::fs::create_dir_all(&bin_dir)?;
 
-    #[cfg(windows)]
-    let authorized_exe = bin_dir.join(format!("{}.exe", &hash[..16]));
-    #[cfg(not(windows))]
-    let authorized_exe = bin_dir.join(&hash[..16]);
+    if let Some(ref v) = version
+        && hash_memo_is_safe(v.mtime, sampled_at)
+        && v.size == bytes.len() as u64
+        && std::fs::metadata(exe_path)
+            .map(|m| FileVersion::of(exe_path, &m) == *v)
+            .unwrap_or(false)
+    {
+        CONTENT_HASH_MEMO
+            .lock()
+            .insert(v.clone(), hash.as_str().to_string());
+    }
+
+    let authorized_exe = authorized_binary_path(&bin_dir, hash.as_str());
 
     let need_write = if authorized_exe.exists() {
         std::fs::metadata(&authorized_exe)
@@ -453,10 +612,29 @@ pub fn get_or_prepare_authorized_binary(
 }
 
 /// Fallback scratch directory for temp files
+///
+/// The path is computed once per process. The directory is (re)created at most once every
+/// `SCRATCH_REVALIDATE_SECS` instead of on every call (it used to run `temp_dir()` +
+/// `create_dir_all` per call), which still recovers if a temp cleaner removes it while a
+/// long-running process (e.g. `uj mcp`) is alive.
 pub fn get_sandbox_scratch_dir() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join("uj").join("tmp");
-    let _ = std::fs::create_dir_all(&p);
-    p
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+    const SCRATCH_REVALIDATE_SECS: u64 = 5;
+    static SCRATCH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    static LAST_ENSURED: AtomicU64 = AtomicU64::new(0);
+
+    let p = SCRATCH.get_or_init(|| std::env::temp_dir().join("uj").join("tmp"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_ENSURED.load(Ordering::Relaxed);
+    if last == 0 || now.saturating_sub(last) >= SCRATCH_REVALIDATE_SECS {
+        let _ = std::fs::create_dir_all(p);
+        LAST_ENSURED.store(now.max(1), Ordering::Relaxed);
+    }
+    p.clone()
 }
 
 #[cfg(windows)]
